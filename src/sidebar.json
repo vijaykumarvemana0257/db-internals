@@ -118,6 +118,17 @@
             }
           }
         ]
+      },
+      {
+        "label": "2.6 LSM Compaction, Amplification and Crash Safety",
+        "collapsed": true,
+        "items": [
+          {
+            "autogenerate": {
+              "directory": "p02-storage-engines/lsm-compaction-and-maintenance"
+            }
+          }
+        ]
       }
     ]
   }

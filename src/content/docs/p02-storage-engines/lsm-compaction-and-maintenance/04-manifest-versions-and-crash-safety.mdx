@@ -1,0 +1,137 @@
+---
+title: Manifest, versions and crash safety
+description: How an LSM engine records which files are live — Versions, VersionEdits, the MANIFEST and CURRENT — why a flush or compaction is atomic, how obsolete files are reclaimed, and exactly what recovery does after a crash.
+depth: deep
+sidebar:
+  order: 4
+---
+
+import ManifestRecoveryLab from '../../../../components/viz/ManifestRecoveryLab';
+
+Flushes and compactions constantly create new files and make old ones obsolete. A crash can happen at any
+moment in that churn: halfway through writing an SSTable, after writing it but before anyone knows it exists,
+or in the middle of retiring an old file. The engine must always be able to answer one question after a restart
+— **which files make up the database?** — and the answer must never include a half-written file or omit data a
+user was told was saved.
+
+LevelDB and RocksDB answer it with a small, carefully ordered metadata log. This page walks through it, using
+RocksDB's names.
+
+<ManifestRecoveryLab client:visible />
+
+## Versions
+
+A **Version** is an immutable description of the database's files: for each level, the list of live SSTables, and
+for each file its number, size, smallest and largest key, and the range of sequence numbers it contains. Reads and
+compactions work against a Version, so the set of files they see cannot change underneath them.
+
+The engine never modifies a Version. When a flush or compaction finishes, it produces a **new** Version that differs
+from the old one by a small change.
+
+## VersionEdits, the MANIFEST and CURRENT
+
+That small change is a **VersionEdit**: the files added (with their levels and metadata), the files deleted, and a few
+counters — notably the **log number** (the oldest write-ahead log still needed), the next file number, and the last
+sequence number.
+
+VersionEdits are appended, one record each, to the **MANIFEST** file — a log in the same record format as the write-ahead
+log, with checksums. The current Version is the result of replaying every edit in the MANIFEST from the beginning.
+
+A flush therefore goes through three durable steps in order:
+
+1. Write the new SSTable and sync it.
+2. Append a VersionEdit to the MANIFEST that adds the file and advances the log number, and sync the MANIFEST.
+3. Only then consider the file part of the database, and allow the old WAL to be retired.
+
+**Step 2 is the commit point.** Until the edit is durably in the MANIFEST, the new file does not exist as far as recovery is
+concerned — even if every one of its bytes is safely on disk. A compaction commits the same way, with an edit that adds its
+output files and deletes its inputs in a single record, so a compaction is either fully applied or not applied at all.
+
+The MANIFEST grows forever as edits accumulate, so the engine periodically **rolls it over**: it writes a new MANIFEST that begins
+with a single record describing the entire current Version, and then switches to it. Which MANIFEST is current is recorded in a tiny
+file called **CURRENT**, which holds just the MANIFEST's name. CURRENT is replaced atomically — the new contents are written to a
+temporary file, synced, and renamed over CURRENT — using exactly the
+[safe-replace protocol](../../../p01-foundations/hardware-os-durability/08-filesystem-crash-consistency-journaling-rename-and-the-safe-/)
+from Part 1.
+
+## Recovery
+
+After a crash, the engine rebuilds everything from those files:
+
+1. **Read CURRENT** to find the MANIFEST.
+2. **Replay the MANIFEST's edits** to reconstruct the live Version: the files in each level, and the log number.
+3. **Delete orphans.** Any SSTable or MANIFEST on disk that the recovered state does not reference was written by work that never
+   committed. It is deleted.
+4. **Replay write-ahead logs** numbered at or above the log number into a memtable. Logs below the log number are already fully
+   persisted in SSTables and are skipped.
+
+Choose crash points in the lab and read the recovery steps.
+
+- **During the flush** or **SST written, VersionEdit not logged.** A complete-looking SST 9 is on disk, but no edit mentions it. Recovery
+  deletes it as an orphan. Nothing is lost: because the edit never advanced the log number, WAL 7 was not retired, and replaying it restores
+  `a` and `b` into the memtable.
+- **Just after the flush's VersionEdit.** Now file 9 is live and the log number is 8, so WAL 7 is skipped — its contents are in file 9.
+- **Compaction output written, edit not logged.** File 10 is an orphan; the compaction simply never happened, and file 9 is still live.
+  The engine will redo the compaction later.
+- **New MANIFEST written, CURRENT not yet switched.** CURRENT still names the old MANIFEST, which is complete and valid. The new MANIFEST is
+  an orphan and is deleted.
+- **After CURRENT is switched.** Recovery reads the new MANIFEST, whose first record is a snapshot of the whole Version.
+
+In every case the **Acknowledged writes lost** stat reads *none*. That is the invariant the ordering exists to guarantee: a file becomes live
+only after it is durable, and a log is retired only after the files that replace it are live.
+
+### Torn write-ahead logs
+
+A crash can also cut the last WAL record in half. Select **Torn WAL tail**: the final record fails its checksum. What happens next is a policy,
+set by `wal_recovery_mode`:
+
+- **`kPointInTimeRecovery`** — the default — replays the log up to the last valid record and stops there. The database opens in a consistent
+  state as of that point.
+- **`kTolerateCorruptedTailRecords`** tolerates incomplete records at the end of the log, the common result of a crash mid-write.
+- **`kAbsoluteConsistency`** treats any corruption in the log as fatal and refuses to open. Switch the lab to it: recovery fails outright.
+- **`kSkipAnyCorruptedRecords`** skips bad records wherever they appear — a last-resort salvage mode that can lose data from the middle of the log.
+
+A torn final record belongs to a write whose log record never finished; it was not durable. The stricter modes exist for deployments that would
+rather stop than open with any doubt, such as a replica that can re-copy data from elsewhere.
+
+## Reclaiming obsolete files
+
+A compaction's VersionEdit deletes its input files from the *current* Version, but those files cannot be removed from disk yet. An iterator or a
+read that started earlier may still be using an older Version that contains them.
+
+So **Versions are reference-counted**. Every open iterator, in-progress read and running compaction holds a reference to the Version it started
+with. A file is physically deleted only when no live Version references it. This is why a long-lived iterator keeps obsolete files on disk: it pins
+the Version it began on, and every file in that Version, until it is closed.
+
+Separately, the engine periodically compares the files in its directory against the set referenced by live Versions and deletes anything unreferenced,
+which also cleans up orphans left by crashes.
+
+Note the difference from a **snapshot**. A snapshot pins a *sequence number*, which stops compaction from dropping old versions of keys, as the
+[tombstones page](../../../p02-storage-engines/lsm-trees/07-deletes-tombstones-ttl-and-snapshots/) showed. It does not pin files. An iterator pins files.
+
+## Column families and a shared log
+
+RocksDB column families are separate LSM trees — separate memtables, SSTables and compaction — that share **one write-ahead log**. A write batch can
+touch several column families atomically because all of it goes into the same log record.
+
+The consequence is that each column family tracks its **own** log number, and a WAL file can be deleted only when every column family has flushed all
+of its data from that file. One rarely written column family can therefore keep old WAL files alive for everyone.
+
+When the WAL is disabled, the log can no longer tie column families together after a crash. The `atomic_flush` option flushes a group of column families
+together, committing their new files in one MANIFEST record, so they recover to a consistent point with each other.
+
+## Where it bites in production
+
+- **Never copy SSTables without the MANIFEST.** A directory of SSTables is not a database; the MANIFEST says which of them are live. Backups and checkpoints
+  must capture the MANIFEST, CURRENT and live files together — which is what RocksDB's checkpoint and backup APIs do.
+- **Disk usage that does not fall after compaction** often means an old iterator or other long-lived reference is pinning a Version and its files.
+- **A long MANIFEST slows startup.** Recovery replays every edit since the last rollover. Very large manifests make restarts slower; rollover size is configurable.
+- **Recovery mode is a durability decision.** `kSkipAnyCorruptedRecords` will open a damaged database by discarding data; use it only knowingly, typically on
+  a node that can be rebuilt from replicas.
+- **Orphan files after a crash are normal.** Files that appear and then vanish right after a restart are uncommitted work being cleaned up, not corruption.
+
+:::note[What to take forward]
+A Version is the immutable set of live files; each flush or compaction commits a VersionEdit to the MANIFEST, and that append is the moment new files become real.
+CURRENT names the MANIFEST and is replaced atomically. Recovery replays the MANIFEST, deletes files no edit committed, and replays write-ahead logs from the recorded
+log number, so no acknowledged write is lost wherever the crash lands. Versions are reference-counted, so iterators pin files until they close.
+:::

@@ -1,0 +1,132 @@
+---
+title: 'Why compaction exists: the three amplifications and the RUM trade-off'
+description: Every flush adds a sorted run. Runs cost reads, obsolete versions cost space, and merging them away costs writes. Compaction policy is a choice of which of the three to pay — and it has a fourth, hidden cost in the block cache.
+depth: intermediate
+sidebar:
+  order: 1
+---
+
+import AmplificationTriangleLab from '../../../../components/viz/AmplificationTriangleLab';
+
+The LSM tree module ended with files piling up: every flush writes a new sorted run, every overwrite
+leaves an older version behind, and every delete leaves a tombstone. Left alone, that produces a
+database whose reads probe more and more files and whose disk fills with data nobody can read.
+**Compaction** is the background process that merges runs to stop that. But merging is itself
+writing, and writing is what the LSM design was supposed to make cheap.
+
+That tension is the entire subject of compaction, and it is precise enough to measure.
+
+<AmplificationTriangleLab client:visible />
+
+## Three amplifications
+
+An LSM tree's costs are conventionally expressed as three ratios.
+
+**Read amplification** is how much work one logical read does beyond the minimum. For a point lookup,
+it is roughly the number of sorted runs that must be consulted. L0 is the worst place for it: L0 files
+overlap, so a lookup may touch every one of them, while each deeper level contributes one file.
+
+**Space amplification** is the total bytes on disk divided by the bytes of live data. Obsolete versions
+of overwritten keys and tombstones that have not yet been compacted away all count against it.
+
+**Write amplification** is the bytes written to storage divided by the bytes the application wrote. A byte
+the user writes once is written to the WAL, again in a flush, and again every time a compaction merges the
+run that contains it. RocksDB reports this per level in its compaction statistics as the `W-Amp` column.
+
+Write amplification is not an abstract number. It is CPU and I/O spent in the background instead of on
+foreground work, and on flash it is **endurance**: an SSD rated for a certain number of drive writes per day
+wears out proportionally faster when every user byte becomes twenty device bytes.
+
+## Compaction trades one against the others
+
+The lab simulates the same stream of key batches under two compaction policies and counts every entry written,
+kept and probed. The two policies are the extremes that the next page examines in detail:
+
+- **Leveled** compaction keeps one sorted run per level below L0 and merges eagerly. Whenever a level exceeds its
+  target size, a file-sized chunk of it is merged into the overlapping part of the next level.
+- **Tiered** compaction lets several runs of similar size accumulate at a level and merges them together only when
+  there are enough of them.
+
+Read the stats with **Leveled** selected and a size ratio of 10: tens of times write amplification, space amplification
+close to one, and only a handful of runs for a read to probe. Switch to **Tiered**: write amplification falls to a few
+times, but the worst-case number of runs a read must probe multiplies, and with overwrites, space amplification rises
+because obsolete versions sit in separate runs until the whole tier is merged.
+
+Now move the **Size ratio** slider:
+
+- Under **leveled** compaction, a larger ratio means each level is merged into a much bigger level below it, so each chunk
+  rewrites more data. Write amplification climbs as the ratio grows, while space and read costs stay low.
+- Under **tiered** compaction, a larger ratio means merges happen less often, so write amplification falls — and the number of
+  runs waiting to be merged, which is exactly what a read has to probe, climbs steeply.
+
+Set **Overwrites** to zero and space amplification is exactly one under both policies: with no duplicate keys, there is nothing
+obsolete to hold on to. Raise overwrites and tiered compaction's space cost appears, while leveled compaction stays close to one
+plus one over the size ratio — the last level holds nearly all the data and is kept fully merged.
+
+The lab's compaction is a simplification — merges are modeled by size rather than key by key, and leveled compaction picks chunks
+round-robin rather than by RocksDB's scoring — but the relationships it shows are the real ones.
+
+## The RUM conjecture
+
+Athanassoulis and colleagues gave this pattern a name: the **RUM conjecture**. For any access method, the three overheads of
+**R**ead, **U**pdate and **M**emory (space) cannot all be minimized at once; designing to reduce two of them increases the third.
+
+Leveled and tiered compaction are two points on that surface, and so is a **B+tree**. The lab places a B+tree using the standard
+reference values rather than simulating it:
+
+- **Write amplification from rewriting pages.** An in-place update rewrites the whole page containing the record. Updating a
+  100-byte record on an 8 KB page is, byte for byte, around 80 times amplification — more than a leveled LSM, before even counting
+  the WAL and full-page images.
+- **Space amplification from fragmentation.** Pages split and are left partly full; after random inserts a B+tree's pages settle
+  around two-thirds full, roughly one and a half times the live data.
+- **Read amplification of one.** A lookup follows one path to one leaf. With the upper levels cached, that is one page read, and it
+  does not change as data accumulates — which is why B+trees have such stable tail latency.
+
+A B+tree is not "worse at writes" in the abstract, and an LSM is not "worse at reads". They sit in different corners of the same triangle.
+
+### Memory is the knob that buys reads back
+
+The third RUM dimension is memory, and in an LSM tree the most important memory is **filter bits**. More bits per key lower each run's
+false-positive rate, and every false positive avoided is a data-block read avoided. Drag **Filter bits per key**: the worst-case expected
+block reads for an absent key fall sharply, regardless of how many runs there are.
+
+The **Monkey** paper from Dayan, Athanassoulis and Idreos sharpened this. A false positive costs one block read no matter which level it
+happens in, but the levels hold very different numbers of keys. Giving every level the same bits per key spends most of the filter memory on
+the largest level. Shifting bits from the largest level to the smaller ones lowers the total expected lookup cost for the same total memory,
+because each extra bit on a small level is cheap and removes a false positive that costs just as much as one on the large level.
+
+## The fourth cost: the block cache
+
+The triangle leaves out something that matters in production. The block cache holds data, index and filter blocks **keyed to the files they came
+from**. A compaction does not modify files; it writes new ones and deletes the old ones. The moment a compaction commits, every cached block that
+belonged to its input files refers to a file that no longer exists, and the replacement files start completely cold.
+
+Switch the lab to **Cache after compaction**. Reads keep the cache warm, until a compaction commits and rewrites half the files: the hit rate drops
+immediately and then recovers as reads re-populate the cache. Nothing about the compaction's own disk I/O causes that dip. It is the cache losing
+everything it knew about the rewritten range, so reads that were served from memory go to disk until the new files' blocks are cached.
+
+Index and filter blocks make it worse, because every read of a new file needs them before it can find anything. Check **Pin index and filter blocks**:
+the dip becomes shallower, because only data blocks go cold. RocksDB offers several ways to get that behavior:
+
+- `cache_index_and_filter_blocks` places index and filter blocks in the block cache, and pinning options keep the critical ones from being evicted —
+  for partitioned indexes and filters, the top-level partitions can be pinned so every read can always reach the right partition.
+- Leaving index and filter blocks out of the block cache entirely, which is RocksDB's default, loads them with the table reader when a file is opened, so
+  they never compete with data blocks for cache space.
+- `prepopulate_block_cache` can warm the cache with blocks as a flush writes them, so freshly flushed files do not start cold.
+
+## Where it bites in production
+
+- **High write amplification shows up as disk wear and background CPU.** If `W-Amp` in RocksDB's compaction stats is in the tens, every gigabyte the
+  application writes costs tens of gigabytes of device writes. Budget SSD endurance and compaction CPU from that number, not from the application's write rate.
+- **Space amplification decides disk headroom.** Tiered and universal compaction can temporarily need close to double the space during large merges. A disk
+  sized for live data plus a little slack will fill.
+- **Read latency tracks run count.** When run count grows — L0 buildup under leveled, many waiting runs under tiered — point lookups pay more filter checks and
+  scans pay more sources. Watch run count alongside latency.
+- **A compaction commit can look like an I/O storm.** A p99 read spike right after a large compaction finishes is usually the block cache going cold for the rewritten
+  range, not the compaction's reads and writes. Pinning index and filter blocks, and sizing the cache with that in mind, addresses the real cause.
+
+:::note[What to take forward]
+Compaction exchanges three costs: runs that make reads slower, obsolete data that takes space, and rewriting that amplifies writes. Leveled compaction pays in writes to
+keep reads and space low; tiered compaction pays in reads and space to keep writes low; a B+tree occupies yet another corner. Filter memory buys read cost back, best spent
+on the smaller levels, and every compaction also discards the block cache's knowledge of the files it rewrote.
+:::

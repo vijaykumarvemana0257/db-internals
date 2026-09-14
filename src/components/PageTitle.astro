@@ -10,6 +10,9 @@ import graph from '../data/curriculum-graph.json';
 
 type Mod = (typeof graph.modules)[number];
 
+// Generated URLs are base-less; prefix the deployed base path.
+const siteHref = (u: string) => `${import.meta.env.BASE_URL.replace(/\/$/, '')}${u}`;
+
 const route = Astro.locals.starlightRoute;
 const segs = route.id.split('/');
 // Lesson pages live at pNN-part/module-slug/NN-page; the homepage and /curriculum/ do not.
@@ -63,7 +66,7 @@ const depthRank = depth ? DEPTHS.indexOf(depth) + 1 : 0;
               <>
                 {i ? ' · ' : ''}
                 {p.url ? (
-                  <a href={p.url}>
+                  <a href={siteHref(p.url)}>
                     {p.index} {p.title}
                   </a>
                 ) : (
@@ -85,7 +88,7 @@ const depthRank = depth ? DEPTHS.indexOf(depth) + 1 : 0;
             <>
               {i ? ' · ' : ''}
               {p.url ? (
-                <a href={p.url}>
+                <a href={siteHref(p.url)}>
                   {p.index} {p.title}
                 </a>
               ) : (

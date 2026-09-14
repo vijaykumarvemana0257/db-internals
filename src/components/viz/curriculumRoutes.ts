@@ -6,6 +6,7 @@
  * hardcoded that the graph can compute (counts, prerequisite edges, written status).
  */
 import graphData from '../../data/curriculum-graph.json';
+import { siteHref } from './Viz';
 
 export type Subtopic = { title: string; depth: string; url: string | null };
 export type ModuleNode = {
@@ -29,7 +30,13 @@ export type Graph = {
   modules: ModuleNode[];
 };
 
-export const graph = graphData as Graph;
+const raw = graphData as Graph;
+const withSite = (u: string | null) => (u ? siteHref(u) : null);
+/** The generated graph stores base-less URLs; resolve them against the deployed base path here. */
+export const graph: Graph = {
+  ...raw,
+  modules: raw.modules.map((m) => ({ ...m, url: withSite(m.url), subtopics: m.subtopics.map((s) => ({ ...s, url: withSite(s.url) })) })),
+};
 export const bySlug = new Map(graph.modules.map((m) => [m.slug, m]));
 export const order = new Map(graph.modules.map((m, i) => [m.slug, i]));
 

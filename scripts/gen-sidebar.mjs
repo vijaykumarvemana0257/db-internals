@@ -5,10 +5,9 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-// Must match astro.config.mjs's BASE resolution, so generated links land under
-// the same base path the site is actually served from (e.g. GitHub Pages project sites).
-const base = process.env.BASE ?? '/';
-const withBase = (path) => `${base.replace(/\/$/, '')}${path}`;
+// Generated URLs are base-less ("/pNN-part/module/NN-page/"). The base path is only known at build
+// time (CI sets BASE for `astro build`, not for this script), so consumers add it: components via
+// siteHref / import.meta.env.BASE_URL, and curriculum.md via page-relative links.
 const curriculum = JSON.parse(
   readFileSync(resolve(root, '_planning/curriculum-result.json'), 'utf8'),
 ).curriculum;
@@ -60,7 +59,7 @@ curriculum.parts.forEach((part, pi) => {
         visual: sub.visual,
         depth: sub.depth,
         path: `src/content/docs/${moduleDir}/${pad(si + 1)}-${slugify(sub.title)}.mdx`,
-        url: withBase(`/${moduleDir}/${pad(si + 1)}-${slugify(sub.title)}/`),
+        url: `/${moduleDir}/${pad(si + 1)}-${slugify(sub.title)}/`,
       });
     });
   });
@@ -132,7 +131,7 @@ curriculum.parts.forEach((part, pi) => {
     manifest
       .filter((m) => m.part === pi + 1 && m.module === mi + 1)
       .forEach((m) => {
-        lines.push(built(m) ? `- [${esc(m.title)}](${m.url})` : `- ${esc(m.title)} <span class="pending">soon</span>`);
+        lines.push(built(m) ? `- [${esc(m.title)}](..${m.url})` : `- ${esc(m.title)} <span class="pending">soon</span>`);
       });
     lines.push('');
   });

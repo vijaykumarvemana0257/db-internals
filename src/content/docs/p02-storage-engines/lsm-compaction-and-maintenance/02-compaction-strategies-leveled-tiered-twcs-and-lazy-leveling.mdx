@@ -1,0 +1,159 @@
+---
+title: 'Compaction strategies: leveled, tiered, TWCS and lazy leveling'
+description: How leveled, size-tiered, time-window and lazy-leveling compaction pick what to merge, what each costs, how trivial moves and whole-file expiry avoid rewriting, and the two ways compaction shows up in production — latency sawtooth and silent debt.
+depth: deep
+sidebar:
+  order: 2
+---
+
+import CompactionPolicySim from '../../../../components/viz/CompactionPolicySim';
+
+The [previous page](../../../p02-storage-engines/lsm-compaction-and-maintenance/01-why-compaction-exists-the-three-amplifications-and-the-rum-t/)
+measured what compaction trades: read, space and write amplification. A **compaction strategy** is the
+policy that decides, at each moment, *which* files to merge. That decision is made thousands of times a day
+by every LSM engine, and small differences in it produce very different disks, latencies and failure modes.
+
+<CompactionPolicySim client:visible />
+
+The lab draws every file at its real key range, one row per level. L0 files are drawn as thin overlapping
+strips because they overlap; deeper levels are laid out across the key space. Change the policy and the
+workload, and read the event table under the figure to see each merge that happened.
+
+## Leveled compaction
+
+Leveled compaction is the default in LevelDB and RocksDB, and it is Cassandra's `LeveledCompactionStrategy`.
+Below L0, **each level is a single sorted run**: its files do not overlap, and together they cover the key space.
+Each level has a target size that grows by a fixed **size ratio** — in RocksDB, `max_bytes_for_level_multiplier`,
+10 by default.
+
+Compaction is driven by pressure:
+
+- **Scoring.** RocksDB computes a score for each level — for L0, the file count relative to
+  `level0_file_num_compaction_trigger`; for deeper levels, the level's size relative to its target — and compacts
+  the level with the highest score first.
+- **File picking.** From that level, it picks one file to push down. The default picking policy,
+  `kMinOverlappingRatio`, prefers the file whose overlapping data in the next level is smallest relative to the
+  file's own size, because that file moves the most data for the least rewriting.
+- **The merge.** The chosen file and every file it overlaps in the next level are merged and written out as new files
+  in the next level. Only the overlapping part of the next level is rewritten, not the whole level.
+
+With **Leveled** and **Random keys** selected, the lab keeps L0 small and a few levels of non-overlapping files below
+it. Because every level is one run, a read checks at most one file per level below L0, and because the last level holds
+most of the data and stays fully merged, obsolete data is cleaned up quickly: space amplification stays low. The price
+is write amplification — data is rewritten as it moves through every level, and a larger size ratio means each merge
+rewrites more of the level below.
+
+### Trivial moves
+
+Now switch the workload to **Increasing keys**. Each new file covers a key range no existing file touches, so when a file
+is pushed down, nothing in the next level overlaps it. RocksDB does not rewrite such a file at all: it performs a **trivial
+move**, changing only the metadata that says which level the file belongs to. The stats show trivial moves climbing, and
+write amplification collapses to roughly one — data is written once, at flush, and then just relabeled as it descends.
+
+This is why append-mostly keys — timestamps, auto-increment IDs, log sequence numbers — are so cheap to ingest into a leveled
+LSM, and why random keys such as UUIDv4 are expensive: random keys always overlap everything below them.
+
+### Making big compactions cheaper to live with
+
+Two mechanisms keep leveled compaction from disrupting foreground work:
+
+- **Subcompactions.** A large L0-to-L1 compaction can be split into key ranges merged in parallel, controlled by
+  `max_subcompactions`, so it finishes sooner.
+- **Rate limiting.** A rate limiter caps the bytes per second that flushes and compactions may write, smoothing their I/O at the
+  cost of letting debt build faster during write bursts.
+
+## Tiered compaction
+
+Tiered compaction — Cassandra's `SizeTieredCompactionStrategy` and RocksDB's **universal** compaction — merges less eagerly.
+Instead of maintaining one run per level, it lets several runs of **similar size** accumulate and merges them together once
+there are enough.
+
+Switch the lab to **Tiered**. Files are not merged until enough runs of a size have built up, so each byte is rewritten fewer
+times and write amplification is lower than under leveled compaction on the same workload. But more runs exist at any moment,
+and a point read must check each one that could hold its key. With overwrites, obsolete versions also sit in separate runs until
+the whole tier merges, so space amplification is higher.
+
+The space cost has a sharp edge. When tiered compaction merges its largest runs, the new output is written before the inputs can
+be deleted, so a full merge can briefly need close to twice the space. RocksDB's universal compaction exposes this directly through
+`max_size_amplification_percent`, which triggers a full merge once space amplification passes a threshold, 200% by default. Cassandra's
+STCS groups similar-sized SSTables into buckets and merges a bucket once it has `min_threshold` files, 4 by default. ScyllaDB's incremental
+compaction strategy was designed to cut this space overhead by merging in bounded pieces rather than whole runs.
+
+## Time-window compaction and FIFO
+
+Time-series data with a TTL has a special property: data written in the same hour expires in the same hour. **Time-window compaction**
+(Cassandra's `TimeWindowCompactionStrategy`) exploits it by never merging data across time windows. Within the current window, files are
+merged as usual; once the window closes, its files are compacted into a single file that is never merged with another window again.
+
+Select **Time-window (TWCS)** with the **Time series with TTL** workload. Files accumulate in the open window, a closed window becomes one
+file, and once a window's data is entirely past its TTL, the whole file is **dropped** — no reads, no merge, no rewrite. The stats count those
+expired files. Compare that with the other policies on the same workload: they have no way to drop a file by age, so expired rows can only be
+removed by being rewritten through compaction.
+
+The approach only works when its assumption holds. Out-of-order writes, or rows with different TTLs mixed in one table, put long-lived data into
+windows that should expire, and those windows can then never be dropped.
+
+RocksDB's **FIFO** compaction takes the idea to its extreme for data that is only ever appended and aged out: it does not merge at all, and deletes
+the oldest files once total size exceeds a limit or files pass a TTL.
+
+## Lazy leveling and hybrid designs
+
+Leveled and tiered compaction are two ends of a spectrum, and the research line behind the Dostoevsky paper by Dayan and Idreos showed that the best
+point is usually in between. **Lazy leveling** uses tiering for the smaller levels, where most of the rewriting happens, and leveling only for the
+largest level, where most of the data and most of the space amplification live. The **Fluid LSM tree** generalizes this with two parameters: how many
+runs the smaller levels may hold, and how many the largest level may hold.
+
+Select **Lazy leveling** in the lab: write amplification falls between the leveled and tiered results on the same workload. Because the largest level stays
+a single run, point lookups and space amplification stay close to leveled compaction, while writes avoid much of leveled compaction's repeated rewriting of
+the small levels.
+
+## How compaction shows up in production
+
+Two operational signatures matter more than any of the steady-state numbers.
+
+### The latency sawtooth
+
+After each large compaction commits, the files it rewrote are new files with nothing in the block cache, as the
+[amplification page](../../../p02-storage-engines/lsm-compaction-and-maintenance/01-why-compaction-exists-the-three-amplifications-and-the-rum-t/)
+showed. Reads of that key range go to disk until the cache re-warms, so p99 read latency jumps right after the commit and decays over the following
+minutes — a sawtooth that repeats with every big compaction.
+
+The lab's **p99** trace illustrates the shape: a spike proportional to how much data a compaction just rewrote, decaying as reads re-warm the cache. It is
+routinely misread as the compaction's own disk I/O competing with reads, which leads to throttling compaction harder — making debt worse without touching
+the cause. The fixes are cache-side: keep index and filter blocks pinned or out of the LRU, and size the block cache with the rewritten ranges in mind.
+
+### Compaction that cannot finish
+
+The more dangerous signature is quiet. Press **Corrupt a block at flush 40**. A file in L1 now contains a block that fails its checksum. Nothing is reported
+to readers — that block may not be on the path of any query — but every compaction that includes the file fails when it tries to read it.
+
+With random keys, every L0 file overlaps that L1 file, so every L0-to-L1 compaction fails. Watch what happens: L0 files pile up past the **slowdown**
+trigger and then the **stop** trigger, compaction debt climbs without ever shrinking, and the stall markers under the timeline turn on. The symptom is not a
+read error. It is write stalls and a backlog that looks like compaction simply cannot keep up.
+
+How engines react differs, and it matters for diagnosis:
+
+- **RocksDB** treats a corruption found during compaction as a serious background error. With `paranoid_checks` enabled, which is the default, it stops
+  accepting writes until the problem is dealt with and the database is resumed or reopened.
+- **Engines that keep rescheduling the same compaction** fail it again on every attempt, which is exactly the lab's pattern: the failure count climbs, debt
+  never falls, and stalls follow.
+
+Check **Quarantine the file at flush 90**. Removing the bad file — in practice, restoring its data from a replica or rebuilding it — lets the blocked
+compaction run, and L0 drains almost immediately. When compaction debt rises steadily and never recovers, look for failed compactions and checksum errors in
+the engine's log before tuning anything.
+
+## Where it bites in production
+
+- **Random keys make leveled compaction expensive.** UUIDv4 primary keys overlap every level on every merge. If write amplification is unexpectedly high, check
+  whether the key design prevents trivial moves.
+- **Tiered compaction needs free space you are not using.** A disk that looks half empty under universal or size-tiered compaction may not survive the next full
+  merge.
+- **TWCS depends on write order.** Backfills, late-arriving data and mixed TTLs defeat whole-window drops and leave windows that can never expire.
+- **Throttling compaction is borrowing.** A rate limiter smooths latency now and converts it into debt, L0 buildup and stalls later if the write rate stays high.
+- **Debt that never shrinks is a symptom.** Look for failed compactions, checksum errors and background errors before assuming compaction is simply under-provisioned.
+
+:::note[What to take forward]
+Leveled compaction keeps one run per level and pays in rewriting; tiered compaction lets runs accumulate and pays in read cost and space; lazy leveling tiers the
+small levels and levels the largest to get most of both. Trivial moves and whole-window drops avoid rewriting entirely when the workload allows it. In production,
+compaction appears as a cache-driven latency sawtooth after big merges, and a single bad block can turn into growing debt and write stalls rather than a read error.
+:::

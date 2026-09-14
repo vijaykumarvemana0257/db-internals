@@ -1,0 +1,209 @@
+---
+title: Bulk loading and external SSTable ingestion
+description: How LSM engines load large datasets by building SSTables outside the database and installing them with a single metadata commit — RocksDB's IngestExternalFile rules for flushing, choosing a level and assigning a sequence number, ingest_behind for backfills, and the L0 compaction debt a badly shaped ingest creates. With Cassandra and CockroachDB for contrast.
+depth: deep
+sidebar:
+  order: 5
+---
+
+import SstIngestLab from '../../../../components/viz/SstIngestLab';
+
+Loading two billion rows through `Put` means two billion WAL appends, two billion memtable inserts, a few
+thousand flushes, and then every one of those bytes rewritten again as compaction pushes it down the tree.
+The write path is built for many small concurrent writes arriving in no particular order. A bulk load is the
+opposite: one writer, a huge amount of data, and often the data is already sorted.
+
+LSM engines therefore offer a second way in. You build finished SSTables **outside** the database, in the same
+format the engine writes itself, and then ask the engine to **ingest** them. Ingestion writes no WAL records and
+touches no memtable. It checks where the file may safely go, gives it a sequence number, and commits one
+VersionEdit to the MANIFEST — the same commit a flush or compaction uses, from the
+[previous page](../04-manifest-versions-and-crash-safety/). A file of any size becomes live in that one step.
+
+This page follows RocksDB's implementation, which most other LSM ingestion paths resemble. For bulk loading a
+B-tree — building it bottom-up from sorted input — see the
+[B-tree bulk loading page](../../../p02-storage-engines/b-trees-and-variants/05-bulk-loading-and-index-construction/).
+
+<SstIngestLab client:visible />
+
+## Building the file
+
+RocksDB's `SstFileWriter` produces an SSTable without a database. You open it with the column family's options —
+the same comparator, block size, compression and filter policy — then add keys **in strictly increasing order**
+and call `Finish`. It accepts `Put`, `Merge` and `Delete`, plus `DeleteRange` for range tombstones.
+
+The ordering requirement is the price of admission. The writer does not sort. If your source data is not sorted, you
+sort it first — usually in a distributed job such as Spark that partitions by key range and writes one file per
+partition. A useful side effect: a file built this way has **at most one version of each key**, which is what later
+lets the engine give the entire file a single sequence number.
+
+Every key in the file is written with sequence number 0. The real number is decided at ingestion time.
+
+## What ingestion does
+
+`IngestExternalFile` (or `IngestExternalFiles`, which can ingest into several column families atomically) runs in
+two parts.
+
+The **preparation** happens while the database keeps serving writes. The engine reads the file's properties and key
+range, optionally verifies its checksums, and places it in the database directory. By default it copies the file.
+With `move_files` or `link_files` it creates a hard link instead, which is nearly free but requires the file to be on
+the same filesystem.
+
+The **commit** happens with foreground writes stopped: the ingestion job enters the write queue as its only writer.
+Step through it in the lab with **Ingest step by step** and **Next step**.
+
+### 1. Check the memtable
+
+Keys in the memtable are newer than anything on disk. If the file's key range overlaps the memtable, the ingested data
+must be placed so that the memtable's writes still win — and the simplest way to guarantee that is to flush the memtable
+first, turning it into an L0 file that the next step can see.
+
+With `allow_blocking_flush` on (the default), RocksDB does exactly that, **while writes are still stopped**. Pick **Overlaps
+the memtable**: the memtable becomes a new L0 file before the walk begins, and the file lands in L0 above it. Now turn
+`allow_blocking_flush` off: ingestion fails with `External file requires flush`, and nothing is changed.
+
+That flush is the most common surprise. An ingest you expected to take milliseconds can stall every foreground writer
+for as long as a memtable flush takes.
+
+### 2. Walk down the levels
+
+Next the engine chooses a level. It walks down from L0, and at each level asks two questions:
+
+- **Does this level hold any keys in the file's range?** If yes, the walk stops. The ingested file must sit *above*
+  those keys, because the LSM's invariant is that newer data lives higher in the tree.
+- **If not, does the file fit here?** In L1 and below, files in a level may not overlap each other, so the file fits only if
+  its range lies in a gap between the level's files. L0 accepts any file.
+
+The file goes to the deepest level where it fit before the walk stopped.
+
+The lab's default file, **Fits a gap in L1, blocked at L2**, shows the rule. L0 and L1 have no keys in its range and it fits
+between L1's files, but L2 has keys there. It lands in L1. Choose **Brand-new keys past the end**: no level has keys in that
+range, so the file drops straight to the last level. Choose **Overlaps an L0 file**: the walk stops immediately, and the file can
+only join L0.
+
+Two refinements matter in practice. RocksDB checks the first question against the **actual keys** in a level, with an iterator
+seek, but checks the second against **file boundaries** — so a range that falls between two keys inside one file passes the first
+test and still does not fit. And a level counts as occupied if a **running compaction** is writing output into that range, since
+that output will appear there shortly.
+
+The files in the lab are dense ranges, so the two tests always agree.
+
+### 3. Assign a sequence number
+
+Every key in the file gets the same **global sequence number**:
+
+- **0**, if the file overlaps nothing in the database. Its keys are new, so they need no ordering against anything.
+- **The last sequence number + 1**, if the file overlaps existing data. The ingested values are then newer than every
+  version already in the database, so they win — the file behaves like a very large write that happened now.
+
+The default file overlaps L2's keys, so the lab stamps 18,205. The brand-new-keys file keeps 0.
+
+Snapshots add a third case. A snapshot reads only versions with a sequence number at or below its own. A file stamped 0 would
+be visible to *every* snapshot, including ones taken before the ingestion — data would appear inside a snapshot that was supposed
+to be frozen. So with `snapshot_consistency` on (the default), an open snapshot forces a new sequence number even when nothing
+overlaps. Choose **Brand-new keys past the end** and tick **A snapshot is open**: the level stays L4, but the number becomes 18,205.
+
+Older RocksDB versions wrote the global sequence number into the file itself. Since RocksDB 5.16 it is recorded in the MANIFEST
+instead, and the table reader applies it to every key it reads from the file. The old behavior remains behind the deprecated
+`write_global_seqno` option, only for compatibility with older readers.
+
+If you set `allow_global_seqno` to false, ingestion refuses any file that would need a non-zero number, which is a way to insist that
+an ingest never overlaps existing data.
+
+### 4. Commit the VersionEdit
+
+Finally the engine appends one VersionEdit — add this file at this level, with these keys and this sequence number — to the MANIFEST,
+installs the new Version, and lets writes resume. As with a flush, that MANIFEST append is the commit point. A crash before it leaves an
+orphan file that recovery deletes; a crash after it leaves a live file.
+
+## Ingesting behind existing data
+
+Sometimes the new data is *older* than what the database holds: a backfill of historical records into a table that is already taking
+live traffic. Stamping it last + 1 would overwrite newer values with old ones.
+
+`ingest_behind` handles this. It skips the walk entirely, places the file in the **last level**, and keeps sequence number 0 — so it sits
+beneath every existing version, and any key that already exists keeps its current value.
+
+That only works if the last level is free for it. So `ingest_behind` requires a column family created with `cf_allow_ingest_behind`, which
+**reserves the last level** for ingested files: compaction never writes into it and never picks files from it. In current RocksDB this is
+supported only with universal compaction. Switch the lab's mode to **ingest_behind**:
+
+- **Backfill under live data** lands in the reserved level with sequence number 0, beneath the data above it.
+- **Collides with an earlier backfill** fails. The reserved level's files may not overlap each other, and an earlier ingested file already
+  covers part of the range.
+
+## Streaming versus ingesting
+
+The meters under the lab compare writing the same rows two ways. The model counts only rewrites of the rows' **own** bytes: when compaction
+merges a file into the next level it also rewrites the overlapping data already there, which adds to both paths and is ignored here.
+
+Streamed through `Put`, the rows are written to the WAL, written again by a flush, and rewritten once for every level compaction pushes them
+down — six times in the lab's five-level tree. Ingested, they are written once by `SstFileWriter`, possibly on another machine, and then only
+rewritten for the levels between where they landed and the bottom. With the default file, that is three levels. With **Brand-new keys past the
+end**, it is zero: the rows never move again.
+
+That is the shape of the ideal bulk load: **sort all the data, split it into non-overlapping files, and ingest them into an empty column family or
+an empty key range in one call.** Every file lands in the last level, keeps sequence number 0, and the load costs no compaction at all. RocksDB's
+`fail_if_not_bottommost_level` option turns that expectation into a check: ingestion fails with `TryAgain` if any file would land above the last level.
+
+When several files in one call overlap each other, they cannot all share a level. RocksDB orders them and assigns sequence numbers so that later files
+sit above earlier ones — and some of them end up high in the tree.
+
+## When the file lands in L0
+
+A file lands in L0 whenever the walk stops at L0: when L0 has keys in its range, or when the memtable overlapped and was flushed. In a tree that
+has been taking writes for a while, L0 almost always has *something* across a wide range. Choose **A whole table in one file** to see the result.
+
+The file counts as a single L0 file, but it is not a normal one:
+
+- **Sudden compaction debt.** Before L0 is healthy again, the whole file must be merged into L1 together with **every L1 file its range overlaps**. The
+  lab's note totals that compaction. For a file spanning the whole key space, that is all of L1, in one job.
+- **Newer flushes wait behind it.** An L0 file can only move to L1 together with the older L0 files that overlap it. While a huge L0→L1 compaction
+  holds L1's entire key range, new memtable flushes pile up in L0 — towards the `level0_slowdown_writes_trigger` and `level0_stop_writes_trigger`
+  thresholds from the [write-stall page](../../../p02-storage-engines/lsm-trees/02-write-path-wal-memtable-flush-and-write-stalls/). The pending-compaction
+  estimate also jumps by the file's size, towards the `soft_pending_compaction_bytes_limit`.
+- **Read amplification.** Every L0 file whose range covers a key is one more file a point lookup may have to check, and L0 files are checked one by one.
+
+The fix is almost always to change the shape of the ingest rather than tune compaction. Split one wide file into many narrow ones. Ingest into ranges the
+tree does not yet hold. Or, if the data truly must replace a populated range, expect the compaction and schedule it.
+
+RocksDB also offers the opposite approach for loads into an empty database: `Options::PrepareForBulkLoad()` streams through the normal write path with
+automatic compaction disabled and the L0 triggers raised out of the way, and expects you to run one large manual compaction at the end.
+
+## The same idea elsewhere
+
+**Cassandra.** `CQLSSTableWriter` builds SSTables offline from a table schema and an `INSERT` statement. `sstableloader` then streams them into a live
+cluster: it reads each SSTable and sends every token range's portion to the replicas that own that range, where the data arrives as new SSTables and
+ordinary compaction merges it. Since Cassandra 4.0, `nodetool import` loads SSTables from a local directory directly into a node's table.
+
+Cassandra has no sequence numbers. It resolves conflicting versions by each cell's **write timestamp** (last write wins), so loaded data wins or loses
+according to the timestamps it was written with — which you can set with `USING TIMESTAMP` — not according to when it was loaded. Loading old data with
+old timestamps is naturally an ingest-behind.
+
+**CockroachDB.** The KV layer's `AddSSTable` request ingests a built SST into a range through Pebble, CockroachDB's LSM engine, which chooses a level for it in the same
+way. `IMPORT`, `RESTORE` and index backfills for schema changes all use it. So does rebalancing: when a replica is moved to a new node,
+the Raft snapshot that carries its data is written as SSTables and ingested. Because bulk ingestion can flood L0, CockroachDB's admission control watches
+L0 file and sub-level counts and slows ingest and foreground work when they climb.
+
+**TiDB Lightning's** physical import mode takes the same route into TiKV, which stores data in RocksDB: it sorts and encodes data into SSTables locally and
+has TiKV ingest them.
+
+## Where it bites in production
+
+- **An overlapping memtable turns ingestion into a write stall.** The flush runs with foreground writes stopped. Ingest into ranges the application is not
+  writing to, or accept the pause knowingly.
+- **"Fast" loads that later stall.** Ingestion returned in milliseconds, but the files landed in L0, and the compaction debt shows up minutes later as slowdowns.
+  Check which level ingested files landed in — `GetLiveFilesMetaData` lists every live file with its level — and use `fail_if_not_bottommost_level` where the last level is the only acceptable answer.
+- **Sequence numbers cannot express "older".** A normal ingest always makes overlapping data the newest version. Backfilling historical data needs `ingest_behind`
+  and a column family prepared for it from creation, or a timestamp-ordered system.
+- **Files must match the column family.** An SST built with a different comparator or incompatible options is either rejected or, worse, read with the wrong ordering.
+  Build files with the target column family's options.
+- **Copies are real I/O.** Without `move_files` or `link_files`, ingestion copies each file into the database directory. For hundreds of gigabytes, that copy dominates
+  the ingest time, and a hard link needs the same filesystem.
+
+:::note[What to take forward]
+Ingestion installs a finished SSTable with one VersionEdit, skipping the WAL and memtable. The engine flushes an overlapping memtable first with writes stopped,
+walks down the levels until it meets existing keys, and places the file in the deepest level above them where it fits. The file gets sequence number 0 if
+nothing overlaps and no snapshot is open, and the last sequence number + 1 otherwise. `ingest_behind` instead puts the file in a reserved last level at 0,
+beneath existing data. Sorted, non-overlapping files into empty ranges land in the last level and cost no compaction. Wide files into a busy tree land in L0
+and create an immediate, large compaction debt.
+:::

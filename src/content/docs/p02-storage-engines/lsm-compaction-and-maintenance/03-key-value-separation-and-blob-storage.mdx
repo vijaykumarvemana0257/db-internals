@@ -1,0 +1,114 @@
+---
+title: Key-value separation and blob storage
+description: WiscKey's idea of keeping only keys and value pointers in the LSM, with values in an append-only log — how RocksDB BlobDB, TiKV's Titan and Badger use it, what it saves in compaction, and what it costs in range scans and garbage collection.
+depth: deep
+sidebar:
+  order: 3
+---
+
+import KvSeparationLab from '../../../../components/viz/KvSeparationLab';
+
+Compaction exists to keep keys sorted. It rewrites values only because they happen to sit next to their
+keys. For small values that coupling is harmless. For large values — a few kilobytes of JSON, an image
+thumbnail, a serialized document — it means the engine spends most of its compaction work copying bytes
+whose order does not matter, over and over, through every level.
+
+**Key-value separation** breaks the coupling: the LSM tree keeps keys, sorted as always, with small
+pointers to where their values live, and the values themselves go into an append-only log that
+compaction never touches.
+
+<KvSeparationLab client:visible />
+
+## WiscKey's split
+
+The design comes from **WiscKey** (Lu and colleagues, FAST 2016). A write appends the full key-value pair
+to a **value log**, then inserts the key and the value's location — its offset and size in the log — into
+the LSM tree. A read looks the key up in the LSM tree as usual and, if it finds a pointer, reads the value
+from the log with one additional read.
+
+Because the value log already contains every write in order, WiscKey can use it as the tree's write-ahead log
+as well, instead of logging the same bytes twice.
+
+In the lab, the default is a million records with 4 KB values and separation on. Read **Compaction bytes**: with
+values in the LSM, compaction rewrites tens of gigabytes; separated, it rewrites a few hundred megabytes, because
+only 24-byte keys and small references move between levels. Whole-system write amplification falls from about ten
+to about two. Turn **Separate values into blob files** off and on to compare, and use the table under the figure to
+see the saving grow with value size.
+
+The lab assumes a leveled tree that rewrites each byte in it about ten times, which is typical but not universal; the
+shape of the result — compaction cost proportional to what sits in the tree — does not depend on that number.
+
+## Where it is used
+
+- **RocksDB's integrated BlobDB** stores values at or above `min_blob_size` in separate blob files, controlled by
+  `enable_blob_files`, `blob_file_size` and related options. Values below the threshold stay inline in the SSTables.
+- **Titan**, the storage engine plugin TiKV uses on top of RocksDB, separates large values into blob files in the same way.
+- **Badger**, a key-value store written in Go, stores values larger than a configured threshold in a value log and keeps
+  small values in the tree.
+
+The **min_blob_size** threshold is the central tuning decision. Move the lab's `min_blob_size` slider above the value size:
+the values stay in the LSM and the savings disappear. Separation is worth it for values large enough that moving them through
+compaction is the dominant cost, and wasteful for small ones, where the extra read and the pointer overhead outweigh the saving.
+
+## The costs
+
+### Range scans lose locality
+
+In an ordinary LSM, a range scan reads sorted data blocks sequentially, and each block holds keys *and* values, so the values
+come for free. With separation, the keys are still sorted, but the values they point to are scattered through the log in the order
+they were *written*, not the order of their keys.
+
+Look at **Scan of 100 keys**. With values in the LSM, the scan reads a run of sequential blocks. Separated, it reads the keys from a
+single block — they are small — and then performs one random read per value. The bytes read are similar; what changed is that sequential
+I/O became random I/O. On spinning disks that is catastrophic. On SSDs the gap is smaller, and WiscKey reduces it further by fetching the
+values for a range scan **in parallel**, exploiting the SSD's ability to serve many random reads at once.
+
+Point lookups pay a smaller, fixed cost: one extra read to follow the pointer, unless the value is cached.
+
+### Garbage in the log
+
+The LSM tree reclaims space from overwritten and deleted keys through compaction. The value log has no such mechanism of its own. When a
+key is overwritten, its old value stays in the log, and nothing in the LSM's compaction ever touches it.
+
+Set **Values overwritten** above zero and watch **Blob space amp** rise, with the dead bytes growing in the blob-log bar. That space can only be
+recovered by **garbage collection** of the log.
+
+WiscKey's garbage collection reads entries from the oldest end of the log, looks each key up in the LSM to check whether its pointer still refers
+to that entry, appends the still-live values at the head of the log, updates their pointers in the LSM, and then frees the old region. Press **Run
+blob garbage collection** a few times: dead space shrinks, while write amplification rises, because relocating live values and updating their
+pointers is writing too.
+
+RocksDB's integrated BlobDB does this work **during compaction** rather than as a separate pass. When compaction encounters a blob reference pointing into
+one of the oldest blob files — the oldest quarter of blob files by default, set by `blob_garbage_collection_age_cutoff` — it copies the blob into a new blob
+file and writes the updated reference. RocksDB also tracks how much of each blob file is garbage, so a file whose blobs have all been superseded can simply be
+deleted.
+
+The trade-off is the same one the RUM conjecture described: garbage collection that runs more often keeps space amplification low at the cost of more rewriting,
+and garbage collection that runs rarely saves writes while the dead blobs take space.
+
+## Choosing whether to separate
+
+Key-value separation is a good fit when:
+
+- values are large relative to keys — kilobytes and up;
+- the workload is write-heavy, so compaction cost dominates;
+- reads are mostly point lookups rather than long range scans;
+- the storage is flash, which tolerates the extra random reads.
+
+It is a poor fit for small values, for scan-heavy analytical access, and for workloads with heavy overwrites where garbage collection must run constantly.
+
+## Where it bites in production
+
+- **Space grows until garbage collection catches up.** A workload that overwrites large values will show blob storage growing well beyond live data. Monitor garbage
+  per blob file, not just total disk usage.
+- **Range scan latency can regress sharply.** Moving an existing scan-heavy workload onto separated storage turns sequential reads into random ones. Test long scans, not
+  only point reads.
+- **The threshold is workload-specific.** Setting `min_blob_size` too low separates small values that were cheap to keep inline and adds a read to every lookup of them.
+- **Garbage collection is background writing.** Aggressive blob garbage collection trades space for write amplification and I/O. Tune it against both disk headroom and
+  device endurance.
+
+:::note[What to take forward]
+Key-value separation keeps only keys and small pointers in the LSM, so compaction stops rewriting large values and write amplification drops sharply. The costs are range
+scans that turn sequential reads into random ones, an extra read on point lookups, and a value log that needs its own garbage collection to reclaim space from overwritten
+values — which reintroduces some of the rewriting separation was meant to avoid.
+:::
