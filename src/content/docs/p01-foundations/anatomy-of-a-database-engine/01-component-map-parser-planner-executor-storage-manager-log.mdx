@@ -80,7 +80,7 @@ file descriptor and an offset under `base/<database oid>/<relfilenode>`, in 1 GB
 WAL lives in its own stream of pre-allocated, recycled 16 MB segments in `pg_wal`.
 
 That is the whole loop for a read. A write adds one thing — a log record, described at the end
-of this page and in detail in [the WAL primer](/p01-foundations/anatomy-of-a-database-engine/07-wal-primer-log-records-lsns-and-log-before-page/).
+of this page and in detail in [the WAL primer](../../../p01-foundations/anatomy-of-a-database-engine/07-wal-primer-log-records-lsns-and-log-before-page/).
 
 ## The four managers that cut across everything
 
@@ -109,7 +109,7 @@ calls them LWLocks) — short-lived mutexes protecting an in-memory structure fo
 instructions, never deadlock-detected, released before the call returns. They appear in
 monitoring as different wait event types (`Lock` vs `LWLock` in `pg_stat_activity`), they have
 different fixes, and conflating them is the most common vocabulary error in this subject. [The
-Buffer Pool](/p02-storage-engines/buffer-pool/01-buffer-pool-structure-frames-page-table-and-pins/)
+Buffer Pool](../../../p02-storage-engines/buffer-pool/01-buffer-pool-structure-frames-page-table-and-pins/)
 defines latches properly, where the structures they protect exist.
 :::
 
@@ -169,17 +169,17 @@ exactly one layer; mixing them up is how servers get sized wrong.
 
 | Layer | Owning module | The knobs that size it |
 |---|---|---|
-| Wire protocol / connections | [Connections and Pooling](/p05-using-the-database-well/connections-pooling-and-process-models/01-connection-lifecycle-and-cost-tcp-tls-scram-and-process-per-/) | `max_connections` (100), `max_allowed_packet` |
-| Parser | [Parsing and the AST](/p03-query-processing/sql-to-logical-plan/01-parsing-and-the-ast/) | Compile-time limits; `sql_mode` in MySQL |
-| Binder / analyzer | [Binding and semantic analysis](/p03-query-processing/sql-to-logical-plan/02-binding-name-resolution-and-semantic-analysis/) | `search_path`; `table_open_cache`, `table_definition_cache` |
-| Rewriter | [Algebraic equivalences and rewrite rules](/p03-query-processing/sql-to-logical-plan/05-algebraic-equivalences-and-rewrite-rules/) | `row_security`; `optimizer_switch` |
-| Optimizer | [Cost-Based Optimization](/p03-query-processing/cost-based-optimization/01-cost-models-i-o-cpu-and-their-calibration/) | `random_page_cost` (4.0), `effective_cache_size` (4 GB), `geqo_threshold` (12), `optimizer_search_depth` |
-| Executor | [Execution Engines](/p03-query-processing/execution-engines-and-resource-control/01-volcano-iterator-model/) | `work_mem` (4 MB), `hash_mem_multiplier`, `max_parallel_workers_per_gather`, `join_buffer_size`, `sort_buffer_size` |
-| Access methods | [B-Trees](/p02-storage-engines/b-trees-and-variants/01-b-tree-structure-invariants-and-search/), [LSM Trees](/p02-storage-engines/lsm-trees/01-append-only-logs-and-bitcask-hash-indexes/) | `fillfactor`, `innodb_page_size` (16 KB), `write_buffer_size` (64 MB in RocksDB) |
-| Buffer pool | [The Buffer Pool](/p02-storage-engines/buffer-pool/01-buffer-pool-structure-frames-page-table-and-pins/) | `shared_buffers` (128 MB), `innodb_buffer_pool_size` (128 MB), `PRAGMA cache_size`, RocksDB `block_cache` |
-| Storage manager | [Pages, Tuples and Heap Files](/p02-storage-engines/pages-tuples-heap-files/01-page-anatomy-and-the-slotted-page/) | `wal_segment_size` (16 MB), `innodb_flush_method`, `PRAGMA journal_mode` |
-| Log manager | [Write-Ahead Logging](/p04-transactions-concurrency-control-and-recovery/write-ahead-logging-and-recovery/01-log-records-lsns-and-the-two-rules-of-write-ahead-logging/) | `wal_buffers`, `max_wal_size`, `full_page_writes`, `innodb_log_buffer_size` (16 MB), `innodb_flush_log_at_trx_commit` |
-| Transaction + lock managers | [Transactions](/p04-transactions-concurrency-control-and-recovery/transactions-and-isolation/01-acid-precisely/), [Locking](/p04-transactions-concurrency-control-and-recovery/lock-based-concurrency-control/01-two-phase-locking-and-strict-2pl/) | `max_locks_per_transaction`, `deadlock_timeout`, `innodb_lock_wait_timeout` |
+| Wire protocol / connections | [Connections and Pooling](../../../p05-using-the-database-well/connections-pooling-and-process-models/01-connection-lifecycle-and-cost-tcp-tls-scram-and-process-per-/) | `max_connections` (100), `max_allowed_packet` |
+| Parser | [Parsing and the AST](../../../p03-query-processing/sql-to-logical-plan/01-parsing-and-the-ast/) | Compile-time limits; `sql_mode` in MySQL |
+| Binder / analyzer | [Binding and semantic analysis](../../../p03-query-processing/sql-to-logical-plan/02-binding-name-resolution-and-semantic-analysis/) | `search_path`; `table_open_cache`, `table_definition_cache` |
+| Rewriter | [Algebraic equivalences and rewrite rules](../../../p03-query-processing/sql-to-logical-plan/05-algebraic-equivalences-and-rewrite-rules/) | `row_security`; `optimizer_switch` |
+| Optimizer | [Cost-Based Optimization](../../../p03-query-processing/cost-based-optimization/01-cost-models-i-o-cpu-and-their-calibration/) | `random_page_cost` (4.0), `effective_cache_size` (4 GB), `geqo_threshold` (12), `optimizer_search_depth` |
+| Executor | [Execution Engines](../../../p03-query-processing/execution-engines-and-resource-control/01-volcano-iterator-model/) | `work_mem` (4 MB), `hash_mem_multiplier`, `max_parallel_workers_per_gather`, `join_buffer_size`, `sort_buffer_size` |
+| Access methods | [B-Trees](../../../p02-storage-engines/b-trees-and-variants/01-b-tree-structure-invariants-and-search/), [LSM Trees](../../../p02-storage-engines/lsm-trees/01-append-only-logs-and-bitcask-hash-indexes/) | `fillfactor`, `innodb_page_size` (16 KB), `write_buffer_size` (64 MB in RocksDB) |
+| Buffer pool | [The Buffer Pool](../../../p02-storage-engines/buffer-pool/01-buffer-pool-structure-frames-page-table-and-pins/) | `shared_buffers` (128 MB), `innodb_buffer_pool_size` (128 MB), `PRAGMA cache_size`, RocksDB `block_cache` |
+| Storage manager | [Pages, Tuples and Heap Files](../../../p02-storage-engines/pages-tuples-heap-files/01-page-anatomy-and-the-slotted-page/) | `wal_segment_size` (16 MB), `innodb_flush_method`, `PRAGMA journal_mode` |
+| Log manager | [Write-Ahead Logging](../../../p04-transactions-concurrency-control-and-recovery/write-ahead-logging-and-recovery/01-log-records-lsns-and-the-two-rules-of-write-ahead-logging/) | `wal_buffers`, `max_wal_size`, `full_page_writes`, `innodb_log_buffer_size` (16 MB), `innodb_flush_log_at_trx_commit` |
+| Transaction + lock managers | [Transactions](../../../p04-transactions-concurrency-control-and-recovery/transactions-and-isolation/01-acid-precisely/), [Locking](../../../p04-transactions-concurrency-control-and-recovery/lock-based-concurrency-control/01-two-phase-locking-and-strict-2pl/) | `max_locks_per_transaction`, `deadlock_timeout`, `innodb_lock_wait_timeout` |
 
 The defaults in that table are shipping defaults, not recommendations — `shared_buffers` at
 128 MB and `innodb_buffer_pool_size` at 128 MB are both sized to start on a laptop. Note also
@@ -209,7 +209,7 @@ whole pages by construction. Three engines, three answers, one hardware fact und
 
 The rest of the write path — where the new row version goes inside the page, what happens to the
 old one, how free space is tracked — needs the page layout defined first, so it belongs to
-[Pages, Tuples and Heap Files](/p02-storage-engines/pages-tuples-heap-files/01-page-anatomy-and-the-slotted-page/).
+[Pages, Tuples and Heap Files](../../../p02-storage-engines/pages-tuples-heap-files/01-page-anatomy-and-the-slotted-page/).
 
 ## Where it bites in production
 

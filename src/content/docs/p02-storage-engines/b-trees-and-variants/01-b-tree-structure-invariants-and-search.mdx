@@ -46,7 +46,7 @@ The theoretical statement is the external-memory bound: with a block size of B k
 Θ(log<sub>B</sub> N) block transfers rather than the Θ(log₂ N) of an in-memory tree. The base of
 the logarithm is the whole trick, and it is why height moves so slowly — at fanout 366, going
 from a billion rows to a trillion adds **one** level. Why B and not some other base is
-[page 8](/p02-storage-engines/b-trees-and-variants/08-why-fanout-b-the-external-memory-model-optimality-bounds-and/).
+[page 8](../../../p02-storage-engines/b-trees-and-variants/08-why-fanout-b-the-external-memory-model-optimality-bounds-and/).
 
 ## The five invariants
 
@@ -59,7 +59,7 @@ invariant that makes the cost model trivial: every key costs the same descent, s
 index latency differ only by what is cached. It survives insertion because a B+tree grows
 *upward*: a full node splits and pushes a separator into its parent, and only when the root
 itself splits does the tree get taller. No leaf ever gets deeper than its siblings. (The
-mechanics are [page 2](/p02-storage-engines/b-trees-and-variants/02-insert-split-delete-and-merge/).)
+mechanics are [page 2](../../../p02-storage-engines/b-trees-and-variants/02-insert-split-delete-and-merge/).)
 
 **2. Keys within a node are sorted, and separators partition the key space.** A node with *c*
 children holds *c − 1* separators s₁ < s₂ < … < s꜀₋₁, and the subtree under child *i* contains
@@ -72,7 +72,7 @@ that a row with that key exists. PostgreSQL leans on this hard: since version 12
 column values that still distinguishes the two subtrees. A composite index on
 `(tenant_id, created_at, id)` may have pivots that carry only `tenant_id`, which raises fanout in
 the internal levels for free; the encoding is
-[page 6](/p02-storage-engines/b-trees-and-variants/06-key-layout-prefix-compression-and-suffix-truncation/).
+[page 6](../../../p02-storage-engines/b-trees-and-variants/06-key-layout-prefix-compression-and-suffix-truncation/).
 `INCLUDE` columns, added in PostgreSQL 11, are truncated away entirely — they exist only in the
 leaves, which is the point.
 
@@ -110,7 +110,7 @@ each level.
 
 The **inner search** is inside a page. A B+tree page is a slotted page — the line-pointer array
 is kept *sorted by key* even though the tuples themselves are not moved, exactly as described in
-[Page anatomy and the slotted page](/p02-storage-engines/pages-tuples-heap-files/01-page-anatomy-and-the-slotted-page/)
+[Page anatomy and the slotted page](../../../p02-storage-engines/pages-tuples-heap-files/01-page-anatomy-and-the-slotted-page/)
 — so the engine binary-searches the slot array. PostgreSQL's `_bt_binsrch` does ⌈log₂ 366⌉ = 9
 comparisons per page, so a height-4 descent is ~36 key comparisons, each one a function call into
 a datatype's comparison operator (and, for `text`, into the collation library). InnoDB adds an

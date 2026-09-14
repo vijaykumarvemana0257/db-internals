@@ -50,7 +50,7 @@ Three consequences worth having in your hands:
 It means "copied into the page cache and marked dirty". The bytes survive a process crash — the
 page cache belongs to the kernel, not to you — but a power cut loses them. Only `fsync()`,
 `fdatasync()` or opening with `O_SYNC` changes that, and [what fsync actually
-promises](/p01-foundations/hardware-os-durability/06-fsync-write-barriers-and-the-durability-contract/)
+promises](../../../p01-foundations/hardware-os-durability/06-fsync-write-barriers-and-the-durability-contract/)
 is narrower than most people assume.
 :::
 
@@ -222,7 +222,7 @@ caching, added `debug_io_direct` in 16, the streaming read API in 17 and the AIO
 InnoDB has run `O_DIRECT` for a decade. The reason is not that the page cache is badly written —
 it is that an engine knows things the kernel cannot: which page is a B-tree root, which scan is a
 one-shot, which write must not precede which log flush. [Direct I/O and
-io_uring](/p01-foundations/hardware-os-durability/09-direct-i-o-vs-buffered-i-o-and-io-uring/)
+io_uring](../../../p01-foundations/hardware-os-durability/09-direct-i-o-vs-buffered-i-o-and-io-uring/)
 takes this apart properly.
 
 ## Where it bites in production

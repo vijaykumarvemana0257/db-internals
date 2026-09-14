@@ -1,11 +1,11 @@
 ---
 title: The full curriculum
-description: Every part, module and page on this site — 11 parts, 45 modules, 396 pages.
+description: Every part, module and page on this site — 12 parts, 104 modules, 716 pages.
 tableOfContents: false
 ---
 
 12 parts · 104 modules · 716 pages.
-**57** are written so far; the rest are specified and queued.
+**66** are written so far; the rest are specified and queued.
 
 ## Part 1 — Foundations: Machines, Data and the Shape of an Engine
 
@@ -15,11 +15,11 @@ The physics of storage and durability, the data models and SQL a beginner needs,
 
 *foundations* — Ninety-odd modules and several hundred subtopics presented as one front-to-back sequence serve nobody by default: an application engineer who needs index selection, EXPLAIN and isolation should not be told to read the FTL and epoch reclamation first, an SRE who arrives mid-incident needs a symptom-shaped entry point rather than chapter one, and the distributed track needs exactly one module from Part 5 rather than all thirteen. A short opener that states the routes, the depth legend and the predict-then-run method keeps the linear order as the default rather than the only option — and every route, count and time estimate on this page is generated from the curriculum's own module and prerequisite data, so no route it prints can contradict the dependency graph it draws.
 
-- Three routes through the same modules <span class="pending">soon</span>
-- Routes for operators, data engineers and platform engineers <span class="pending">soon</span>
-- Depth levels, prerequisites and stopping points <span class="pending">soon</span>
-- How to use the simulations <span class="pending">soon</span>
-- Five questions to ask of any data system <span class="pending">soon</span>
+- [Three routes through the same modules](/db-internals/p01-foundations/start-here-routes-and-method/01-three-routes-through-the-same-modules/)
+- [Routes for operators, data engineers and platform engineers](/db-internals/p01-foundations/start-here-routes-and-method/02-routes-for-operators-data-engineers-and-platform-engineers/)
+- [Depth levels, prerequisites and stopping points](/db-internals/p01-foundations/start-here-routes-and-method/03-depth-levels-prerequisites-and-stopping-points/)
+- [How to use the simulations](/db-internals/p01-foundations/start-here-routes-and-method/04-how-to-use-the-simulations/)
+- [Five questions to ask of any data system](/db-internals/p01-foundations/start-here-routes-and-method/05-five-questions-to-ask-of-any-data-system/)
 
 ### 1.2 Data Models and a Hands-On SQL Primer
 
@@ -121,7 +121,30 @@ The single-node storage substrate in depth: page layout, buffer management, B-tr
 - [Collation, Unicode and byte-comparable key encoding](/db-internals/p02-storage-engines/b-trees-and-variants/07-collation-unicode-and-byte-comparable-key-encoding/)
 - [Why fanout B: the external-memory model, optimality bounds and cache-oblivious layouts](/db-internals/p02-storage-engines/b-trees-and-variants/08-why-fanout-b-the-external-memory-model-optimality-bounds-and/)
 
-### 2.5 B-Tree Concurrency and Write-Optimized Variants
+### 2.5 Log-Structured Merge Trees
+
+*core* — LSM trees power RocksDB, Cassandra, and most distributed stores; the write path, the sorted-run file format and the filtered read path explain both their speed and where that speed quietly disappears.
+
+- [Append-only logs and Bitcask hash indexes](/db-internals/p02-storage-engines/lsm-trees/01-append-only-logs-and-bitcask-hash-indexes/)
+- [Write path: WAL, memtable, flush and write stalls](/db-internals/p02-storage-engines/lsm-trees/02-write-path-wal-memtable-flush-and-write-stalls/)
+- [Skip lists: probabilistic balance without rebalancing](/db-internals/p02-storage-engines/lsm-trees/03-skip-lists-probabilistic-balance-without-rebalancing/)
+- [Writes that must read first: constraints, secondary indexes and Merge](/db-internals/p02-storage-engines/lsm-trees/04-writes-that-must-read-first-constraints-secondary-indexes-an/)
+- [SSTable format: blocks, restart points, index, filters, footer](/db-internals/p02-storage-engines/lsm-trees/05-sstable-format-blocks-restart-points-index-filters-footer/)
+- Read path, Bloom filters and the block cache <span class="pending">soon</span>
+- Deletes, tombstones, TTL and snapshots <span class="pending">soon</span>
+- Beyond Bloom: cuckoo, quotient, xor and ribbon filters <span class="pending">soon</span>
+
+### 2.6 LSM Compaction, Amplification and Crash Safety
+
+*core* — Everything an LSM costs in practice — write amplification, space bloat, stalls, recovery time and bulk-load behavior — is decided by the compaction policy and the version/manifest machinery that installs its output.
+
+- Why compaction exists: the three amplifications and the RUM trade-off <span class="pending">soon</span>
+- Compaction strategies: leveled, tiered, TWCS and lazy leveling <span class="pending">soon</span>
+- Key-value separation and blob storage <span class="pending">soon</span>
+- Manifest, versions and crash safety <span class="pending">soon</span>
+- Bulk loading and external SSTable ingestion <span class="pending">soon</span>
+
+### 2.7 B-Tree Concurrency and Write-Optimized Variants
 
 *advanced* — Once many cores hit the same index, correctness and throughput come from latch protocols, the memory model beneath them and safe reclamation — and the same pressure produced the latch-free, write-optimized and copy-on-write descendants of the B+tree, which only make sense once you have seen both a B+tree and an LSM and can price one against the other; this module is the first 'enough for most engineers, stop here' boundary in Part 2, so a reader who stops after it still has the complete core storage spine, while everything here is what you need before reading engine source or designing an index yourself.
 
@@ -131,29 +154,6 @@ The single-node storage substrate in depth: page layout, buffer management, B-tr
 - Memory reclamation for latch-free structures: epochs, hazard pointers, RCU <span class="pending">soon</span>
 - Bε-trees, fractal trees and copy-on-write B-trees <span class="pending">soon</span>
 - Persistence by path copying: fat nodes, versions and why snapshots are cheap <span class="pending">soon</span>
-
-### 2.6 Log-Structured Merge Trees
-
-*core* — LSM trees power RocksDB, Cassandra, and most distributed stores; the write path, the sorted-run file format and the filtered read path explain both their speed and where that speed quietly disappears.
-
-- [Append-only logs and Bitcask hash indexes](/db-internals/p02-storage-engines/lsm-trees/01-append-only-logs-and-bitcask-hash-indexes/)
-- Write path: WAL, memtable, flush and write stalls <span class="pending">soon</span>
-- Skip lists: probabilistic balance without rebalancing <span class="pending">soon</span>
-- Writes that must read first: constraints, secondary indexes and Merge <span class="pending">soon</span>
-- SSTable format: blocks, restart points, index, filters, footer <span class="pending">soon</span>
-- Read path, Bloom filters and the block cache <span class="pending">soon</span>
-- Deletes, tombstones, TTL and snapshots <span class="pending">soon</span>
-- Beyond Bloom: cuckoo, quotient, xor and ribbon filters <span class="pending">soon</span>
-
-### 2.7 LSM Compaction, Amplification and Crash Safety
-
-*core* — Everything an LSM costs in practice — write amplification, space bloat, stalls, recovery time and bulk-load behavior — is decided by the compaction policy and the version/manifest machinery that installs its output.
-
-- Why compaction exists: the three amplifications and the RUM trade-off <span class="pending">soon</span>
-- Compaction strategies: leveled, tiered, TWCS and lazy leveling <span class="pending">soon</span>
-- Key-value separation and blob storage <span class="pending">soon</span>
-- Manifest, versions and crash safety <span class="pending">soon</span>
-- Bulk loading and external SSTable ingestion <span class="pending">soon</span>
 
 ### 2.8 Indexes Beyond the B-Tree
 
@@ -244,19 +244,7 @@ Parsing, rewriting, physical operators, cost-based optimization, execution engin
 - Views, CTEs and materialization fences <span class="pending">soon</span>
 - Rule pipelines: where heuristics end and cost begins <span class="pending">soon</span>
 
-### 3.2 Rewrite Legality, Decorrelation and Recursive Evaluation
-
-*advanced* — Whether a correlated subquery becomes one free semi join or a per-row re-execution, and whether an aggressive rewrite still returns the same answer, is decided in this layer; a senior engineer needs the actual decision procedure for legality (containment, the chase, and the bag-, NULL- and incomplete-information traps that void textbook equivalences), the unnesting machinery that removes dependent joins, and the fixpoint theory behind recursion, magic sets and incremental maintenance. It is positioned fifth in Part 3, after physical-operators, join-algorithms-at-the-limit and cost-based-optimization, because the rewrites here are only meaningful once hash/semi/anti joins, Bloom-filter semi-join reduction and the planner's search space are already familiar — and it opens with the data-vs-combined-complexity frame that explains every blow-up in the module, so the application-engineer route in start-here-routes-and-method can skip it entirely and lose nothing it needs downstream.
-
-- Data complexity vs combined complexity: cheap in the rows, expensive in the query <span class="pending">soon</span>
-- Query equivalence, containment and the chase: when is a rewrite legal? <span class="pending">soon</span>
-- Incomplete information: certain answers and what a NULL actually means <span class="pending">soon</span>
-- Subquery unnesting and decorrelation <span class="pending">soon</span>
-- Advanced rewrites: join elimination, aggregate pushdown, CSE and magic sets <span class="pending">soon</span>
-- Row-level provenance: why is this row in my answer? <span class="pending">soon</span>
-- Datalog and fixpoint evaluation: recursion the engine can reason about <span class="pending">soon</span>
-
-### 3.3 Physical Operators: Scans, Joins, Sorting and Aggregation
+### 3.2 Physical Operators: Scans, Joins, Sorting and Aggregation
 
 *core* — Every plan node is one of a dozen algorithms whose I/O and memory behavior you must be able to predict.
 
@@ -271,7 +259,7 @@ Parsing, rewriting, physical operators, cost-based optimization, execution engin
 - Write operators: ModifyTable, junk TIDs and Halloween protection <span class="pending">soon</span>
 - Choosing among operators: cost intuition <span class="pending">soon</span>
 
-### 3.4 Join Algorithms at the Limit: Worst-Case-Optimal, Cache-Aware and Distributed
+### 3.3 Join Algorithms at the Limit: Worst-Case-Optimal, Cache-Aware and Distributed
 
 *advanced* — Binary hash and merge joins run into three separate ceilings — a provable complexity bound on output size, the memory hierarchy, and the network between shards — and the algorithms that break each one are where modern join execution is headed.
 
@@ -280,7 +268,7 @@ Parsing, rewriting, physical operators, cost-based optimization, execution engin
 - In-memory parallel joins: radix partitioning and cache-aware hashing <span class="pending">soon</span>
 - Distributed join strategies: co-located, broadcast, shuffle and semi-join reduction <span class="pending">soon</span>
 
-### 3.5 Cost-Based Optimization
+### 3.4 Cost-Based Optimization
 
 *advanced* — Cardinality estimation and join-order search are where plans go wrong, and knowing why is the difference between guessing and fixing.
 
@@ -294,6 +282,18 @@ Parsing, rewriting, physical operators, cost-based optimization, execution engin
 - Cascades and Volcano top-down optimization <span class="pending">soon</span>
 - Join ordering search space and heuristics <span class="pending">soon</span>
 - Adaptive and learned optimization <span class="pending">soon</span>
+
+### 3.5 Rewrite Legality, Decorrelation and Recursive Evaluation
+
+*advanced* — Whether a correlated subquery becomes one free semi join or a per-row re-execution, and whether an aggressive rewrite still returns the same answer, is decided in this layer; a senior engineer needs the actual decision procedure for legality (containment, the chase, and the bag-, NULL- and incomplete-information traps that void textbook equivalences), the unnesting machinery that removes dependent joins, and the fixpoint theory behind recursion, magic sets and incremental maintenance. It is positioned fifth in Part 3, after physical-operators, join-algorithms-at-the-limit and cost-based-optimization, because the rewrites here are only meaningful once hash/semi/anti joins, Bloom-filter semi-join reduction and the planner's search space are already familiar — and it opens with the data-vs-combined-complexity frame that explains every blow-up in the module, so the application-engineer route in start-here-routes-and-method can skip it entirely and lose nothing it needs downstream.
+
+- Data complexity vs combined complexity: cheap in the rows, expensive in the query <span class="pending">soon</span>
+- Query equivalence, containment and the chase: when is a rewrite legal? <span class="pending">soon</span>
+- Incomplete information: certain answers and what a NULL actually means <span class="pending">soon</span>
+- Subquery unnesting and decorrelation <span class="pending">soon</span>
+- Advanced rewrites: join elimination, aggregate pushdown, CSE and magic sets <span class="pending">soon</span>
+- Row-level provenance: why is this row in my answer? <span class="pending">soon</span>
+- Datalog and fixpoint evaluation: recursion the engine can reason about <span class="pending">soon</span>
 
 ### 3.6 Execution Engines, Vectorization and Parallelism
 

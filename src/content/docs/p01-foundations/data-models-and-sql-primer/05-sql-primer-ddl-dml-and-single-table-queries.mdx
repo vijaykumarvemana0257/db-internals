@@ -31,7 +31,7 @@ execute it however it likes as long as the answer matches what this order would 
 |---|---|---|---|
 | 2nd | 1st | `FROM` | Names the relation and produces its rows |
 | 3rd | 2nd | `WHERE` | Keeps rows whose predicate is **strictly TRUE** |
-| — | 3rd | `GROUP BY` / `HAVING` | Collapses rows into groups (the [next page](/p01-foundations/data-models-and-sql-primer/06-sql-primer-joins-group-by-subqueries-and-set-operations/)) |
+| — | 3rd | `GROUP BY` / `HAVING` | Collapses rows into groups (the [next page](../../../p01-foundations/data-models-and-sql-primer/06-sql-primer-joins-group-by-subqueries-and-set-operations/)) |
 | 1st | 4th | `SELECT` | Evaluates the output list — **this is where aliases are created** |
 | 1st | 5th | `DISTINCT` | Folds duplicate output rows |
 | 4th | 6th | `ORDER BY` | Sorts the output rows |
@@ -112,7 +112,7 @@ Constraints are where the declaration can quietly not be a declaration. MySQL pa
 and silently ignored it until 8.0.16. SQLite enforces foreign keys only if the connection has
 run `PRAGMA foreign_keys = ON`, and it is off by default, so a schema full of `REFERENCES`
 clauses can be enforcing nothing at all. (What `UNIQUE`, `NOT NULL` and a foreign key *mean*
-under NULLs is [page 2's subject](/p01-foundations/data-models-and-sql-primer/02-the-relational-model-precisely-relations-keys-constraints-an/);
+under NULLs is [page 2's subject](../../../p01-foundations/data-models-and-sql-primer/02-the-relational-model-precisely-relations-keys-constraints-an/);
 this page is about the SQL that trips over them.)
 
 A `DEFAULT` is an expression evaluated **at insert time**, not at `CREATE TABLE` time —

@@ -40,7 +40,7 @@ is the ground truth for everything in this section.
 | Shared allocation | Sized by | Notes |
 |---|---|---|
 | Buffer blocks | `shared_buffers` | The frames themselves, 8 KB each |
-| Buffer descriptors, mapping table, checkpoint sort array | derived | ~64 B of cache-line-padded `BufferDesc` plus a hash entry and a sort slot per frame — on the order of 1–2% *on top of* `shared_buffers`. The [buffer pool structure page](/p02-storage-engines/buffer-pool/01-buffer-pool-structure-frames-page-table-and-pins/) owns what is in them |
+| Buffer descriptors, mapping table, checkpoint sort array | derived | ~64 B of cache-line-padded `BufferDesc` plus a hash entry and a sort slot per frame — on the order of 1–2% *on top of* `shared_buffers`. The [buffer pool structure page](../../../p02-storage-engines/buffer-pool/01-buffer-pool-structure-frames-page-table-and-pins/) owns what is in them |
 | WAL buffers | `wal_buffers` | Default `-1`: one thirty-second of `shared_buffers`, clamped to at least 64 kB and at most one 16 MB WAL segment |
 | Lock manager | `max_locks_per_transaction` × (`max_connections` + `max_prepared_transactions`) | A fixed-size hash of lockable objects, not a per-transaction limit |
 | Predicate lock manager | `max_pred_locks_per_transaction` × the same | Only used by `SERIALIZABLE`, allocated regardless |
@@ -177,7 +177,7 @@ bounds the whole engine instead of three numbers that sum to more than the conta
 A page pool is a random-access structure over gigabytes, which is the worst case for address
 translation. With 4 kB pages, a core's second-level dTLB — on the order of 1 500 to 3 000 entries
 on current x86 — reaches something like 6–12 MB. Everything past that pays a page-table walk on
-top of the DRAM access, and the [latency ladder](/p01-foundations/hardware-os-durability/01-memory-hierarchy-and-latency-numbers/)
+top of the DRAM access, and the [latency ladder](../../../p01-foundations/hardware-os-durability/01-memory-hierarchy-and-latency-numbers/)
 already told you what an extra memory access costs. Two-megabyte pages multiply that reach by 512
 and cut the page tables by the same factor; the second panel of the memory map shows both numbers
 moving as you toggle them.

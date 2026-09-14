@@ -1,0 +1,117 @@
+---
+title: Depth levels, prerequisites and stopping points
+description: What foundations, core, advanced and expert mean, how a page's depth differs from its module's level, when skipping a prerequisite is safe, and where a module is enough for most engineers.
+depth: basics
+sidebar:
+  order: 3
+---
+
+import PrereqChainExplorer from '../../../../components/viz/PrereqChainExplorer';
+
+Every module on this site carries two kinds of label, and they answer different questions. A
+module's **level** says where it sits in the curriculum. A page's **depth** says how far into the
+mechanism that page goes. Confusing the two is how people either give up on a module too early or
+spend an afternoon on material they did not need.
+
+<PrereqChainExplorer client:visible />
+
+## Module levels
+
+Modules are tagged with one of four levels, in order:
+
+- **Foundations** — assumes nothing beyond general programming. The vocabulary everything else
+  uses: relations and keys, what a database engine is made of, what the hardware and operating
+  system actually promise.
+- **Core** — the mechanisms every engineer who works with databases should be able to reason
+  about: pages, the buffer pool, B-trees, LSM trees, indexes.
+- **Advanced** — mechanisms you need when you own a system's behavior under load or failure:
+  concurrency control, recovery, cost-based optimization, buffer-pool contention, latch-free
+  index structures.
+- **Expert** — the material specialists and people building data systems need: consensus
+  variants, distributed transaction protocols.
+
+Level is a statement about *prerequisites*, not difficulty for its own sake. An expert module is
+expert because it stands on a long chain of earlier ones.
+
+## Page depth
+
+Inside a module, each page is marked **basics**, **intermediate** or **deep**. The strip under
+the chain shows the selected module's pages in reading order, colored by depth. The default,
+B-Trees, is a clean example: it opens with basics — structure, search, splits — moves through
+intermediate pages on crash safety, fill factor, bulk loading and key layout, and ends on deep
+pages about collation and the external-memory bounds behind why fanout matters.
+
+The two labels vary independently. A *core* module can end on *deep* pages, and an *advanced*
+module can open on a *basics* page. Pick a few modules and compare the level in the stats with the
+depth mix in the note.
+
+## Where a module is enough
+
+The stat labelled **Enough for most engineers** marks the last page before the first deep one.
+Everything up to that point is the mechanism and its practical consequences; the deep pages are
+where a module goes into implementation detail, theory, or the edge cases that matter mainly to
+people building or deeply tuning that component. For B-Trees, the marker falls just before the
+collation page.
+
+That example is also a warning. The collation page is marked deep, but it is where you learn why a
+`LIKE 'prefix%'` query can or cannot use an ordinary text index — something an application engineer
+tuning queries will hit. So read the marker as *a place to pause and decide*, not a wall: glance at
+the titles of the deep pages and read any that name a problem you actually have.
+
+This marker is derived from the page depths, so it is only as good as their ordering. A module
+that opens on a deep page is labelled *starts deep* — it is a specialist module as a whole, and
+the useful question is whether you need the module at all, not where to stop inside it. And where a
+module places an intermediate page after a deep one, that later page is past the marker even though
+it is not deep — the depth strip makes those visible at a glance.
+
+Routes have their own stopping points, described on the
+[routes page](../../../p01-foundations/start-here-routes-and-method/01-three-routes-through-the-same-modules/).
+Those say which *modules* a role can stop before; this marker says which *pages* inside a module.
+
+## Reading the chain
+
+The columns lay out everything the selected module assumes. The leftmost column is the module
+itself, the next holds what it declares directly, and each column further right holds prerequisites
+one step further back — placed by the *longest* path, so a module that is needed both directly and
+through something else appears in the column that respects both.
+
+Each prerequisite is declared by the module that needs it, in the curriculum data this site is
+built from. That makes the chain a check on everything else: a reading route that disagrees with
+the chain is wrong, and it shows up here as a module whose foundations are missing.
+
+## When skipping a prerequisite is safe
+
+Use **Skip a prerequisite** to remove one module from the chain. Every module that transitively
+depends on it is marked **⚠**, and the note counts how many more depend on it elsewhere in the
+curriculum.
+
+The size of that blast radius is the answer to "can I skip this?". On the default chain, skipping
+the Buffer Pool strands only B-Trees itself: the buffer pool is a direct prerequisite with nothing
+else in this chain built on it, so if you already understand frames, pins and eviction, skipping
+it costs you little. Now skip the Data Models and SQL Primer instead, and every other module in the
+chain is marked, because the hardware, anatomy, page-layout and buffer-pool modules all assume its
+vocabulary. That is the general rule:
+
+- **Safe to skip** when the module has a small blast radius *and* you already know its content —
+  for example, you have worked with the mechanism in production.
+- **Not safe to skip** when it sits near the root of many chains. Foundations modules almost always
+  do, which is why they are cheap to read and expensive to miss.
+
+A stranded page still reads. It does not break; it just leans on terms and mechanisms it assumes
+you already have, and the failure mode is quiet — you follow the words without being able to
+predict what the mechanism will do.
+
+## Recommended later reading
+
+A few modules point forward to modules later in the curriculum as *recommended later reading*
+rather than as prerequisites — for example, Index Selection points ahead to cost-based
+optimization and EXPLAIN. Those modules are written to stand on their own, introducing just
+enough of the later material to make their decisions, and they tell you where the full treatment
+lives. Select one and the note lists its forward pointers. They never appear in the chain, because
+you do not need them first.
+
+:::note[What to take forward]
+Level tells you where a module sits; depth tells you how far a page goes. Stop a module at its last
+page before deep unless you are going to own that component, and before skipping a prerequisite,
+check how much of the chain stands on it.
+:::

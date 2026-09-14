@@ -44,9 +44,9 @@ half of a key range lands at a physically unrelated block; after a few hundred t
 correlation between key order and block number is zero, which is what the scatter plot in the lab
 is showing. And the split is WAL-logged as a structural change: the insert itself logs a few dozen
 bytes, but a split logs enough to rebuild both halves. See
-[Insert, split, delete and merge](/p02-storage-engines/b-trees-and-variants/02-insert-split-delete-and-merge/)
+[Insert, split, delete and merge](../../../p02-storage-engines/b-trees-and-variants/02-insert-split-delete-and-merge/)
 for the split mechanics and
-[Fill factor, fragmentation and splits under load](/p02-storage-engines/b-trees-and-variants/04-fill-factor-fragmentation-and-splits-under-load/)
+[Fill factor, fragmentation and splits under load](../../../p02-storage-engines/b-trees-and-variants/04-fill-factor-fragmentation-and-splits-under-load/)
 for what that utilization does over a workload's lifetime.
 
 The one case that escapes most of this is a strictly ascending key. Every insert lands on the same
@@ -83,13 +83,13 @@ implements one pipeline:
    than one pass, which is rare at modern settings and expensive when it happens. Because the
    builder only ever reads forward, the final merge is not materialized — it streams straight into
    the next step. The full treatment is in
-   [External sort and sort-merge join](/p03-query-processing/physical-operators/03-external-sort-and-sort-merge-join/).
+   [External sort and sort-merge join](../../../p03-query-processing/physical-operators/03-external-sort-and-sort-merge-join/).
 4. **`_bt_load`.** The builder keeps **one in-progress page per level** — a `BTPageState` stack, so
    peak memory here is a handful of pages regardless of index size. Sorted tuples are appended to
    the current leaf until it reaches `fillfactor`; that page is then sealed, given a right-link to
    its successor, and written. Sealing a child is what produces a parent entry: the child's high
    key (the separator between its last key and its right sibling's first key, suffix-truncated as
-   described in [Key layout, prefix compression and suffix truncation](/p02-storage-engines/b-trees-and-variants/06-key-layout-prefix-compression-and-suffix-truncation/))
+   described in [Key layout, prefix compression and suffix truncation](../../../p02-storage-engines/b-trees-and-variants/06-key-layout-prefix-compression-and-suffix-truncation/))
    is appended to the level above, which fills and seals by the same rule. Non-leaf pages use
    `BTREE_NONLEAF_FILLFACTOR`, a fixed 70% — downlinks are the pages most likely to need room for a
    later insert, and they are a tiny fraction of the index.
@@ -108,7 +108,7 @@ entirely and fsyncs the finished relation instead.
 |---|---|---|
 | CPU | N descents, each O(log<sub>F</sub> N) page searches | N log N comparisons, once |
 | I/O, index > memory | ~N random reads + ~N random writes | ⌈N/B⌉ sequential reads of the heap + 2 sequential passes over the sort per merge pass + N/F sequential page writes |
-| External-memory bound | Θ(N log<sub>F</sub> N) block transfers | Θ((N/B)·log<sub>M/B</sub>(N/B)) for the sort, then Θ(N/F) — see [the external-memory model](/p02-storage-engines/b-trees-and-variants/08-why-fanout-b-the-external-memory-model-optimality-bounds-and/) |
+| External-memory bound | Θ(N log<sub>F</sub> N) block transfers | Θ((N/B)·log<sub>M/B</sub>(N/B)) for the sort, then Θ(N/F) — see [the external-memory model](../../../p02-storage-engines/b-trees-and-variants/08-why-fanout-b-the-external-memory-model-optimality-bounds-and/) |
 | Page splits | ~N/(F·ln 2) | none |
 | Leaf utilization | ln 2 ≈ 69% (random), `fillfactor` (strictly ascending) | exactly `fillfactor` |
 | Key order vs block order | uncorrelated | identical |
@@ -194,7 +194,7 @@ real write mix.
   — replica lag during a big `REINDEX` is not a bug, it is arithmetic.
 - **The lock.** `CREATE INDEX` takes a `ShareLock`: reads continue, writes block for the whole build.
   If that window is unacceptable, the answer is
-  [CREATE INDEX CONCURRENTLY](/p02-storage-engines/indexes-beyond-the-b-tree/09-building-indexes-online-create-index-concurrently-internals/),
+  [CREATE INDEX CONCURRENTLY](../../../p02-storage-engines/indexes-beyond-the-b-tree/09-building-indexes-online-create-index-concurrently-internals/),
   which trades two heap scans and a far slower build for not blocking writers.
 - **`maintenance_work_mem` is per build, not per server.** Four concurrent `REINDEX`es at 2 GB each is
   8 GB of anonymous memory. Raise it in the session that does the restore, not in `postgresql.conf`.

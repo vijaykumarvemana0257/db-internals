@@ -19,7 +19,7 @@ which means none of them can move a single page anywhere.
 
 ## Six shared writes on the way into one cached page
 
-The hit path is the one [buffer pool structure](/p02-storage-engines/buffer-pool/01-buffer-pool-structure-frames-page-table-and-pins/)
+The hit path is the one [buffer pool structure](../../../p02-storage-engines/buffer-pool/01-buffer-pool-structure-frames-page-table-and-pins/)
 walks: hash the tag, take the partition lock, find the frame, pin it, lock its contents, read,
 unlock, unpin. Counted as memory traffic rather than as steps, a PostgreSQL hit looks like this:
 
@@ -214,7 +214,7 @@ Bw-tree made the node itself immutable and CAS'd a mapping table instead, Leis e
 optimistic lock coupling (DaMoN 2016) turned it into a general recipe for tree descent, and
 LeanStore put versioned optimistic latches into the *buffer frames* — which is what makes the
 buffer manager in
-[Beyond the page table](/p02-storage-engines/buffer-pool-memory-mmap-and-contention/03-beyond-the-page-table-pointer-swizzling-in-memory-engines-an/)
+[Beyond the page table](../../../p02-storage-engines/buffer-pool-memory-mmap-and-contention/03-beyond-the-page-table-pointer-swizzling-in-memory-engines-an/)
 viable. Set the lab to point reads with optimistic
 latching and the pin and latch bars disappear entirely; what is left is the page-table lookup,
 which pointer swizzling removes as well.
@@ -230,7 +230,7 @@ the rightmost leaf is a logical serialization, and only a different key or a dif
 removes it.
 
 PostgreSQL cannot simply adopt this for buffers, because its pin is not an optimization — it is
-the [pin contract](/p02-storage-engines/buffer-pool/01-buffer-pool-structure-frames-page-table-and-pins/):
+the [pin contract](../../../p02-storage-engines/buffer-pool/01-buffer-pool-structure-frames-page-table-and-pins/):
 a non-zero pin count is the *only* thing that stops the clock sweep from replacing the bytes
 under a live pointer. Making the read path pinless means replacing
 that contract with a deferred-reclamation scheme, which is a different buffer manager, not a

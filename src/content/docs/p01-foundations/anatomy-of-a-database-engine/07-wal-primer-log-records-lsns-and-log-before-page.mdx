@@ -125,7 +125,7 @@ durable.
 record* — not when its pages are written. That is **no-force**, and it is why a commit costs
 one sequential `fdatasync()` of a few hundred bytes instead of N random page writes. The
 `fdatasync()` is the expensive part; its cost and the group-commit trick that amortizes it are
-in [fsync, write barriers and the durability contract](/p01-foundations/hardware-os-durability/06-fsync-write-barriers-and-the-durability-contract/).
+in [fsync, write barriers and the durability contract](../../../p01-foundations/hardware-os-durability/06-fsync-write-barriers-and-the-durability-contract/).
 
 :::note[These are the *only* two rules]
 Nothing requires a dirty page to be written at any particular time, or ever. A page can sit
@@ -203,10 +203,10 @@ and survive, and it is the reason ARIES describes redo as "repeating history".
 Redo replays everything, including records from transactions that never committed. Cleaning
 those up is the undo pass, which needs compensation log records so that undo is itself
 restartable — that, along with checkpoint algorithms, group commit and the rest of the ARIES
-machinery, is [Write-Ahead Logging, Checkpoints and the Commit Path](/curriculum/) and
-[Crash Recovery](/curriculum/). The page-level write path that produces these records —
+machinery, is [Write-Ahead Logging, Checkpoints and the Commit Path](../../../curriculum/) and
+[Crash Recovery](../../../curriculum/). The page-level write path that produces these records —
 which byte of which tuple, and who takes the latch — is
-[Pages, Tuples and Heap Files](/curriculum/).
+[Pages, Tuples and Heap Files](../../../curriculum/).
 
 ## Where it bites in production
 

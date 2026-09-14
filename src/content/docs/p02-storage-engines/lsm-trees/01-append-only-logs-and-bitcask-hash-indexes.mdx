@@ -40,7 +40,7 @@ A record is framed like this, and the framing is the whole file format:
 
 Fourteen bytes of header, then the bytes you asked to store. There is no page, no slot array, no
 free-space map, no fragmentation to manage — the concerns that
-[heap file organization](/p02-storage-engines/pages-tuples-heap-files/03-heap-file-organization-and-free-space-management/)
+[heap file organization](../../../p02-storage-engines/pages-tuples-heap-files/03-heap-file-organization-and-free-space-management/)
 spends its whole existence on simply do not arise, because space is never reused.
 
 In RAM sits the **keydir**: a hash table from key to a fixed-size entry.
@@ -55,7 +55,7 @@ record the entry used to point at is still on disk, byte for byte, and is now un
 up behind it. That is the entire update mechanism: *overwrite by append*, with a garbage trail.
 
 Two consequences fall straight out of the ratio from the
-[latency ladder](/p01-foundations/hardware-os-durability/01-memory-hierarchy-and-latency-numbers/):
+[latency ladder](../../../p01-foundations/hardware-os-durability/01-memory-hierarchy-and-latency-numbers/):
 
 - **A write is one sequential append.** No read-modify-write of a page, no seek to a location the
   key determines, no split. The cost does not depend on how much data you already have, which is
@@ -79,28 +79,29 @@ destroys the entire index and loses no data at all. Press **Crash** in the lab: 
 out, not because the bytes are gone but because nothing can find them.
 
 The durability contract is the ordinary one from
-[fsync and write barriers](/p01-foundations/hardware-os-durability/06-fsync-write-barriers-and-the-durability-contract/):
+[fsync and write barriers](../../../p01-foundations/hardware-os-durability/06-fsync-write-barriers-and-the-durability-contract/):
 an append that has only reached the page cache survives a process crash and not a power cut. Riak
 exposes this directly as a sync strategy — never sync and let the OS write back on its own schedule,
 open the active file `O_SYNC` and pay a barrier per write, or sync on a timer and accept a bounded
 loss window. The knob is the same trade every engine offers; what is unusual here is how little
 machinery sits behind it, because there is no separate log to keep ordered against a heap. The log
-*is* the database. The [WAL primer](/p01-foundations/anatomy-of-a-database-engine/07-wal-primer-log-records-lsns-and-log-before-page/)
+*is* the database. The [WAL primer](../../../p01-foundations/anatomy-of-a-database-engine/07-wal-primer-log-records-lsns-and-log-before-page/)
 described a redo log that exists to protect pages written elsewhere; Bitcask deletes the
 "elsewhere".
 
 Crash recovery of the file tail is the `crc32` field's job. A power cut mid-append leaves a partial
-record; on startup the checksum over that record fails, the file is truncated at the last complete
-record, and nothing downstream ever sees the fragment. This is why the checksum is *per record*
+record; on startup that record either ends before its declared length or fails its checksum, so the
+rebuild treats the file as ending at the last complete record, and nothing downstream ever sees the
+fragment. This is why the checksum is *per record*
 rather than per page: the recovery unit and the write unit are the same thing.
 
 ## Delete is an append too
 
 There is no way to erase a record — files are immutable and the active file only grows. So a delete
 appends a record whose value is a **tombstone**: in early Bitcask, the literal sentinel
-`bitcask_tombstone`; later versions a versioned tombstone that also records the file id and offset
-of the record it supersedes, so a merge can tell whether the value it shadows is inside the set of
-files being merged. The keydir entry is then marked deleted (or removed, once nothing older can
+`bitcask_tombstone`; later versions write a versioned tombstone carrying extra metadata about the
+record it supersedes, so a merge can tell whether the value it shadows is inside the set of files
+being merged. The keydir entry is then marked deleted (or removed, once nothing older can
 resurface), and a `get` answers `not_found` without touching disk.
 
 Press **delete** in the lab and read the disk stats: the "dead bytes" number goes *up*. A delete
@@ -148,10 +149,16 @@ Eighteen bytes plus the key — everything the keydir needs and none of the payl
 file with a hint file is rebuilt by reading the hint file; a file without one (the active file,
 plus any closed file not yet merged) must be scanned in full.
 
-Flip the lab's **Restart reads** control between *hint files* and *full scan* and watch the bytes
-read and the rebuild time. The speedup is simply the ratio of average record size to average hint
-entry size: with 20-byte keys and 1 KB values it is roughly 30×, and with 100 KB values it is
-thousands. That ratio is the difference between a node rejoining a cluster in seconds and a node
+To see it in the lab, write a couple of batches with **Run 6 ops**, press **Roll file** and then
+**Merge**, so the records land in a merged file with a hint file beside it. Then press **Crash** and
+**Restart** once with **Restart reads** set to *hint files* and once with *full scan*, and compare
+the bytes read. At the lab's default value size the hint file is about a tenth of the data; drag
+**Value size** to its maximum and repeat, and the gap grows to dozens of times. Roll and merge first
+matters: the active file, and any closed file not yet merged, has no hint file and is scanned in full
+either way.
+
+The speedup is simply the ratio of average record size to average hint entry size: with 20-byte
+keys and 1 KB values it is roughly 30×, and with 100 KB values it is thousands. That ratio is the difference between a node rejoining a cluster in seconds and a node
 that is unavailable for an hour after a reboot.
 
 :::note[Startup cost is proportional to bytes on disk]
@@ -189,8 +196,8 @@ then issue one random read per hit. The cost is O(total keys) regardless of how 
 is no way to stream results in key order without sorting the whole keyspace first.
 
 This is not a tuning problem, it is the data structure. It shows up in Riak as a hard product
-boundary: the Bitcask backend cannot serve secondary-index queries at all — Riak's 2i requires the
-LevelDB backend instead, which is to say a backend built on *sorted* files. Anything that needs
+boundary: the Bitcask backend cannot serve secondary-index queries at all — Riak's 2i needs the
+LevelDB or in-memory backend instead, and on disk that means a backend built on *sorted* files. Anything that needs
 ordered access — a range predicate, a prefix scan, an ordered iterator, a merge join, a time-series
 slice — is off the table.
 
@@ -199,7 +206,8 @@ would need a random read per lookup and could not be scanned in order either. Ma
 files **sorted** fixes both at once. A sorted file can carry a sparse index — one entry per block
 rather than per key — so the in-memory footprint drops by the block size divided by the record size,
 and it can be scanned in key order and merged with other sorted files in a single pass. That file is
-the SSTable, and it is the next page.
+the SSTable. The next pages build the write path that produces sorted files, and the SSTable format
+gets its own page after that.
 
 ## Where it bites in production
 

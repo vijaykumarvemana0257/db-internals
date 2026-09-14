@@ -219,7 +219,7 @@ elegance:
   produces rows that were never asserted.
 - **Fan-out double counting.** `SUM(salary)` over the flat table multiplies every salary by that
   employee's phone-number count. This is the same fan-out trap as
-  [page 1](/p01-foundations/sql-semantics-types-and-schema-design/01-sql-semantics-engineers-get-wrong/),
+  [page 1](../../../p01-foundations/sql-semantics-types-and-schema-design/01-sql-semantics-engineers-get-wrong/),
   with the cross product baked into storage rather than created by a join, and `DISTINCT` will
   not save you because the duplicated values are genuinely distinct rows. BI tools have a name
   for the modelling version — the *chasm trap*, two independent one-to-many bridges hanging off
@@ -247,7 +247,7 @@ domain-key normal form is a beautiful result and not an engineering target.
 The practical payoff of all of this returns in Part 5, where the same question — which facts are
 independent, and which storage engine's data model can express that independence natively — is
 what decides whether a document, wide-column or relational store is the right home for a given
-entity. See the [curriculum map](/curriculum/) for that module.
+entity. See the [curriculum map](../../../curriculum/) for that module.
 
 :::note[What to take forward]
 An MVD is the constraint that forces a relation to store a cross product, and BCNF cannot see it

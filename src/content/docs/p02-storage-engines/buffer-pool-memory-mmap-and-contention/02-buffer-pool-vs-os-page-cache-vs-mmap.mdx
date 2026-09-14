@@ -22,7 +22,7 @@ Run the lab in **pool + buffered** mode and read a dozen pages. Every miss takes
 `pread()` finds no folio, the kernel allocates one, the drive DMAs 8 KiB into it, and
 `copy_folio_to_iter()` memcpys those bytes into the frame the engine already reserved. Now two
 frames of RAM hold one page of data, and nothing in either layer will notice. The engine's
-[page table](/p02-storage-engines/buffer-pool/01-buffer-pool-structure-frames-page-table-and-pins/)
+[page table](../../../p02-storage-engines/buffer-pool/01-buffer-pool-structure-frames-page-table-and-pins/)
 maps `(relfilenode, fork, blocknum)` to a frame it owns; the kernel's XArray maps `(inode, offset)`
 to a folio it owns. They agree on the bytes and on nothing else.
 
@@ -44,7 +44,7 @@ and you are paying full price for them.
 
 **A policy you cannot reach.** The kernel's reclaim does not know that block 0 of an index is a
 B+tree root and that this 2 GB sequential read is a one-shot. The engine has
-[midpoint insertion and ring buffers](/p02-storage-engines/buffer-pool/05-scan-resistance-sequential-flooding-ring-buffers-and-midpoin/)
+[midpoint insertion and ring buffers](../../../p02-storage-engines/buffer-pool/05-scan-resistance-sequential-flooding-ring-buffers-and-midpoin/)
 for exactly that; the page cache has `POSIX_FADV_DONTNEED` and hope.
 
 PostgreSQL accepts all of this on purpose. The familiar advice to set `shared_buffers` to about 25%
@@ -78,18 +78,18 @@ engine decides. What you must now supply yourself:
 - **Alignment.** Buffer address, file offset and length must all be aligned to the device's logical
   block size, or `pwrite()` returns `EINVAL` with nothing written. That is why engines allocate
   pool memory with `posix_memalign()` and why a partial page write is not expressible.
-  [Direct I/O and io_uring](/p01-foundations/hardware-os-durability/09-direct-i-o-and-io-uring-alignment-submission-and-completion/)
+  [Direct I/O and io_uring](../../../p01-foundations/hardware-os-durability/09-direct-i-o-and-io-uring-alignment-submission-and-completion/)
   has the mechanics.
 - **Readahead.** The kernel does none for an `O_DIRECT` descriptor. InnoDB implements its own —
   linear read-ahead fires once `innodb_read_ahead_threshold` (default 56) of the 64 pages in an
   extent have been touched in order — and every direct-I/O engine needs
-  [an equivalent](/p02-storage-engines/buffer-pool/07-prefetching-and-asynchronous-reads/).
+  [an equivalent](../../../p02-storage-engines/buffer-pool/07-prefetching-and-asynchronous-reads/).
 - **Concurrency.** A synchronous direct read is one outstanding command on a device built for
   dozens. Without async submission — libaio, io_uring, or a pool of I/O worker threads — direct I/O
   is *slower* than buffered, and this is the single most common reason a naive switch regresses.
 - **A cold start with no safety net.** There is no kernel copy to fall back on, so a restarted
   server reads everything from the device until the pool refills. Hence
-  [dump and reload of the pool contents](/p02-storage-engines/buffer-pool/02-cache-warm-up-cold-pools-dump-load-and-prewarming/).
+  [dump and reload of the pool contents](../../../p02-storage-engines/buffer-pool/02-cache-warm-up-cold-pools-dump-load-and-prewarming/).
 
 The knobs, by engine:
 
@@ -109,7 +109,7 @@ when it can be fast rather than merely correct.
 :::note[Direct I/O is not durability]
 `O_DIRECT` bypasses the page cache. It says nothing about the drive's volatile write cache, and
 `fsync()` is still required — see
-[the durability contract](/p01-foundations/hardware-os-durability/06-fsync-write-barriers-and-the-durability-contract/).
+[the durability contract](../../../p01-foundations/hardware-os-durability/06-fsync-write-barriers-and-the-durability-contract/).
 Two independent decisions that people routinely collapse into one.
 :::
 
@@ -122,7 +122,7 @@ Recovery has a data file containing a change at an LSN the log never recorded. R
 reproduce it — the log record describing that change died in the WAL buffer. Undo cannot remove it
 — there is no before-image. The page's checksum is perfectly valid, because the page is internally
 consistent and semantically wrong. This is the failure the
-[WAL-before-data rule](/p02-storage-engines/buffer-pool/06-dirty-pages-write-back-and-the-wal-before-data-rule/)
+[WAL-before-data rule](../../../p02-storage-engines/buffer-pool/06-dirty-pages-write-back-and-the-wal-before-data-rule/)
 exists to prevent, and in mmap mode there is no mechanism with which to prevent it. `msync()`
 flushes a range *now*; nothing anywhere says *not yet*. You do not even need the flusher thread to
 do it to you: in the lab, once the mapping has filled RAM, faulting in one more page evicts a dirty

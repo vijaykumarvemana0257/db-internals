@@ -20,7 +20,7 @@ which shrinks the internal levels until they fit in memory and stay there.
 ## A cell is not a key
 
 An index page is a slotted page, laid out exactly as
-[Page anatomy and the slotted page](/p02-storage-engines/pages-tuples-heap-files/01-page-anatomy-and-the-slotted-page/)
+[Page anatomy and the slotted page](../../../p02-storage-engines/pages-tuples-heap-files/01-page-anatomy-and-the-slotted-page/)
 describes: a fixed header at the low end, an array of fixed-width line pointers growing up
 from it, and variable-length cells growing down from the high end. What changes for an index
 is what goes in the cell and what the slot array means.
@@ -95,7 +95,7 @@ copied up to the parent at split time, kept in two places on purpose. A descent 
 at a page and finds its search key greater than the high key knows it is at a stale page and
 must follow `btpo_next` to the right — the Lehman-Yao rule that lets readers proceed without
 holding a lock on the parent, and the reason an
-[incomplete split](/p02-storage-engines/b-trees-and-variants/03-crash-safety-of-structure-modifications-atomic-splits-and-in/)
+[incomplete split](../../../p02-storage-engines/b-trees-and-variants/03-crash-safety-of-structure-modifications-atomic-splits-and-in/)
 is still searchable. (The locking protocol built on it belongs to the concurrency module.)
 
 For this page, the high key is a cost: one extra cell per page, which is why the lab subtracts
@@ -182,7 +182,7 @@ see both effects at once.
 
 That is the concrete cost behind the "use a narrow, monotonic primary key" advice, and it
 compounds with the split behaviour of random keys covered in
-[Fill factor, fragmentation and splits under load](/p02-storage-engines/b-trees-and-variants/04-fill-factor-fragmentation-and-splits-under-load/).
+[Fill factor, fragmentation and splits under load](../../../p02-storage-engines/b-trees-and-variants/04-fill-factor-fragmentation-and-splits-under-load/).
 InnoDB also enforces a hard ceiling: 3072 bytes of index key with the `DYNAMIC` or
 `COMPRESSED` row format at the default 16 KB page, 767 with `COMPACT` or `REDUNDANT`, which is
 why long `VARCHAR` columns end up indexed by a prefix (`KEY (url(191))`).
@@ -205,7 +205,7 @@ most comparisons are a single integer compare, with the full comparator as a tie
 
 That encoding is also where the ordering guarantees of the whole tree come from, and where
 they can be silently lost. The next page takes it apart:
-[Collation, Unicode and byte-comparable key encoding](/p02-storage-engines/b-trees-and-variants/07-collation-unicode-and-byte-comparable-key-encoding/).
+[Collation, Unicode and byte-comparable key encoding](../../../p02-storage-engines/b-trees-and-variants/07-collation-unicode-and-byte-comparable-key-encoding/).
 
 ## Where it bites in production
 

@@ -135,7 +135,7 @@ Past `TOAST_TUPLE_THRESHOLD` — `MAXALIGN(BLCKSZ/4)`, so 2048 bytes — the tup
 quarter page and TOAST fires: the widest attribute is compressed and, failing that, moved out of
 line, leaving an 18-byte `varatt_external` pointer (`va_rawsize`, `va_extsize`, `va_valueid`,
 `va_toastrelid` behind a 2-byte header). Select the 3000-byte `title` and the 3068-byte tuple
-collapses to 88 bytes. [Large values: TOAST and overflow pages](/p02-storage-engines/pages-tuples-heap-files/05-large-values-toast-and-overflow-pages/)
+collapses to 88 bytes. [Large values: TOAST and overflow pages](../../../p02-storage-engines/pages-tuples-heap-files/05-large-values-toast-and-overflow-pages/)
 takes the rest of that story.
 
 ## Deforming: why the first null is more expensive than the null

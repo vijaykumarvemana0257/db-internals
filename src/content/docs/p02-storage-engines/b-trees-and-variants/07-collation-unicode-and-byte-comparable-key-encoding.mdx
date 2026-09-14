@@ -58,7 +58,7 @@ collation calls it equal to `kraken`, and only the byte-level tiebreak keeps bot
 The same rule is why NFC `é` (`c3 a9`) and NFD `e` + U+0301 are adjacent but never equal in a
 deterministic PostgreSQL collation. (What a collation is, level by level, and the
 deterministic/nondeterministic distinction are covered in
-[Text, encoding and collation](/p01-foundations/sql-semantics-types-and-schema-design/04-text-encoding-and-collation/);
+[Text, encoding and collation](../../../p01-foundations/sql-semantics-types-and-schema-design/04-text-encoding-and-collation/);
 this page is about what that function does to the physical tree.)
 
 Cost matters here too. A three-level tree with a few hundred entries per page costs roughly
@@ -113,7 +113,7 @@ The price of a memcomparable text key is that a sort key is **lossy**: you canno
 from its ICU sort key, and the sort key is usually longer than the source. So an engine either
 stores the original next to the key, which inflates the index, or refuses to support the collation
 at all — which is what MyRocks' strict check does. It is also the reason this page and
-[key layout and suffix truncation](/p02-storage-engines/b-trees-and-variants/06-key-layout-prefix-compression-and-suffix-truncation/)
+[key layout and suffix truncation](../../../p02-storage-engines/b-trees-and-variants/06-key-layout-prefix-compression-and-suffix-truncation/)
 are connected: PostgreSQL truncates trailing *columns* off a separator, never a partial byte string,
 because a text prefix is not guaranteed to be a valid bound under a linguistic comparator. Engines
 with byte-comparable keys can truncate at any byte, which is exactly what makes their internal
@@ -176,7 +176,7 @@ explicit collations) to stamp the new version. But the ordering matters, and the
 admit one duplicate through a broken unique index and the rebuild fails with
 `ERROR: could not create unique index ... DETAIL: Key (display_name)=(de Vries) is duplicated`. The
 index can be rebuilt; the rows that got in while it was broken have to be reconciled by hand. The
-[operational drill](/p10-production-practice/failover-stacks-poolers-and-upgrades/05-the-collation-trap-silent-index-corruption-after-an-os-upgra/)
+[operational drill](../../../p10-production-practice/failover-stacks-poolers-and-upgrades/05-the-collation-trap-silent-index-corruption-after-an-os-upgra/)
 is a page of its own.
 
 Other engines are exposed differently rather than not at all. MySQL compiles its collations into the

@@ -1,0 +1,197 @@
+---
+title: 'SSTable format: blocks, restart points, index, filters, footer'
+description: The byte layout of a LevelDB/RocksDB block-based table — prefix-compressed data blocks with restart points, a shortest-separator index, filters, the metaindex and the fixed-size footer — and how a point lookup walks it.
+depth: intermediate
+sidebar:
+  order: 5
+---
+
+import SstBlockLayoutLab from '../../../../components/viz/SstBlockLayoutLab';
+
+A flush turns a memtable into an **SSTable** — a sorted, immutable file. Immutability is what makes
+the format simple: nothing is ever updated in place, so there is no free-space map, no slot directory
+and no page split. The file is written once, front to back, and then only read. What the format has to
+get right is making those reads cheap: find a key without scanning the file, skip files that cannot
+hold the key, and store sorted keys compactly.
+
+The format on this page is the **block-based table** used by LevelDB and RocksDB, which most LSM
+engines either use directly or closely resemble.
+
+<SstBlockLayoutLab client:visible />
+
+## The file, end to end
+
+A block-based table is a sequence of blocks followed by a fixed-size footer:
+
+```
+[data block 0] [data block 1] ... [data block N]
+[filter block] [properties block] ...          ← meta blocks
+[metaindex block]
+[index block]
+[footer]
+```
+
+The order matters because the file is written in one pass. Data blocks are written as keys arrive,
+in sorted order. Only once every key has been seen can the writer produce the filter, the index and
+the metaindex, and only once those are written does it know their offsets — which is why the pointers
+to them live at the very end, in the footer.
+
+A reader therefore starts at the **end** of the file. The byte map in the lab shows every block at its
+real offset and size; hover a region to decode it.
+
+## Data blocks
+
+Each data block holds a run of consecutive key-value entries, up to a target size set by `block_size`
+(4 KB by default in both LevelDB and RocksDB). An entry is:
+
+```
+shared_bytes: varint32    how many leading bytes of the key match the previous key
+unshared_bytes: varint32  how many new key bytes follow
+value_length: varint32
+key_delta: unshared_bytes
+value: value_length
+```
+
+Sorted keys share long prefixes with their neighbors — `user:001003`, `user:001010`, `user:001017` —
+so storing only the differing suffix saves most of the key bytes. The table under the byte map shows this
+for the block you select: the **key delta written** column is what actually lands on disk, and the
+**full key** column is what a reader has to reconstruct.
+
+### Restart points
+
+Prefix compression has a cost: to reconstruct a key you need the previous key, so in principle you would
+have to decode every entry from the start of the block. **Restart points** break that chain. Every
+`block_restart_interval` entries (16 by default), the entry is written with `shared_bytes = 0` — the full
+key — and its offset is recorded. At the end of the block sits an array of those offsets as 32-bit integers,
+followed by a 32-bit count.
+
+That array is what makes a data block searchable. A lookup binary-searches the restart points, comparing
+the target against the full key stored at each one, to find the last restart whose key is smaller than the
+target. Then it decodes forward from there, rebuilding each key from the one before, until it reaches a key
+that is not smaller. In the entry table, restart points are marked ◆.
+
+### The restart-interval trade-off
+
+The interval trades file size against lookup work:
+
+- A **small** interval stores full keys often, so less prefix sharing and more 4-byte restart offsets — a
+  bigger file — but a lookup decodes only a few entries after its binary search.
+- A **large** interval shares more and stores fewer offsets — a smaller file — but a lookup may decode many
+  entries sequentially.
+
+Drag **Restart interval** and watch the file size and the lookup cost change, or open **Show the numbers** for
+the whole sweep on the current keys. With the user-ID preset, going from an interval of 1 to the default of 16
+shrinks the data section by more than a quarter while the average lookup decodes several more entries. Going
+from 16 to 32 saves only a couple of percent more. The curve flattens because savings come from prefix sharing,
+which is mostly captured once full keys are no longer stored every few entries, and because an interval longer
+than the number of entries in a block just means one restart per block. In real files with 4 KB blocks, a
+block holds far more entries than the lab's small blocks do, which is where the interval matters most.
+
+### Trailer, compression and checksums
+
+Every block — data, index and meta — is followed by a **5-byte trailer**: one byte naming the compression
+applied to the block and a 4-byte checksum. The block is compressed as a unit, so a reader decompresses a
+whole block to read any entry in it; the checksum lets it detect a corrupted block before trusting a single
+byte. RocksDB's default is a CRC32C checksum, with other checksum types available, and compression is
+configurable per level — typically a fast codec for the upper levels and a stronger one for the bottom.
+
+## The index block
+
+The index block has one entry per data block. Its value is a **block handle** — the block's offset and size,
+as varints. Its key is a **separator**: some key that is at least the last key in that data block and smaller
+than the first key in the next one.
+
+The obvious separator is the block's last key, but any key in that gap works, and a shorter one makes a smaller
+index. LevelDB's bytewise comparator computes the **shortest separator**: take the common prefix of the two
+boundary keys and, if there is room, increment the first byte where they differ. Between `abcdef` and `abzz`, the
+shortest separator is `abd`. For densely packed keys such as consecutive numeric IDs there is often no room, and
+the separator is simply the last key — look at the index for the user-ID preset. The same idea, applied to keys
+inside B-tree pages, is suffix truncation, covered on the
+[key layout page](../../../p02-storage-engines/b-trees-and-variants/06-key-layout-prefix-compression-and-suffix-truncation/).
+
+To find a key's block, a reader binary-searches the index for the first separator that is not smaller than the
+key. That single block is the only data block that could contain it.
+
+### Partitioned indexes and filters
+
+For a very large file, the index and filter blocks themselves become large, and they must be read — or held in
+the block cache — before any lookup can proceed. RocksDB can **partition** them: the index is split into many index
+blocks with a small top-level index over them, and filters can be partitioned the same way. Only the partitions a
+lookup actually touches have to be loaded, which bounds the memory needed per file.
+
+## Filters, the metaindex and properties
+
+The **filter block** holds a probabilistic filter over the file's keys — a Bloom filter by default, or a Ribbon filter
+in newer RocksDB versions. At about 10 bits per key a Bloom filter has roughly a 1% false-positive rate. A lookup checks
+the filter *before* reading any data block. In the lab, set **Lookup** to *a key that does not exist*: the index search
+still happens, but the filter answers "definitely not here" and no data block is read. Across the dozens of files a
+point read may probe, that is the difference between one block read and dozens. Filters get their own page next.
+
+The **properties block** records statistics about the file — number of entries, raw key and value sizes, the data and
+index sizes, the compression used — that compaction and the query layer can read without scanning data.
+
+The **metaindex block** is a small map from meta-block names to block handles: it says where the filter block and the
+properties block are. A reader finds the metaindex from the footer and the meta blocks from the metaindex.
+
+## The footer
+
+The footer is fixed-size so a reader can find it by seeking to a known distance from the end of the file. It holds the
+block handles of the metaindex block and the index block, plus a **magic number** that identifies the file format and
+catches a truncated or foreign file immediately.
+
+LevelDB's footer is 48 bytes: the two handles padded to a fixed width, then an 8-byte magic number. RocksDB's current
+footer format is 53 bytes; it adds a checksum-type byte and a format-version field, and block-based tables end with the
+magic number `0x88e241b785f4cff7`.
+
+## Walking a lookup
+
+Put it together and a point lookup on one SSTable is:
+
+1. Read the footer from the end of the file; get the index and metaindex handles.
+2. Binary-search the index block for the first separator not smaller than the key. That names one data block.
+3. Check the filter. If it says the key is absent, stop — no data block is read.
+4. Read that data block, verify its checksum, decompress it.
+5. Binary-search the restart points, then decode forward to the key.
+
+The note under the lab narrates exactly these steps for the key you pick, with the comparison and decode counts. In a
+running engine, steps 1 to 3 almost never touch disk: open files keep their footer, index and filter in memory or in the
+block cache, so a lookup that the filter rejects costs no I/O at all, and one that it accepts costs one data-block read.
+
+## Cassandra's SSTables
+
+Cassandra splits an SSTable into separate component files rather than packing everything into one. In its long-standing
+`BIG` format:
+
+| Component | Role |
+|---|---|
+| `Data.db` | The rows themselves, in partition order |
+| `Index.db` | Partition index: partition key → position in `Data.db` |
+| `Summary.db` | A sampled index over `Index.db`, kept in memory |
+| `Filter.db` | Bloom filter over partition keys |
+| `CompressionInfo.db` | Offsets of compressed chunks, so a read can seek into compressed data |
+| `Statistics.db` | Metadata such as timestamps and tombstone estimates |
+
+A read checks the Bloom filter, uses the in-memory summary to find a region of the partition index, reads the index to
+find the partition's position, and then reads `Data.db`. Cassandra 5.0 added a trie-based SSTable format, `BTI`, which
+replaces the partition index and summary with on-disk tries.
+
+## Where it bites in production
+
+- **Index and filter blocks cost memory.** For a large dataset, the index and filter blocks of every open file add up. If
+  they are not cached, each lookup reads them from disk first; if they are, they compete with data blocks for the block
+  cache. Partitioned indexes and filters, and settings that pin top-level index partitions, exist to manage this.
+- **Block size is a read/space trade-off.** Larger blocks compress better and make the index smaller, but a point read has
+  to decompress more bytes to find one entry. Workloads dominated by point reads often use smaller blocks than scan-heavy
+  ones.
+- **Checksums catch corruption, they do not repair it.** A checksum mismatch on a block means the read fails rather than
+  returning bad data. Recovery comes from replication or backups, not from the file.
+- **Key design is compression design.** Prefix compression rewards keys that share long prefixes with their neighbors.
+  Putting a high-cardinality field such as a UUID at the *front* of a composite key destroys prefix sharing and inflates
+  both data and index blocks.
+
+:::note[What to take forward]
+An SSTable is written once, front to back, and read from the back: the footer points to the index and meta blocks, the index
+names the one data block that could hold a key, the filter usually rules the file out without reading that block, and restart
+points make a prefix-compressed block binary-searchable. The restart interval and block size trade file size against the work
+a lookup does inside a block.
+:::

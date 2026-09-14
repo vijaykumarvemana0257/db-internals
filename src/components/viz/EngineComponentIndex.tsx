@@ -11,8 +11,7 @@ import {
   useTip,
   useSize,
   fmtBytes,
-  fmtNum,
-} from './Viz';
+  fmtNum, siteHref } from './Viz';
 
 /**
  * A clickable index of an engine's layers.
@@ -746,14 +745,14 @@ export default function EngineComponentIndex() {
               <strong>No cross-cutting manager touches it</strong> — nothing here is transactional.{' '}
             </>
           )}
-          <strong>Owned by:</strong> <a href={selLayer.href}>{selLayer.module}</a>.
+          <strong>Owned by:</strong> <a href={siteHref(selLayer.href)}>{selLayer.module}</a>.
         </>
       );
     })()
   ) : (
     <>
       <strong>{selMgr!.label}</strong> {selMgr!.detail} <strong>Owned by:</strong>{' '}
-      <a href={selMgr!.href}>{selMgr!.module}</a>.
+      <a href={siteHref(selMgr!.href)}>{selMgr!.module}</a>.
     </>
   );
 

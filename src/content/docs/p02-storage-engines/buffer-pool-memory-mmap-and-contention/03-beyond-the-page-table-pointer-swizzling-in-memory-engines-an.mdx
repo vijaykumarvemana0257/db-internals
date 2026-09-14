@@ -19,7 +19,7 @@ not micro-optimizations; they decide what happens on the day the data stops fitt
 
 ## What the translation actually costs
 
-The [structure](/p02-storage-engines/buffer-pool/01-buffer-pool-structure-frames-page-table-and-pins/)
+The [structure](../../../p02-storage-engines/buffer-pool/01-buffer-pool-structure-frames-page-table-and-pins/)
 is already familiar: a frame array, a descriptor per frame, and a hash table from page identity
 to frame index. What is easy to underestimate is the per-access cost of using it. A PostgreSQL
 buffer access hashes the `BufferTag`, takes one of the 128 `BufMappingLock` partitions in shared
@@ -106,7 +106,7 @@ by the size of its index, not the size of its data.
 
 :::caution[The cold-scan pathology]
 Anti-caching has the same weakness as an LRU buffer pool under a
-[sequential scan](/p02-storage-engines/buffer-pool/05-scan-resistance-sequential-flooding-ring-buffers-and-midpoin/),
+[sequential scan](../../../p02-storage-engines/buffer-pool/05-scan-resistance-sequential-flooding-ring-buffers-and-midpoin/),
 only louder. A nightly report that reads cold rows aborts and restarts a transaction per block,
 drags every one of those tuples into memory, and evicts the hot set to make room for them.
 The symptom is a restart rate that climbs while throughput falls off a cliff, and a working set
@@ -132,7 +132,7 @@ lookup to discover *where* the page lives.
 Reads are validated **optimistically**: each page carries a version counter, a reader reads the
 version, reads the data, then re-reads the version and restarts if it moved. A read writes
 nothing to shared memory, so there is no cache line for readers to fight over — the mechanics of
-that fight are [page 4's subject](/p02-storage-engines/buffer-pool-memory-mmap-and-contention/04-latching-the-buffer-pool-and-hot-page-contention/).
+that fight are [page 4's subject](../../../p02-storage-engines/buffer-pool-memory-mmap-and-contention/04-latching-the-buffer-pool-and-hot-page-contention/).
 
 The invariant that makes any of this possible is severe: **every page is referenced by exactly
 one swip**. That is what makes "find the reference to this page" a bounded operation instead of a
@@ -176,7 +176,7 @@ as the whole buffer pool, with `MAP_NORESERVE`, so the total *virtual* reservati
 times RAM while the *resident* set stays capped by the buffer manager's own accounting; the
 physical pages behind an evicted frame are handed back with `madvise(MADV_DONTNEED)`. That is
 virtual memory used as an allocator, not as an I/O path —
-[the argument against mmap as a storage interface](/p02-storage-engines/buffer-pool-memory-mmap-and-contention/02-buffer-pool-vs-os-page-cache-vs-mmap/)
+[the argument against mmap as a storage interface](../../../p02-storage-engines/buffer-pool-memory-mmap-and-contention/02-buffer-pool-vs-os-page-cache-vs-mmap/)
 is untouched: Umbra still issues its own reads and writes and still decides its own eviction.
 
 ## The trade, stated plainly

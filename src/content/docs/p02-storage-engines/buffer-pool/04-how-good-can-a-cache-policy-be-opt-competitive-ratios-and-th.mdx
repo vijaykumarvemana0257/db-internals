@@ -45,7 +45,7 @@ from any non-adversarial string.
 OPT assumes the cache fetches a page only when it is referenced. Once you add prefetching,
 a policy that fetches *before* the reference can beat MIN, which is exactly why read-ahead
 is a separate lever from replacement — see [prefetching and asynchronous
-reads](/p02-storage-engines/buffer-pool/07-prefetching-and-asynchronous-reads/). MIN is also
+reads](../../../p02-storage-engines/buffer-pool/07-prefetching-and-asynchronous-reads/). MIN is also
 optimal in *fault count*, not in *time*: two schedules with equal misses can differ wildly if
 one's misses are sequential and the other's are random seeks.
 :::
@@ -91,7 +91,7 @@ of writeback, the mark bit is one more word of contended state per frame, and on
 the measured gap between CLOCK and anything smarter is a few percentage points — while the
 gap between one atomic increment and a list-head mutex on every hit is the difference
 between scaling to 64 cores and not. That trade is [page 3's
-subject](/p02-storage-engines/buffer-pool/03-replacement-policies-lru-clock-lru-k-2q-and-arc/).
+subject](../../../p02-storage-engines/buffer-pool/03-replacement-policies-lru-clock-lru-k-2q-and-arc/).
 :::
 
 ## The sentence to actually use: resource augmentation
@@ -239,7 +239,7 @@ function: 100% misses at every size below `L`, near zero at `L` and above.
 Set the second lab to the pure looping scan and drag the loop length across the pool marker.
 Nothing gradual happens. One extra page in the loop, or one frame fewer in the pool, moves a
 workload from a perfect hit rate to a perfect miss rate. This is the same cliff as the
-[memory-hierarchy page's](/p01-foundations/hardware-os-durability/01-memory-hierarchy-and-latency-numbers/)
+[memory-hierarchy page's](../../../p01-foundations/hardware-os-durability/01-memory-hierarchy-and-latency-numbers/)
 working-set cliff, now with an exact cause and an exact location.
 
 Two lessons fall out of it. First, **the cliff is not a policy failure**, because OPT sits on
@@ -247,7 +247,7 @@ the same trace: at 6 frames on a 9-page loop, perfect foresight still misses 40%
 references. No eviction algorithm can hold nine pages in six frames. Second, the cliff is
 where the special-case machinery lives: rather than let a scan own the pool it cannot fit in,
 engines route it through a small ring buffer and protect the hot set instead — the subject of
-[scan resistance](/p02-storage-engines/buffer-pool/05-scan-resistance-sequential-flooding-ring-buffers-and-midpoin/).
+[scan resistance](../../../p02-storage-engines/buffer-pool/05-scan-resistance-sequential-flooding-ring-buffers-and-midpoin/).
 
 ## Where it bites in production
 
@@ -266,7 +266,7 @@ engines route it through a small ring buffer and protect the hot set instead —
 - **Warm-up costs scale with the curve too.** The area between the cold-start hit rate and the
   steady-state hit rate is the work a restart has to redo, which is why an accurate MRC is
   also an estimate of how long a failover runs slow — see [cache
-  warm-up](/p02-storage-engines/buffer-pool/02-cache-warm-up-cold-pools-dump-load-and-prewarming/).
+  warm-up](../../../p02-storage-engines/buffer-pool/02-cache-warm-up-cold-pools-dump-load-and-prewarming/).
 - **A Redis tier is the same calculation with a different unit.** `keyspace_hits` and
   `keyspace_misses` give the operating point; `maxmemory-policy allkeys-lru` is itself an
   approximation — Redis samples `maxmemory-samples` keys (5 by default) and evicts the best of

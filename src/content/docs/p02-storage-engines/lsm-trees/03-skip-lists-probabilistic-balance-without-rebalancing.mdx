@@ -1,0 +1,166 @@
+---
+title: 'Skip lists: probabilistic balance without rebalancing'
+description: Why LSM memtables are usually skip lists — logarithmic search from coin flips, inserts that are one compare-and-swap per level, and the cache and tail-latency costs that push newer engines toward tries.
+depth: intermediate
+sidebar:
+  order: 3
+---
+
+import SkipListStaircaseLab from '../../../../components/viz/SkipListStaircaseLab';
+import SkipListCasRaceLab from '../../../../components/viz/SkipListCasRaceLab';
+
+The [write path](../../../p02-storage-engines/lsm-trees/02-write-path-wal-memtable-flush-and-write-stalls/)
+needs an in-memory structure that keeps keys sorted, accepts inserts from many threads at once, and
+can be iterated in order when it is flushed. A balanced search tree does the first and third jobs,
+but keeping a red-black or AVL tree balanced means rotations that touch several nodes at once — and
+touching several nodes atomically under concurrency means locks.
+
+The skip list, introduced by William Pugh in 1990, gets logarithmic search without ever rebalancing
+anything. Its balance comes from coin flips, and that single design choice is why it became the
+default memtable in LevelDB, RocksDB and many engines after them.
+
+<SkipListStaircaseLab client:visible />
+
+## The structure
+
+A skip list is a sorted linked list with express lanes. Every node is on level 1, the bottom lane,
+which links all keys in order. When a node is inserted it flips a coin that comes up heads with
+probability *p*: on heads it also joins level 2, then flips again for level 3, and so on until the
+first tails or a maximum height. So:
+
+- a fraction *p* of nodes reach level 2, *p²* reach level 3, and so on — a geometric distribution;
+- the expected number of forward pointers per node is **1 / (1 − p)**;
+- the tallest tower in a list of *n* nodes is about **log₁/ₚ n** levels.
+
+Nothing about a node's height depends on its neighbors or on the order keys arrived in. That is the
+whole trick: the structure is balanced *in expectation* regardless of insert order, and no operation
+ever has to restructure existing nodes to keep it that way.
+
+## Search is a staircase
+
+To find a key, start at the head on the highest level. Move right while the next node's key is
+smaller than the target; when the next key is not smaller, drop down one level and continue. When
+you drop off level 1, the next node is the key if it exists, or the position where it would go.
+
+In the lab, the path the search takes is drawn over the list: horizontal steps along a lane, vertical
+drops between lanes. Pugh's analysis gives an expected cost of roughly **log₁/ₚ(n) / p** comparisons.
+Intuitively, you descend about log₁/ₚ n levels and take a bounded expected number of steps on each.
+
+Use **Re-flip coins** to rebuild the same keys with fresh heights and watch the number of comparisons
+change. The average is predictable; any single search is not.
+
+### Choosing p
+
+RocksDB and LevelDB both use **p = ¼** with a maximum height of 12; Pugh's original presentation uses
+p = ½. The two values give nearly the same expected search cost, but they differ sharply in memory:
+
+| p | Expected pointers per node | Where a max height of 12 starts to bind |
+|---|---|---|
+| ½ | 2.00 | around 4,096 nodes (2¹²) |
+| ¼ | 1.33 | around 16.7 million nodes (4¹²) |
+
+Pointers are most of a small node's overhead, so p = ¼ saves about a third of the pointer memory for
+essentially no search penalty. It also changes how far a fixed height cap reaches. The lab builds every
+list with the same cap of 12 that RocksDB and LevelDB use. Set the measurement panel under the list to
+100,000 keys: at p = ¼ the tallest towers stay well under 12, and the measured cost — around 30
+comparisons — sits just under the analytic estimate of about 33. Switch to p = ½ and the towers hit the
+cap. The top lane now holds far more nodes than the ideal, and the measured cost jumps to around 42 while
+the analytic estimate, which assumes no cap, stays at 33. A height cap chosen for p = ¼ is a poor fit for
+p = ½.
+
+## Why a memtable can be lock-free
+
+Concurrent inserts into a balanced tree need locking because a rotation changes several pointers that
+must change together. A skip-list insert does not. Once the search has found where the new node goes,
+linking it in is a sequence of independent, single-pointer updates — one per level of the new node's
+tower — and each one can be a single atomic **compare-and-swap**: set the predecessor's forward pointer
+to the new node *only if it still points where the search saw it pointing*.
+
+<SkipListCasRaceLab client:visible />
+
+Step through the race. Two threads insert 25 and 27 into the same gap. Thread A's compare-and-swap on
+level 1 succeeds; thread B's fails, because the pointer it expected no longer holds the value it read.
+Nothing is corrupted and nothing is half-visible: B simply resumes its search from its predecessor,
+finds the new node, and links in after it. Links go bottom-up, so a node that is linked on level 1 but
+not yet on level 2 is already findable — it just looks like a shorter tower for a moment.
+
+This is the scheme RocksDB's `InlineSkipList` uses for concurrent memtable inserts, and it is what
+`allow_concurrent_memtable_write` enables. LevelDB's skip list takes a simpler position: readers need no
+locking, but writers must be serialized externally, which LevelDB does with its write queue.
+
+### The part that makes it easy: memtables never delete
+
+Lock-free structures are usually hard because of **removal**. If one thread unlinks a node while another
+thread is still reading it, you need a memory-reclamation scheme — epochs, hazard pointers — to know when
+the node can be freed safely. That problem has its own page later in this part.
+
+LSM memtables sidestep it entirely. A delete is not a removal; it is an *insert* of a tombstone. An overwrite
+is an insert with a higher sequence number. Nodes are only ever added, and the entire memtable — every node,
+allocated from one arena — is freed in one step after it has been flushed and no reader still holds a
+reference. So a memtable needs only the easy half of a lock-free skip list: concurrent insert with
+compare-and-swap, and no reclamation at all.
+
+## What skip lists cost
+
+The design has three well-known costs, and each explains a direction engines have moved in.
+
+**Pointer chasing.** Every step along a lane follows a pointer to a node allocated somewhere else in memory.
+Nodes that are adjacent in key order are not adjacent in memory, so a search is a chain of likely cache misses
+— the [latency ladder](../../../p01-foundations/hardware-os-durability/01-memory-hierarchy-and-latency-numbers/)
+puts each one at roughly a hundred L1 hits. RocksDB's `InlineSkipList` reduces the damage by storing the key
+inline with the node and allocating nodes from an arena, but it cannot make the search itself sequential.
+
+**Variance.** Balance is probabilistic. A particular list can have an unlucky tall tower or a long run of short
+ones, and a particular search can take noticeably longer than the average — with a vanishingly small probability
+of degenerating toward linear time. For a memtable the average matters most, but engines that care about tail
+latency pay attention to that spread.
+
+**Space.** Even at p = ¼, each node carries an average of 1.33 forward pointers on top of the key, the value and
+the metadata. For small keys and values, pointers are a large share of memtable memory — and memtable memory is
+what decides how often you flush.
+
+### What engines use instead
+
+Because of those costs, the skip list is no longer the only choice:
+
+- **Cassandra** made its memtable pluggable in 4.1 and added a **trie**-based memtable in 5.0. A trie shares key
+  prefixes and lays nodes out far more compactly, reducing both memory and pointer chasing.
+- **Adaptive radix trees (ART)** and **Masstree** are the cache-conscious alternatives that in-memory databases
+  reach for: node layouts sized to cache lines and fanout that adapts to how dense the keys are. The Part 2 page on
+  tries and adaptive radix trees covers them.
+- **Hash-based memtable representations** exist in RocksDB for workloads dominated by point lookups within a key
+  prefix, trading away cheap full ordered iteration.
+
+The skip list remains the default in RocksDB and LevelDB because it is simple, it is correct under concurrency with
+very little code, and it iterates in key order for free — which is exactly what a flush needs.
+
+## Skip lists outside memtables
+
+The same trade-offs show up wherever a system needs a concurrent sorted map:
+
+- **Redis sorted sets** pair a skip list (for ordering and range queries by score) with a hash table (for O(1)
+  lookup of a member's score). Redis uses p = ¼ with a maximum of 32 levels, and small sorted sets use a compact
+  listpack encoding instead of either structure.
+- **HBase** keeps its in-memory store in Java's `ConcurrentSkipListMap`.
+- **Java's `ConcurrentSkipListMap`** is the standard library's concurrent sorted map for exactly the reason on this
+  page: a concurrent balanced tree is far harder to build without locks.
+
+## Where it bites in production
+
+- **Memtable memory is larger than the data you wrote.** Keys, values, sequence numbers, node headers and forward
+  pointers all count against `write_buffer_size`. With small records the overhead can be a large fraction, so a
+  64 MB memtable holds noticeably less than 64 MB of user data — and flushes more often than a naive estimate
+  predicts.
+- **Memtable lookups are not free.** A point read checks the active memtable, then immutable memtables, before any
+  SSTable. When several immutable memtables are waiting to flush, each adds a skip-list search with its pointer
+  chasing to every read.
+- **Concurrent inserts help only if they are the bottleneck.** Enabling concurrent memtable writes lets threads insert
+  in parallel, but if the write-ahead log sync or a write stall is what limits throughput, parallel inserts change
+  nothing.
+
+:::note[What to take forward]
+A skip list gets logarithmic search from coin flips instead of rebalancing, so an insert is a handful of independent
+pointer updates that can each be an atomic compare-and-swap. LSM memtables only ever insert and are freed wholesale,
+which makes the lock-free version simple. The price is pointer chasing, probabilistic variance and per-node pointer
+overhead — the reasons newer engines are moving to tries and cache-conscious trees.
+:::

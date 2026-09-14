@@ -147,7 +147,7 @@ In practice you pick one of three exits, and the right one is usually the first:
 BCNF is the stopping point for almost every production schema. Beyond it lies 4NF and the theory
 of multivalued dependencies, and those matter for a specific, recognizable shape — two
 independent multi-valued facts crammed into one table — which the
-[optional next page](/p01-foundations/sql-semantics-types-and-schema-design/06-optional-deep-dive-multivalued-dependencies-4nf-and-the-chas/)
+[optional next page](../../../p01-foundations/sql-semantics-types-and-schema-design/06-optional-deep-dive-multivalued-dependencies-4nf-and-the-chas/)
 covers. You can skip it and lose nothing on a first pass.
 
 What you should *not* do is treat denormalization as a modeling decision. It is a physical,
@@ -246,6 +246,6 @@ key of one side — and any dependency it costs you has to be re-enforced somewh
 BCNF plus judgement is enough for nearly every production schema; denormalize afterwards, on
 purpose, only with a mechanism that maintains the copy. And pick the primary key knowing it is
 also the physical order of a clustered table and the row locator in every secondary index — a
-subject Part 2 picks up in [B+tree structure](/p02-storage-engines/b-trees-and-variants/01-b-tree-structure-invariants-and-search/)
-and [splits under load](/p02-storage-engines/b-trees-and-variants/04-fill-factor-fragmentation-and-splits-under-load/).
+subject Part 2 picks up in [B+tree structure](../../../p02-storage-engines/b-trees-and-variants/01-b-tree-structure-invariants-and-search/)
+and [splits under load](../../../p02-storage-engines/b-trees-and-variants/04-fill-factor-fragmentation-and-splits-under-load/).
 :::

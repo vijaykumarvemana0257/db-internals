@@ -1,0 +1,162 @@
+---
+/**
+ * Page title + the curriculum context every lesson page promises on the homepage:
+ * the module and its level, this page's depth, its position in the module, and
+ * the module's prerequisites. Read from src/data/curriculum-graph.json, which
+ * scripts/gen-sidebar.mjs regenerates on every build, so it never goes stale.
+ */
+import Default from '@astrojs/starlight/components/PageTitle.astro';
+import graph from '../data/curriculum-graph.json';
+
+type Mod = (typeof graph.modules)[number];
+
+const route = Astro.locals.starlightRoute;
+const segs = route.id.split('/');
+// Lesson pages live at pNN-part/module-slug/NN-page; the homepage and /curriculum/ do not.
+const mod: Mod | undefined = segs.length === 3 ? graph.modules.find((m) => m.slug === segs[1]) : undefined;
+const part = mod ? graph.parts.find((p) => p.n === mod.part) : undefined;
+const pageNo = Number.parseInt(segs[2] ?? '', 10) || 0;
+const depth = (route.entry.data as { depth?: string }).depth;
+
+const bySlug = new Map(graph.modules.map((m) => [m.slug, m]));
+const prereqs = (mod?.prerequisites ?? []).map((s) => bySlug.get(s)).filter((m): m is Mod => Boolean(m));
+const seeAlso = ((mod as { seeAlso?: string[] } | undefined)?.seeAlso ?? []).map((s) => bySlug.get(s)).filter((m): m is Mod => Boolean(m));
+
+const LEVELS = ['foundations', 'core', 'advanced', 'expert'];
+const DEPTHS = ['basics', 'intermediate', 'deep'];
+const levelRank = mod ? LEVELS.indexOf(mod.level) + 1 : 0;
+const depthRank = depth ? DEPTHS.indexOf(depth) + 1 : 0;
+---
+
+<Default />
+
+{
+  mod && (
+    <div class="page-meta" aria-label="Where this page sits in the curriculum">
+      <p class="pm-row">
+        <span class="pm-where">
+          {part ? `Part ${part.n}` : ''} · Module {mod.index} · {mod.title}
+          {pageNo > 0 && <span class="pm-count"> — page {pageNo} of {mod.pages}</span>}
+        </span>
+      </p>
+      <p class="pm-row pm-tags">
+        <span class="pm-badge" title="Module level: foundations → core → advanced → expert">
+          <span class="pm-meter" aria-hidden="true">
+            {LEVELS.map((_, i) => <span class:list={['pm-dot', { on: i < levelRank }]} />)}
+          </span>
+          Module level: <strong>{mod.level}</strong>
+        </span>
+        {depth && (
+          <span class="pm-badge" title="Page depth: basics → intermediate → deep">
+            <span class="pm-meter" aria-hidden="true">
+              {DEPTHS.map((_, i) => <span class:list={['pm-dot', { on: i < depthRank }]} />)}
+            </span>
+            This page: <strong>{depth}</strong>
+          </span>
+        )}
+      </p>
+      <p class="pm-row pm-prereq">
+        {prereqs.length ? (
+          <>
+            <span class="pm-label">Builds on:</span>{' '}
+            {prereqs.map((p, i) => (
+              <>
+                {i ? ' · ' : ''}
+                {p.url ? (
+                  <a href={p.url}>
+                    {p.index} {p.title}
+                  </a>
+                ) : (
+                  <span class="pm-unwritten" title="Specified in the curriculum, not written yet">
+                    {p.index} {p.title} (not written yet)
+                  </span>
+                )}
+              </>
+            ))}
+          </>
+        ) : (
+          <span class="pm-label">No prerequisites — a starting point.</span>
+        )}
+      </p>
+      {seeAlso.length > 0 && (
+        <p class="pm-row pm-prereq">
+          <span class="pm-label">Recommended later:</span>{' '}
+          {seeAlso.map((p, i) => (
+            <>
+              {i ? ' · ' : ''}
+              {p.url ? (
+                <a href={p.url}>
+                  {p.index} {p.title}
+                </a>
+              ) : (
+                <span class="pm-unwritten">
+                  {p.index} {p.title} (not written yet)
+                </span>
+              )}
+            </>
+          ))}
+        </p>
+      )}
+    </div>
+  )
+}
+
+<style>
+  .page-meta {
+    margin-top: 0.75rem;
+    padding: 0.65rem 0.85rem;
+    border: 1px solid var(--sl-color-hairline);
+    border-radius: 0.5rem;
+    background: var(--sl-color-bg-nav);
+    font-size: var(--sl-text-sm);
+    color: var(--sl-color-gray-2);
+  }
+  .pm-row {
+    margin: 0;
+  }
+  .pm-row + .pm-row {
+    margin-top: 0.4rem;
+  }
+  .pm-where {
+    color: var(--sl-color-white);
+    font-weight: 600;
+  }
+  .pm-count {
+    color: var(--sl-color-gray-3);
+    font-weight: 400;
+  }
+  .pm-tags {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem 0.9rem;
+  }
+  .pm-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+  }
+  .pm-badge strong {
+    color: var(--sl-color-white);
+    text-transform: capitalize;
+  }
+  .pm-meter {
+    display: inline-flex;
+    gap: 3px;
+  }
+  .pm-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    border: 1px solid var(--sl-color-gray-3);
+  }
+  .pm-dot.on {
+    background: var(--sl-color-accent);
+    border-color: var(--sl-color-accent);
+  }
+  .pm-label {
+    color: var(--sl-color-gray-3);
+  }
+  .pm-unwritten {
+    color: var(--sl-color-gray-3);
+  }
+</style>

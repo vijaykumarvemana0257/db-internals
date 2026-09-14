@@ -78,7 +78,7 @@ The advice is exactly that: advisory. Nothing tells you whether the page arrived
 memory for it, and a page prefetched into the page cache can be evicted again before the reader
 reaches it. And all of it vanishes under `O_DIRECT`, which has no page cache to read ahead into —
 the engines that use direct I/O have no choice but to prefetch themselves. That trade-off is
-[Direct I/O and io_uring](/p01-foundations/hardware-os-durability/09-direct-i-o-and-io-uring-alignment-submission-and-completion/).
+[Direct I/O and io_uring](../../../p01-foundations/hardware-os-durability/09-direct-i-o-and-io-uring-alignment-submission-and-completion/).
 
 **The engine** knows things the kernel cannot infer. It knows a bitmap heap scan will visit exactly
 these 900 block numbers in this order. It knows the sequential scan is going to read the relation
@@ -227,7 +227,7 @@ leaf-sibling step into a seek.
   available means pages are read, evicted before use, and read again. Engines avoid it structurally —
   PostgreSQL's read stream pins each buffer it has queued, so the window is bounded by frames the
   scan may hold, and the scan-resistance machinery in
-  [sequential flooding and ring buffers](/p02-storage-engines/buffer-pool/05-scan-resistance-sequential-flooding-ring-buffers-and-midpoin/)
+  [sequential flooding and ring buffers](../../../p02-storage-engines/buffer-pool/05-scan-resistance-sequential-flooding-ring-buffers-and-midpoin/)
   keeps the trail behind the scan from taking frames from the window in front of it.
 
 :::note[What to take forward]

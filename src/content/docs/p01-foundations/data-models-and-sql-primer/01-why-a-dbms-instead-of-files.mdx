@@ -72,7 +72,7 @@ can tell.
 
 Bytes reach the media through the page cache, in whatever order the kernel and the drive choose, and
 a power cut can leave the last write partially applied — see
-[fsync, write barriers and the durability contract](/p01-foundations/hardware-os-durability/06-fsync-write-barriers-and-the-durability-contract/)
+[fsync, write barriers and the durability contract](../../../p01-foundations/hardware-os-durability/06-fsync-write-barriers-and-the-durability-contract/)
 for how partial that can get. A CSV line has no length prefix, no checksum and no commit marker, so
 after the reboot the truncated line is a perfectly ordinary line as far as any reader is concerned.
 Worse, the damage is not even confined to one file: if the order lives in `orders.csv` and its

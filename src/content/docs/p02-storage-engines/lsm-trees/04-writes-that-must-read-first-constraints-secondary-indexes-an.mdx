@@ -1,0 +1,180 @@
+---
+title: 'Writes that must read first: constraints, secondary indexes and Merge'
+description: An LSM write is only blind for pure key-value puts. Unique checks and secondary-index maintenance force a point read before the write — and RocksDB's Merge operator and SingleDelete exist to avoid that read.
+depth: intermediate
+sidebar:
+  order: 4
+---
+
+import ReadBeforeWriteLsmLab from '../../../../components/viz/ReadBeforeWriteLsmLab';
+
+The [write path](../../../p02-storage-engines/lsm-trees/02-write-path-wal-memtable-flush-and-write-stalls/)
+made an LSM write look almost free: append to a log, insert into memory, return. That is true for
+exactly one kind of write — a **blind put**, one that does not care what, if anything, was there
+before.
+
+Most real writes care. A SQL `INSERT` must not violate a primary key. An `UPDATE` of an indexed column
+must find and remove the old index entry. An increment must know the current value. Each of those
+turns a blind write into a **read followed by a write**, and in an LSM tree the read is the expensive
+half of the engine. How much of the LSM's famous write advantage survives depends entirely on how
+many of your writes have to read first.
+
+<ReadBeforeWriteLsmLab client:visible />
+
+## One SQL row is several key-value operations
+
+When a relational engine runs on top of an LSM key-value store — MyRocks on RocksDB, TiDB on TiKV,
+CockroachDB on Pebble — a single row becomes several keys:
+
+- one **clustered** entry, keyed by primary key, holding the row;
+- one entry per **secondary index**, keyed by the indexed columns plus the primary key, so the index
+  can point back at the row.
+
+Writing the row means writing all of them, which is where secondary indexes cost you on every engine.
+What is specific to an LSM is which of those writes have to *read first*:
+
+| Statement | What must be read | Why |
+|---|---|---|
+| `INSERT`, primary key enforced | Does this primary key exist? | A put would silently overwrite an existing row |
+| `INSERT` into a unique secondary index | Does this index value exist? | Same, for the unique column |
+| `UPDATE` of an indexed column | The old row | To learn the old index value, so its entry can be deleted |
+| `DELETE` | The old row | To learn which index entries to delete |
+
+An `INSERT` into a *non-unique* secondary index can stay blind: the new entry's key includes the
+primary key, so it cannot collide with anything. That is why the lab models secondary indexes as
+non-unique and charges reads only for the primary-key check and for reading the old row.
+
+So the per-row cost model is: **one clustered write, plus a write per index entry touched, plus a point
+read for every constraint check and every old-row lookup.** An update that changes indexed columns
+writes twice per index — a delete of the old entry and a put of the new one.
+
+## What a point read costs here
+
+A point read in an LSM probes, in order: the active memtable, each immutable memtable, every L0 file
+whose key range could hold the key, and then one file in each deeper level. Each file has a Bloom
+filter, which usually answers "definitely not here" without reading a data block. The next pages build
+that read path in detail; for now what matters is that there are two very different kinds of lookup.
+
+**Checking that a key does not exist** is the case filters are built for. Every file's filter says no,
+and with roughly 1% false positives, an absent key costs almost no block reads no matter how many files
+there are. In the lab, choose `INSERT` with the primary-key check enabled: the row reads once, but the
+expected block reads round to nearly zero, and the row costs only about one and a half times a blind write.
+
+**Reading a key that does exist** always pays at least one real block read, because the key is in some
+file and no filter can skip that one. That is the `UPDATE` and `DELETE` case. Choose `UPDATE`: a data
+block is read on every row, and with three secondary indexes the row costs close to three times the same
+writes done blind.
+
+Now look at how the ratio responds to the settings:
+
+- **Set secondary indexes to 0.** An update of a narrow row is one write and one read, and the read now
+  dominates: the row costs well over ten times a blind write. The fewer and smaller your writes, the larger
+  the share of the cost the mandatory read takes.
+- **Set secondary indexes to 8.** Seventeen writes swamp the single read and the ratio drops below
+  two. The read penalty is a fixed cost per row; wide writes dilute it.
+- **Turn off Bloom filters.** Now every probed file needs a block read, even for a key that is only in the
+  last level. The update jumps to more than ten times a blind write with the default shape.
+- **Push L0 files up to 20 with filters off.** This is what a read-before-write workload looks like when
+  compaction has fallen behind: every L0 file is another block read on every row, and the row costs dozens
+  of times a blind write.
+
+That last combination is the one to remember. The [write stalls](../../../p02-storage-engines/lsm-trees/02-write-path-wal-memtable-flush-and-write-stalls/)
+exist to keep L0 from growing without bound; a read-before-write workload feels that growth on *writes*,
+not just reads.
+
+### How engines reduce the reads
+
+Because this cost is structural, the engines built on LSMs all have ways to avoid paying it when they can:
+
+- **Blind upserts.** CockroachDB's `UPSERT` can be a blind write when the table has no secondary indexes,
+  because there is no old index entry to find — which is why it is faster than `INSERT ... ON CONFLICT`
+  in that case.
+- **Deferred uniqueness checks.** TiDB's optimistic transactions can postpone unique-constraint checks
+  until commit, batching the reads rather than performing one per statement.
+- **Skipping checks you already guarantee.** MyRocks offers `rocksdb_skip_unique_check` for bulk loads
+  where the data is known to be unique, and a read-free replication mode for replicas: a row-based
+  replication event already carries the row's before-image, so the replica does not need to read the old
+  row to apply an update.
+
+Each of these is the same idea: a read that the engine can prove unnecessary is the single largest saving
+available on the LSM write path.
+
+### Locking reads inside transactions
+
+Inside a transaction, the read that precedes a write usually has to be protected too, or two transactions
+can read the same old value and both write. RocksDB's transactional APIs provide `GetForUpdate` for this:
+in a pessimistic `TransactionDB` it takes a lock on the key as it reads it, and in an
+`OptimisticTransactionDB` it records the key so the commit can detect a conflicting write. Either way it
+is still a full point read — the concurrency protection is on top of the cost above, not instead of it.
+
+## Merge: removing the read from read-modify-write
+
+Some writes read the old value only to compute the new one: increment a counter, append to a list, add to
+a set. For those, RocksDB offers a different operation. Instead of `Get` then `Put`, the application calls
+**`Merge(key, operand)`**, which appends the operand — say, `+1` — without reading anything. The engine
+applies a user-supplied **merge operator** later:
+
+- a **read** of the key finds the most recent full value and every operand written after it, and folds the
+  operands into the value on the fly;
+- **compaction** folds operands as it rewrites files, so they do not accumulate forever.
+
+Switch the lab to **A counter** and press **Increment ×10** a few times. The read-modify-write tally grows by
+one read per increment; the Merge version reads nothing, and a stack of operands builds up after the base
+value. Press **Read the counter**: the read folds every operand. Press **Compact**: the operands collapse into a
+single base value, and the next read is cheap again.
+
+The trade is explicit. Merge moves the read cost from every writer to whoever reads, and bounds it by compaction.
+That is excellent for counters written far more often than they are read, and poor when the same key is read
+constantly while operands pile up. RocksDB's `max_successive_merges` exists for that second case: once a key has
+that many operands in the memtable, a merge folds them at write time instead of letting the chain grow.
+
+A merge operator must be correct whatever grouping of operands it is given, because reads and compactions fold
+different subsets at different times. For simple cases RocksDB provides `AssociativeMergeOperator`, which requires
+the operation to be associative; the general `MergeOperator` interface separates a full merge over a base value
+from a partial merge of operands.
+
+## SingleDelete: a cheaper delete with a sharp contract
+
+A regular `Delete` writes a tombstone that must shadow *every* older version of the key. It cannot be dropped
+until compaction carries it down to the level where the oldest version might live, which is why deletes leave
+tombstones lingering through the tree — a problem with its own page later in this module.
+
+`SingleDelete` is a narrower promise. It says: *this key was put exactly once since it was last deleted*. Given
+that promise, compaction can drop the SingleDelete as soon as it meets the matching put, and both disappear —
+no tombstone has to travel all the way down.
+
+The promise is the whole mechanism, and breaking it has a specific, silent failure. Switch the lab to
+**SingleDelete** and step through:
+
+1. `Put(k, v1)`, then a flush moves `v1` into an older SSTable.
+2. `Put(k, v2)` — the key has now been put twice, which violates the contract.
+3. `SingleDelete(k)` — reads see the key as gone.
+4. Compaction pairs the SingleDelete with the put it meets, `v2`, and drops both. `v1` is still in its older file,
+   and nothing shadows it any more. **The deleted key comes back with its old value.**
+
+RocksDB documents the result of mixing `SingleDelete` with multiple puts, `Delete` or `Merge` on the same key as
+undefined, and the scenario above is why. The safe use is keys that are structurally written once and deleted once.
+Secondary-index entries are the classic example: an entry's key includes the row's primary key, so a given entry is
+inserted once when the row is indexed and deleted once when it stops being indexed.
+
+## Where it bites in production
+
+- **An LSM-backed database can be slower at updates than at inserts.** Benchmarks of blind inserts show the LSM write
+  path at its best; an update-heavy workload with secondary indexes pays a point read per row, and its throughput is
+  set by read-path performance.
+- **Compaction debt turns into write latency.** When L0 grows or filters are missing, every read-before-write gets
+  slower. On a workload dominated by updates, a compaction backlog shows up as rising *write* latency before anyone
+  notices reads.
+- **Merge operators can hide read cost.** A counter updated millions of times between compactions can make a single
+  read fold millions of operands. Watch read latency on hot merge keys, and use `max_successive_merges` where reads are
+  frequent.
+- **SingleDelete bugs look like data corruption.** A deleted key reappearing with an old value, long after the delete,
+  is the signature of a SingleDelete issued against a key that was written more than once. It is not a storage fault;
+  it is the contract.
+
+:::note[What to take forward]
+An LSM write is only blind when it does not care about the old value. Unique checks are cheap thanks to filters, but
+updates and deletes of indexed rows always pay a real point read, so their cost is set by the read path — especially
+when compaction falls behind. Merge moves read-modify-write cost to readers and compaction; SingleDelete is a cheap
+delete that is only correct for keys written exactly once.
+:::

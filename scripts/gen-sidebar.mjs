@@ -81,13 +81,43 @@ writeFileSync(
   JSON.stringify(manifest, null, 1) + '\n',
 );
 
+// ---- lint: content pages must not use root-absolute internal links ----
+// Starlight prefixes `base` onto its own navigation but not onto links inside page content,
+// so "/p02-…" 404s on a project site (base "/db-internals/"). Pages are three levels deep
+// (pNN/module/page/), so write "../../../p02-…" instead, which resolves under any base.
+{
+  const offenders = [];
+  const walk = (dir) => {
+    for (const f of readdirSync(dir, { withFileTypes: true })) {
+      const full = resolve(dir, f.name);
+      if (f.isDirectory()) walk(full);
+      else if (/\.mdx?$/.test(f.name) && !/^(index|curriculum)\.mdx?$/.test(f.name)) {
+        const hits = readFileSync(full, 'utf8').match(/\]\(\/(p\d{2}-|curriculum)[^)]*\)/g);
+        if (hits) offenders.push(`${full.replace(root + '/', '')}: ${hits.length} root-absolute link(s), e.g. ${hits[0]}`);
+      }
+    }
+  };
+  walk(resolve(root, 'src/content/docs'));
+  // Components render links too: they must wrap internal paths in siteHref() from Viz.tsx.
+  for (const f of readdirSync(resolve(root, 'src/components/viz'))) {
+    if (!f.endsWith('.tsx')) continue;
+    const src = readFileSync(resolve(root, 'src/components/viz', f), 'utf8');
+    const hits = src.match(/href=["']\/(p\d{2}-|curriculum)[^"']*["']/g);
+    if (hits) offenders.push(`src/components/viz/${f}: ${hits.length} root-absolute href(s) — wrap in siteHref(), e.g. ${hits[0]}`);
+  }
+  if (offenders.length) {
+    console.error(`\nRoot-absolute internal links break under a base path. Use ../../../pNN-… instead:\n  ${offenders.join('\n  ')}\n`);
+    process.exit(1);
+  }
+}
+
 // ---- /curriculum/ : the full map, with built pages linked and the rest listed ----
 const esc = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 const built = (p) => existsSync(resolve(root, p.path));
 const lines = [
   '---',
   'title: The full curriculum',
-  'description: Every part, module and page on this site — 11 parts, 45 modules, 396 pages.',
+  `description: Every part, module and page on this site — ${curriculum.parts.length} parts, ${curriculum.parts.reduce((n, p) => n + p.modules.length, 0)} modules, ${manifest.length} pages.`,
   'tableOfContents: false',
   '---',
   '',
@@ -108,6 +138,39 @@ curriculum.parts.forEach((part, pi) => {
   });
 });
 writeFileSync(resolve(root, 'src/content/docs/curriculum.md'), lines.join('\n'));
+
+// ---- src/data/curriculum-graph.json : module dependency graph for the Start Here visuals ----
+// Regenerated on every build (CI runs `npm run sidebar` first), so `built` never goes stale.
+const graph = {
+  totals: {
+    parts: curriculum.parts.length,
+    modules: curriculum.parts.reduce((n, p) => n + p.modules.length, 0),
+    pages: manifest.length,
+    builtPages: manifest.filter(built).length,
+  },
+  parts: curriculum.parts.map((p, pi) => ({ n: pi + 1, title: p.title, summary: p.summary })),
+  modules: curriculum.parts.flatMap((part, pi) =>
+    part.modules.map((mod, mi) => {
+      const pages = manifest.filter((m) => m.part === pi + 1 && m.module === mi + 1);
+      const first = pages.find(built);
+      return {
+        slug: mod.slug,
+        title: mod.title,
+        index: `${pi + 1}.${mi + 1}`,
+        part: pi + 1,
+        level: mod.level,
+        prerequisites: mod.prerequisites,
+        seeAlso: mod.seeAlso ?? [],
+        pages: pages.length,
+        builtPages: pages.filter(built).length,
+        url: first ? first.url : null,
+        subtopics: pages.map((m) => ({ title: m.title, depth: m.depth, url: built(m) ? m.url : null })),
+      };
+    }),
+  ),
+};
+mkdirSync(resolve(root, 'src/data'), { recursive: true });
+writeFileSync(resolve(root, 'src/data/curriculum-graph.json'), JSON.stringify(graph) + '\n');
 
 console.log(
   `sidebar: ${sidebar.length} parts, ${sidebar.reduce((n, p) => n + p.items.length, 0)} modules listed; ${manifest.filter(built).length}/${manifest.length} pages written`,

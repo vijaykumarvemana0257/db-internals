@@ -1,0 +1,92 @@
+---
+title: Five questions to ask of any data system
+description: The unit of durability, the unit of atomicity, the unit of replication and partitioning, what a read sees, and what happens on failure — the five answers that predict a system's behavior better than its feature list.
+depth: basics
+sidebar:
+  order: 5
+---
+
+import FiveQuestionsCard from '../../../../components/viz/FiveQuestionsCard';
+
+Feature lists describe what a data system does when everything works. Engineers get hurt by what
+it does when something fails — a crash mid-write, a network partition, a leader that dies with
+acknowledged writes it had not replicated. Five questions predict that behavior, and nearly every
+module on this site exists to answer one of them for some class of system.
+
+<FiveQuestionsCard client:visible />
+
+## The five questions
+
+**1. What is the unit of durability?** At what exact moment is an acknowledged write safe, and
+against what? A write flushed to one machine's disk survives a process crash but not the loss of
+that disk. A write persisted by a quorum of replicas in different availability zones survives
+losing any one of them. "Acknowledged" means different things in different systems, and the gap
+between *acknowledged* and *safe* is where data loss lives.
+
+**2. What is the unit of atomicity?** What succeeds or fails together? One row, one item, one
+record? A transaction across many rows on one server? Many partitions, but only if you use a
+specific API? If you assume a wider unit than the system provides, you get partial writes that
+look like bugs in your code.
+
+**3. What is the unit of replication and partitioning?** What gets copied, and what gets split?
+The whole database as one log, each partition independently, each row? This answer quietly sets
+the ceiling on the other two: whatever is replicated as a unit can be made durable and atomic
+cheaply, and anything that spans units needs a protocol on top.
+
+**4. What does a read see, and how stale can it be?** The latest committed write? A snapshot from
+some point in time? Something eventually consistent that may not yet include your own write? The
+answer usually depends on *which* node or index you read from, which is why the same query can be
+right on the primary and wrong on a replica.
+
+**5. What exactly happens on each failure?** When the leader or primary dies: who takes over, who
+decides, how long does it take, and which acknowledged writes can be lost in the process? A system
+that fails over automatically and one that needs an operator, or a tool, behave very differently at
+three in the morning.
+
+## Why these five, and why together
+
+The answers are not independent, and that is the point. The replication unit constrains the
+atomicity unit: a system that replicates each partition on its own can only commit across
+partitions by running a commit protocol on top, which costs extra round trips on every write that
+needs it. The durability answer constrains the failure answer: a write that only reached one node's
+memory cannot survive that node.
+
+That is why the card watches your answers for combinations that do not fit. Answer that writes are
+safe once they reach the leader's memory *and* that a leader failure loses nothing, and it flags the
+pair. Some flags mark a genuine contradiction; others mark a combination that is possible but costly
+— atomic writes across independently replicated partitions *by default* is something Spanner and
+CockroachDB deliberately pay for, and the flag asks you to check whether the system you picked
+really does.
+
+## Three systems, three different answers
+
+Work through the card for **PostgreSQL** first, then **DynamoDB**, then **Kafka**. Each keeps its
+own answers, so you can compare them in the **Show the numbers** table once you have checked all
+three.
+
+The pattern that emerges is the lesson of this page. PostgreSQL replicates the whole server as one
+log and makes durability a local flush, so a transaction across many rows is cheap and ordinary —
+and failover is something you add. DynamoDB and Kafka both split data into partitions that replicate
+independently, so a single-item or single-partition write is their natural unit, atomicity beyond it
+is an explicit API with a commit protocol behind it, and a leader is elected automatically inside each
+partition. None of this is on a feature comparison page, and all of it follows from question three.
+
+After you check a system, each answer names the modules that derive it. Some of those modules are
+written; the ones marked *not written yet* are specified in the curriculum and on their way.
+
+## Using the questions on a system you do not know
+
+When you evaluate a database, a queue or a storage service you have not used before, answer these
+five before reading any benchmark. Most documentation answers them indirectly, in the sections on
+consistency, durability settings, transactions and high availability — and when the documentation is
+vague about one of them, that vagueness is itself an answer worth writing down.
+
+They also make a good review checklist for your own designs. If a design document cannot state its
+unit of atomicity and what a read sees during a failover, it has not decided them, and production will
+decide them for it.
+
+:::note[What to take forward]
+Durability, atomicity, replication, read semantics and failure behavior are five answers that move
+together. Get the replication unit first, because it constrains the rest, and distrust any design —
+yours or a vendor's — that cannot state all five.
+:::

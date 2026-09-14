@@ -42,7 +42,7 @@ would not change, so the list operation and its lock are simply not taken.
 ## CLOCK: one bit instead of one list
 
 CLOCK keeps the frames in a fixed circular array — the same array of frames and descriptors the pool
-already has, described in [buffer pool structure](/p02-storage-engines/buffer-pool/01-buffer-pool-structure-frames-page-table-and-pins/) — plus a
+already has, described in [buffer pool structure](../../../p02-storage-engines/buffer-pool/01-buffer-pool-structure-frames-page-table-and-pins/) — plus a
 **reference bit** per frame and a **hand** that points at the next candidate. A hit sets the bit and
 does nothing else: no list, no shared ordering, no global lock. On a miss the hand advances; if the
 frame under it has its bit set, the bit is cleared (a second chance) and the hand moves on; the first
@@ -89,7 +89,7 @@ definition the more recent. That is the whole weakness, and it shows up as two n
 
 - **Sequential flooding** — one large scan evicts the entire working set, because every scanned page
   is newer than everything it displaces. The engine-level defenses are their own subject; see
-  [scan resistance](/p02-storage-engines/buffer-pool/05-scan-resistance-sequential-flooding-ring-buffers-and-midpoin/).
+  [scan resistance](../../../p02-storage-engines/buffer-pool/05-scan-resistance-sequential-flooding-ring-buffers-and-midpoin/).
 - **The looping cliff** — a cyclic access pattern over *N* pages in a pool of *N−1* frames. Under
   pure recency the next page needed is always the page just evicted, and the hit rate is **exactly
   zero**. Not degraded: zero; one more frame takes it to 100%. Set the loop one page longer than the
@@ -154,7 +154,7 @@ them rather than at the head, and promotes a page into the young sublist only on
 window, expressed in the time domain by `innodb_old_blocks_time`: a page re-read too soon after
 entering the old sublist is not promoted, which is exactly the "a scan touches every row on the page
 it just read" case. The knobs, their defaults and the monitoring belong to
-[scan resistance](/p02-storage-engines/buffer-pool/05-scan-resistance-sequential-flooding-ring-buffers-and-midpoin/).
+[scan resistance](../../../p02-storage-engines/buffer-pool/05-scan-resistance-sequential-flooding-ring-buffers-and-midpoin/).
 
 ## ARC: let the workload set the knob
 
@@ -200,7 +200,7 @@ computed from a trace afterwards, which makes it the only honest yardstick: the 
 is the hit rate no online policy can beat on that trace with those frames. Note that OPT minimizes
 *total* misses and will sacrifice a hot page to save two others, so its hot-set hit rate is sometimes
 lower than ARC's. How close an online policy can get in the worst case is
-[the next page](/p02-storage-engines/buffer-pool/04-how-good-can-a-cache-policy-be-opt-competitive-ratios-and-th/).
+[the next page](../../../p02-storage-engines/buffer-pool/04-how-good-can-a-cache-policy-be-opt-competitive-ratios-and-th/).
 
 ## Where it bites in production
 
@@ -212,7 +212,7 @@ lower than ARC's. How close an online policy can get in the worst case is
 - **A nightly job that wrecks the morning.** A scan, a `pg_dump` or a backup reads the whole table,
   and under a recency policy the working set is gone by the time traffic arrives; the pool then
   spends hours re-reading it, with the same cold-pool arithmetic as
-  [cache warm-up](/p02-storage-engines/buffer-pool/02-cache-warm-up-cold-pools-dump-load-and-prewarming/).
+  [cache warm-up](../../../p02-storage-engines/buffer-pool/02-cache-warm-up-cold-pools-dump-load-and-prewarming/).
 - **A burst of references is not frequency.** Every frequency-aware policy on this page can be
   fooled by correlated references: a scan that touches all ~200 tuples on one heap page, or a nested
   loop that re-probes the same index leaf a thousand times inside one statement, looks like a very hot

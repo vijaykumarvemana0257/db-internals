@@ -1,0 +1,182 @@
+---
+title: 'Write path: WAL, memtable, flush and write stalls'
+description: How an LSM write becomes durable and sorted — WAL append, memtable insert, flush to L0 — and why RocksDB deliberately slows and then stops writes when background work falls behind.
+depth: basics
+sidebar:
+  order: 2
+---
+
+import WritePathStallLab from '../../../../components/viz/WritePathStallLab';
+
+[Bitcask](../../../p02-storage-engines/lsm-trees/01-append-only-logs-and-bitcask-hash-indexes/)
+showed that appending is the cheapest possible write, and that an unordered log cannot serve range
+scans or keep its index off the heap. An LSM tree keeps the cheap append and adds order — but you
+cannot sort data on disk as it arrives without paying for random writes. So the write path splits
+the job in two: make the write **durable** by appending it to a log, make it **sorted** by inserting
+it into an in-memory structure, and push sorted data to disk later, in bulk, in the background.
+
+Everything interesting about LSM write performance lives in the gap between "later" and "now".
+
+<WritePathStallLab client:visible />
+
+## One write, three steps
+
+In RocksDB, a `Put`, `Delete` or `WriteBatch` goes through the same path:
+
+1. **Append to the write-ahead log.** The record is serialized and appended to the current WAL
+   file. This is the only step that makes the write survive a crash.
+2. **Assign a sequence number.** Every write gets a monotonically increasing 56-bit sequence number,
+   packed with an 8-bit value type (put, delete, merge…) into an 8-byte trailer on the key. Newer
+   sequence numbers shadow older ones for the same user key; snapshots are just "read as of sequence
+   number *N*".
+3. **Insert into the memtable.** The active memtable is a sorted in-memory structure — by default a
+   skip list whose nodes are allocated from an arena, so a whole memtable is freed in one step when
+   it is no longer needed. The next page is entirely about that skip list.
+
+The write returns to the caller after step 3. Nothing has been written to an SSTable yet, and
+nothing on disk is sorted. The write is durable because of the log, and readable because of the
+memtable.
+
+Other engines make the same split with different parts. Cassandra appends to its commit log and
+inserts into a memtable; since Cassandra 5.0 that memtable can be a trie rather than a skip list.
+Pebble, the engine inside CockroachDB, uses an arena-allocated skip list (`arenaskl`) for its
+memtable, and a separate skip list (`batchskl`) to index the contents of batches that are still
+being built.
+
+### Atomic batches and group commit
+
+A `WriteBatch` bundles many puts and deletes into a single log record with a single contiguous
+range of sequence numbers, so the batch is atomic: after a crash, recovery replays all of it or
+none of it.
+
+Under concurrency RocksDB does not write each batch to the log separately. Writers queue up, and the
+first becomes the **leader** of a write group: it concatenates the batches of compatible writers
+queued behind it, appends them to the WAL in one write, and, when those writers asked for a sync,
+performs one sync that covers all of them. (Writers that need a sync are not grouped under a leader
+that does not, so a non-syncing leader never silently drops someone else's durability request.) This is the same group commit you met on the
+[fsync page](../../../p01-foundations/hardware-os-durability/06-fsync-write-barriers-and-the-durability-contract/):
+it is how an engine turns a slow sync into many durable writes per second. The memtable inserts for
+the group can then run in parallel when `allow_concurrent_memtable_write` is enabled.
+
+### The durability window is a setting
+
+Whether step 1 is durable against a *power loss* depends on the sync policy:
+
+- **`WriteOptions::sync = false`** (the default): the WAL append reaches the operating system's page
+  cache and the write returns. A process crash loses nothing — the kernel still has the bytes — but a
+  machine crash or power loss can lose writes that had not yet been written back.
+- **`sync = true`**: the write returns only after the WAL is synced. Durable against power loss, at
+  the cost of a sync per write group.
+- **`disableWAL = true`**: skip the log entirely. The write is only as durable as the memtable, which
+  means a process crash loses everything not yet flushed. This is legitimate for data you can
+  regenerate, such as a bulk load you can restart.
+
+Cassandra exposes the same choice as `commitlog_sync`: the default `periodic` mode acknowledges
+writes immediately and syncs the commit log on a timer (every 10 seconds by default), trading a
+bounded loss window on power failure for throughput, while `batch` and `group` modes wait for a
+sync before acknowledging.
+
+## When the memtable fills
+
+The active memtable grows until it reaches `write_buffer_size` (64 MB by default). Then RocksDB:
+
+1. Marks it **immutable** — no more inserts, but still readable.
+2. Opens a fresh active memtable and a new WAL file, so foreground writes continue immediately.
+3. Schedules a background **flush**, which iterates the immutable memtable in key order and writes it
+   out as an SSTable in level 0.
+
+Once that flush completes, the immutable memtable is dropped, and the WAL file that covered it can be
+retired — its contents are now safely inside an SSTable.
+
+Level 0 is special. Each flush produces one L0 file, and because each file is simply a snapshot of
+one memtable, **L0 files can overlap in key range**. A point read may have to check every L0 file
+that could contain its key. That is why L0 cannot be allowed to grow without bound, and why a
+background **compaction** merges L0 files into the non-overlapping levels below — the subject of
+its own module. In RocksDB, compaction out of L0 starts when the file count reaches
+`level0_file_num_compaction_trigger`, 4 by default.
+
+In the lab, press **Play**. Watch the active memtable fill, freeze into an immutable one, and turn
+into an L0 file once the flush catches up with it, while the WAL bar grows with writes and shrinks
+each time a flush lets a log file retire.
+
+## Write stalls: the engine protecting itself
+
+Foreground writes only touch memory and a sequential log, so they can arrive much faster than flush
+and compaction can do their work. If nothing pushed back, immutable memtables would pile up in
+memory and L0 files would multiply until reads became unusably slow and memory ran out.
+
+RocksDB pushes back with **write stalls**. It first *slows* writes and then *stops* them, based on
+three kinds of backlog:
+
+| Backlog | Slowdown | Stop | Defaults |
+|---|---|---|---|
+| Memtables waiting to flush | only when `max_write_buffer_number` > 3, at one below it | at `max_write_buffer_number` | `max_write_buffer_number` = 2 |
+| L0 file count | `level0_slowdown_writes_trigger` | `level0_stop_writes_trigger` | 20 and 36 |
+| Estimated bytes compaction still has to do | `soft_pending_compaction_bytes_limit` | `hard_pending_compaction_bytes_limit` | 64 GB and 256 GB |
+
+During a slowdown, RocksDB admits writes at a reduced rate, starting from `delayed_write_rate` (16 MB/s
+by default) and adjusting it as the backlog grows or shrinks. During a stop, writes block until
+background work brings the backlog back under the threshold.
+
+The lab models the first two rows with their default thresholds. It holds the delayed rate at a fixed
+16 MB/s rather than adjusting it, and it reports pending compaction bytes without acting on them,
+because a backlog of tens of gigabytes is far beyond what it simulates.
+
+### What the triggers teach
+
+**A flush bottleneck.** Set incoming writes to 150 MB/s, flush throughput to 80 MB/s and compaction
+throughput to 300 MB/s. Writes stop within a few seconds, because two memtables are waiting to flush
+and that is the default `max_write_buffer_number`. Now play to the end and read *Average admitted so
+far*: it settles at the flush throughput, 80 MB/s. The engine cannot accept writes faster than it can
+flush them for long, so everything above that rate becomes time spent stopped.
+
+Now change `max_write_buffer_number` to 4 and play again. Some of the stops become slowdowns, because
+with more than three memtables allowed, RocksDB starts throttling when three are waiting — one before
+the stop. But the average admitted rate barely moves. **Allowing more memtables smooths a stall; it does
+not raise the ceiling.**
+The ceiling is the rate of the background work.
+
+**A compaction bottleneck.** Set flush throughput to 300 MB/s, so flushing is never the problem, and
+compaction throughput to 60 MB/s. Now the stall arrives later and from the other direction: L0 files
+accumulate until they reach 20, and writes are throttled. In this run they never stop — throttled
+writes arrive slower than compaction removes L0 files, so the file count hovers at the slowdown
+trigger. Drag compaction throughput down to its minimum, 10 MB/s, below even the delayed write rate,
+and play to the end: the throttle can no longer hold L0 back, the file count climbs to 36, and writes
+stop.
+
+**No bottleneck.** Set incoming writes to 60 MB/s and both background throughputs to 200 MB/s. Nothing
+ever crosses a trigger. That is the only healthy steady state: background work that keeps up with the
+sustained write rate, with triggers that exist for bursts.
+
+The practical lesson is that stalls are a symptom, and the trigger that fired tells you which background
+process is behind. Raising the thresholds hides the symptom and lets the backlog — and read cost —
+grow further before the engine finally has to stop anyway.
+
+## Where it bites in production
+
+- **Stalls look like latency spikes, not errors.** A write that is throttled or blocked simply takes
+  longer. The first sign is often p99 write latency jumping while throughput flattens. RocksDB records
+  stall counts and durations in its `LOG` file and in `rocksdb.stats`, and exposes the current state
+  through properties such as `rocksdb.is-write-stopped` and `rocksdb.actual-delayed-write-rate`.
+- **One quiet column family can pin old WAL files.** WAL files are shared across column families, and a
+  WAL file can only be deleted when every column family's data in it has been flushed. A column family
+  that receives few writes rarely fills its memtable, so it can keep ancient WAL files alive and make
+  recovery replay far more log than expected. `max_total_wal_size` forces flushes when total WAL size
+  crosses a limit for exactly this reason.
+- **Memtable memory is per column family unless you cap it.** `write_buffer_size ×
+  max_write_buffer_number` is a per-column-family bound. With many column families, total memtable
+  memory can surprise you; a shared `WriteBufferManager` (configured through `db_write_buffer_size`)
+  caps it across all of them.
+- **Recovery time is WAL length.** On restart, RocksDB replays every WAL record newer than the last
+  flush back into a memtable. Anything that delays flushes — a large `write_buffer_size`, a quiet column
+  family — lengthens restart.
+- **Turning off the WAL is a durability decision, not a tuning knob.** `disableWAL` removes the log
+  write from the hot path, and with it every guarantee for unflushed data. It is correct for
+  regenerable data and wrong for anything else.
+
+:::note[What to take forward]
+An LSM write is a log append for durability plus a memtable insert for order, and flushing sorted data
+to disk happens later, in the background. Sustained write throughput is therefore bounded by flush and
+compaction, not by the foreground path. Write stalls are how the engine enforces that bound; the
+trigger that fires tells you which background process has fallen behind.
+:::

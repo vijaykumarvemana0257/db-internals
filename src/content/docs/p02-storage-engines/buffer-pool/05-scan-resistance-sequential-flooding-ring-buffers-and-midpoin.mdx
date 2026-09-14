@@ -31,7 +31,7 @@ then by the end of the scan, under strict LRU, *every* frame holds a scan page: 
 issued more distinct references than the pool can hold, and LRU keeps the most recent `P` of
 them. It does not matter how hot the evicted pages were or how long they had been resident.
 This is the pathological case behind the k-competitive bound from
-[the previous page](/p02-storage-engines/buffer-pool/04-how-good-can-a-cache-policy-be-opt-competitive-ratios-and-th/):
+[the previous page](../../../p02-storage-engines/buffer-pool/04-how-good-can-a-cache-policy-be-opt-competitive-ratios-and-th/):
 an adversary that wants to make LRU miss on everything writes a loop over `P + 1` pages, and a
 sequential scan is that adversary by accident.
 
@@ -78,7 +78,7 @@ readers.
 
 Dirty pages are the other subtlety, and it is the reason the write ring is 64× the read ring.
 Evicting a dirty buffer means writing it, and writing it means first flushing the WAL through
-its page LSN — the rule [page 6](/p02-storage-engines/buffer-pool/06-dirty-pages-write-back-and-the-wal-before-data-rule/)
+its page LSN — the rule [page 6](../../../p02-storage-engines/buffer-pool/06-dirty-pages-write-back-and-the-wal-before-data-rule/)
 covers in full. With a 32-buffer ring, a bulk *write* would hit that cost every 32 pages, so
 `COPY` would spend its life in `XLogFlush()`. `StrategyRejectBuffer()` handles the read side of
 the same problem: if the buffer the ring offers back is dirty, a `BAS_BULKREAD` strategy rejects
@@ -233,7 +233,7 @@ speed when nobody is watching, and `BUFFER_USAGE_LIMIT 0` removes the ring entir
 - **Replica promotion into a cold pool.** Scan resistance means a standby that has been
   replaying WAL is warm in exactly the pages WAL touched and cold everywhere else, so the first
   analytical query after failover is also the first scan. That is the warm-up problem from
-  [page 2](/p02-storage-engines/buffer-pool/02-cache-warm-up-cold-pools-dump-load-and-prewarming/),
+  [page 2](../../../p02-storage-engines/buffer-pool/02-cache-warm-up-cold-pools-dump-load-and-prewarming/),
   and prewarming is the answer to it — not the ring.
 - **Benchmarks that measure the wrong pool.** A `SELECT count(*)` run twice on a table above
   the ring threshold is slow both times, and it is not a caching bug. A benchmark that reports

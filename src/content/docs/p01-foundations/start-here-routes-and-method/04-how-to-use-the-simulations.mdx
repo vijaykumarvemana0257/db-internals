@@ -1,0 +1,95 @@
+---
+title: How to use the simulations
+description: The predict-then-run method every page on this site assumes, what the simulators do and do not model, and how to read their shared visual conventions.
+depth: basics
+sidebar:
+  order: 4
+---
+
+import PredictThenRunTour from '../../../../components/viz/PredictThenRunTour';
+
+Every page on this site has at least one simulator, and it is easy to use them wrong: drag a
+slider, watch something move, feel like you understood it, and move on. That produces the
+sensation of learning without much of the substance. The simulators are built for a different
+loop, and it takes about a minute to practise.
+
+<PredictThenRunTour client:visible />
+
+## The loop: predict, run, compare
+
+1. **Change one input.** Not three. If you move the pool size, the policy and the workload at
+   once, you cannot tell which one caused what you see.
+2. **Predict the internal state before you run it.** Say it concretely: *this page gets evicted*,
+   *the hit rate goes down*, *this transaction blocks*. A vague prediction ("something changes")
+   cannot be wrong, so it teaches you nothing.
+3. **Run it and compare against the state panel.** When your prediction was right, you have
+   evidence your model of the mechanism is right. When it was wrong, you have found the exact
+   point where your model and the mechanism disagree — which is the most valuable thing a page can
+   give you.
+
+The tour above is that loop on the smallest possible buffer pool: three frames and a fixed
+sequence of ten page accesses. Before each access, pick what you think will happen — a hit, or a
+miss that evicts a particular page — then reveal it. The frames are drawn in eviction order, with
+the next victim on the right, so you have everything you need to predict correctly.
+
+Go through it once under **LRU**. Then switch to **FIFO** and go through the same sequence again.
+The first four accesses produce the same outcomes — three misses into free frames, then a hit — and at the fifth access — page D arriving to a full
+pool — the two policies evict *different* pages: LRU throws out B, the page that has gone longest
+without being used, while FIFO throws out A, the page loaded earliest, even though A was just
+accessed. Everything else is identical: same pages, same order, same pool. That single rule change
+is also why FIFO ends the sequence with fewer hits than LRU. If you predicted the fifth access
+correctly both times, you understand the difference between the two policies better than a
+paragraph describing them would give you.
+
+The [buffer pool module](../../../p02-storage-engines/buffer-pool/03-replacement-policies-lru-clock-lru-k-2q-and-arc/)
+does this properly, with CLOCK, LRU-K, 2Q and ARC on realistic workloads. The point here is only the
+method.
+
+## What the simulators model — and what they do not
+
+The simulators model **mechanism**: which page is evicted, which version a transaction sees, which
+log record must reach disk before which page, which replica is allowed to answer. When a simulator
+says a design takes two disk reads where another takes one, that relationship is the point, and you
+should trust it.
+
+They do **not** model the absolute performance of your hardware or your production system. A
+latency or throughput number in a simulator comes from a simple, stated model — usually a handful
+of constants for access cost and transfer cost — so that *relative* costs and *shapes* are right: a
+cliff where the working set outgrows memory, a gap that closes as request size grows, a stall when a
+threshold is crossed. Do not read a simulator's "3,000 IOPS" as a prediction for your machine. Read
+"roughly ten times slower, and it falls off a cliff here" as the lesson.
+
+Two more things they deliberately leave out:
+
+- **Most of the concurrency.** Real engines interleave thousands of operations. Simulators usually
+  step through a small number, one at a time, so you can see each step. When a page is about a race,
+  it will say so and let you control the interleaving.
+- **Randomness.** Every simulator is deterministic: the same inputs always produce the same result,
+  including anything that looks random. That is what makes predicting possible, and it means a
+  surprising result is reproducible — reset and run it again.
+
+## Reading the visual conventions
+
+Every simulator has a **legend**, and the legend is authoritative for that simulator. Beyond that,
+a few conventions hold across the whole site, so that the same idea looks the same everywhere:
+
+- **Committed, durable data** and **dirty, uncommitted or in-memory-only data** each have a
+  reserved color, and pages use it for that meaning. Learn what makes a page dirty on the
+  durability pages, and the same color marks dirty state on the buffer-pool, crash-safety and
+  transaction pages that follow. The tour
+  above deliberately does *not* use those two colors: a page just read from disk is neither.
+- **Dead or garbage data** — a dead tuple version, a tombstone past its grace period, an evicted
+  page's former contents — is drawn muted.
+- **Status colors** for good, warning, serious and critical are used only for a system's state,
+  and always with a label or icon beside them, never on their own.
+- **Identity is never carried by color alone.** Anything distinguished by color is also labelled,
+  shaped or listed, and most simulators have a **Show the numbers** table underneath with the same
+  information as text.
+
+If a simulator ever seems to contradict its page — the page says "watch X happen" and X does not
+happen at those settings — that is a bug, not a subtlety, and it is worth reporting.
+
+:::note[What to take forward]
+Change one input, predict the internal state out loud, then compare. Trust simulators for mechanism
+and relative cost, never for absolute numbers, and treat each legend as the key for its own figure.
+:::

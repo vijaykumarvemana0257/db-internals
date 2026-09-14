@@ -4,6 +4,17 @@
     "collapsed": true,
     "items": [
       {
+        "label": "1.1 Start Here: Routes, Depth and How to Read a Mechanism",
+        "collapsed": true,
+        "items": [
+          {
+            "autogenerate": {
+              "directory": "p01-foundations/start-here-routes-and-method"
+            }
+          }
+        ]
+      },
+      {
         "label": "1.2 Data Models and a Hands-On SQL Primer",
         "collapsed": true,
         "items": [
@@ -98,7 +109,7 @@
         ]
       },
       {
-        "label": "2.6 Log-Structured Merge Trees",
+        "label": "2.5 Log-Structured Merge Trees",
         "collapsed": true,
         "items": [
           {

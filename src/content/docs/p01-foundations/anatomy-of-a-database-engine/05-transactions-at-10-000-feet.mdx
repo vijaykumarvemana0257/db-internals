@@ -55,7 +55,7 @@ writes nothing to the table at all — it appends an abort record to the WAL and
 aborted in `pg_xact`, and every reader that later encounters those tuples checks the xid, sees
 "aborted", and treats the new version as invisible. Abort is O(1) regardless of transaction
 size. The bill arrives later, as dead tuples that `VACUUM` has to collect, which is the subject
-of [versions, snapshots and the garbage horizon](/p01-foundations/anatomy-of-a-database-engine/06-versions-snapshots-and-the-garbage-horizon/).
+of [versions, snapshots and the garbage horizon](../../../p01-foundations/anatomy-of-a-database-engine/06-versions-snapshots-and-the-garbage-horizon/).
 
 The lab models the InnoDB shape because it is easier to see: every write pushes a before-image
 onto an undo log, and a rollback or a crash walks it backwards. Both designs give you the same
@@ -113,7 +113,7 @@ storage. That ordering — log record durable before the reply, and before the m
 allowed to reach disk — is the whole of the write-ahead logging rule, and it is what makes
 recovery a two-part sweep: redo every transaction whose commit record is in the log, undo every
 transaction whose is not. Watch the recovery column in the lab after a power cut; that is the
-entire algorithm. [The WAL primer](/p01-foundations/anatomy-of-a-database-engine/07-wal-primer-log-records-lsns-and-log-before-page/)
+entire algorithm. [The WAL primer](../../../p01-foundations/anatomy-of-a-database-engine/07-wal-primer-log-records-lsns-and-log-before-page/)
 takes it apart.
 
 Durability is also the promise you are most often given a knob to weaken:

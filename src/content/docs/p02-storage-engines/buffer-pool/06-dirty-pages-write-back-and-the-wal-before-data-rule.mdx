@@ -19,7 +19,7 @@ the log must be durable through the page's LSN before the page may be written �
 
 ## One bit and two LSNs
 
-The [frame descriptor](/p02-storage-engines/buffer-pool/01-buffer-pool-structure-frames-page-table-and-pins/)
+The [frame descriptor](../../../p02-storage-engines/buffer-pool/01-buffer-pool-structure-frames-page-table-and-pins/)
 carries the dirty bit. In PostgreSQL it is `BM_DIRTY`, one flag inside the descriptor's single
 atomic `state` word alongside `BM_VALID`, `BM_IO_IN_PROGRESS`, `BM_CHECKPOINT_NEEDED` and the
 usage count; `MarkBufferDirty()` sets it, and the WAL coding rules in `access/transam/README` require it to
@@ -34,7 +34,7 @@ The LSNs are where the real information is.
 - **pageLSN** — PostgreSQL's `pd_lsn`, the first 8 bytes of the page; InnoDB's `FIL_PAGE_LSN`
   at byte 16 — is the **end LSN of the most recent log record applied to this page**. It is
   stamped into the in-memory page when the change is made, not when the page is written. This
-  is the field the [WAL primer](/p01-foundations/anatomy-of-a-database-engine/07-wal-primer-log-records-lsns-and-log-before-page/)
+  is the field the [WAL primer](../../../p01-foundations/anatomy-of-a-database-engine/07-wal-primer-log-records-lsns-and-log-before-page/)
   introduced; here it is the thing that gates I/O.
 - **recLSN** — InnoDB's `oldest_modification`; the ARIES literature calls it the recovery LSN —
   is the LSN at which this page *first* became dirty since it was last written. It is set on the
@@ -79,7 +79,7 @@ dirty frame** in the lab repeatedly: the *most recently* dirtied page costs a fo
 the very next eviction usually costs nothing, because the flush you were just charged for
 covered every page stamped below that LSN too. `XLogNeedsFlush()` is the cheap predicate for
 exactly this question, and PostgreSQL consults it before deciding whether a nondefault strategy
-should accept a victim at all — which is how the [bulk-read ring](/p02-storage-engines/buffer-pool/05-scan-resistance-sequential-flooding-ring-buffers-and-midpoin/)
+should accept a victim at all — which is how the [bulk-read ring](../../../p02-storage-engines/buffer-pool/05-scan-resistance-sequential-flooding-ring-buffers-and-midpoin/)
 avoids turning a sequential scan into a write-and-flush storm.
 
 **`BM_PERMANENT` is a real exemption.** Unlogged tables and temporary relations generate no WAL,
@@ -104,7 +104,7 @@ The barrier orders the log against the page; it says nothing about the page arri
 logs a full-page image on the first change to each block after a checkpoint and InnoDB writes
 every page twice — once into the doublewrite files, once into the tablespace. Both taxes exist
 because a page write is not a transaction. See
-[checksums and corruption detection](/p02-storage-engines/pages-tuples-heap-files/06-checksums-corruption-detection-and-on-disk-format-evolution/).
+[checksums and corruption detection](../../../p02-storage-engines/pages-tuples-heap-files/06-checksums-corruption-detection-and-on-disk-format-evolution/).
 :::
 
 ## Who fsyncs the page? Nobody, yet

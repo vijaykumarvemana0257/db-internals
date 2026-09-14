@@ -222,8 +222,8 @@ over 1 of 100 columns reads about 1% of the bytes; PAX does both by choosing a r
 A sorted key-value engine is a fourth answer that is really the first one plus an encoding
 discipline: turn the key columns into bytes whose `memcmp` order is the logical order, prefix
 them with the table and index, and every SQL range becomes a contiguous byte range. Later
-modules take these apart — [pages and tuples](/p02-storage-engines/pages-tuples-heap-files/01-page-anatomy-and-the-slotted-page/)
-for the NSM write path, [columnar layouts](/p02-storage-engines/column-stores-analytical-storage/01-columnar-layouts-nsm-dsm-pax-and-row-groups/)
-for encodings and compression, and [key encoding](/p02-storage-engines/b-trees-and-variants/07-collation-unicode-and-byte-comparable-key-encoding/)
+modules take these apart — [pages and tuples](../../../p02-storage-engines/pages-tuples-heap-files/01-page-anatomy-and-the-slotted-page/)
+for the NSM write path, [columnar layouts](../../../p02-storage-engines/column-stores-analytical-storage/01-columnar-layouts-nsm-dsm-pax-and-row-groups/)
+for encodings and compression, and [key encoding](../../../p02-storage-engines/b-trees-and-variants/07-collation-unicode-and-byte-comparable-key-encoding/)
 for the byte-comparable rules in full.
 :::

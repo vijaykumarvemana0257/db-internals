@@ -76,7 +76,7 @@ Three predicates disagree about floats: `=` (IEEE semantics, mostly), `IS NOT DI
 (NULL-aware), and `memcmp` over the encoded bytes. Deduplication, cache keys and
 content-addressed storage all quietly use the third one. Making float keys byte-comparable
 takes an explicit transform — flip the sign bit for positives, flip every bit for negatives —
-and that belongs to the [B-tree key-encoding](/curriculum/) page, not here.
+and that belongs to the [B-tree key-encoding](../../../curriculum/) page, not here.
 :::
 
 ## Length-prefixed or delimited: pick your failure mode
@@ -155,7 +155,7 @@ and nothing in the bytes says which. Formats settle it in one of three ways:
   8192` sit right next to the LSNs — the file is the cluster's ABI contract with itself.
   (`sizeof(ControlFileData)` is capped at `PG_CONTROL_MAX_SAFE_SIZE` = 512 bytes so the whole
   thing lands in a single sector write; that constraint belongs to the
-  [fsync and atomicity](/curriculum/) page.)
+  [fsync and atomicity](../../../curriculum/) page.)
 
 The remaining option is self-description: TIFF begins with `II` or `MM`, Unicode has a byte
 order mark. Nobody sensible invents a fourth.
@@ -194,7 +194,7 @@ sense of it with the **writer's schema** — stored once in the object-container
 fetched from a registry by id — resolved against its own **reader's schema**, matching fields
 by name. That is the densest of the three and the one that is completely unreadable without
 out-of-band metadata. The compatibility rules that come with writer/reader resolution are the
-[data-modeling module's](/curriculum/) subject.
+[data-modeling module's](../../../curriculum/) subject.
 
 ## Where it bites
 

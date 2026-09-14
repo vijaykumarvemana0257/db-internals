@@ -339,6 +339,17 @@ export function makeRng(seed = 1) {
   };
 }
 
+/* ------------------------------------------------------------------ links */
+
+/**
+ * Internal link from inside a component. Pages are served under Astro's `base`
+ * (e.g. "/db-internals/" on GitHub Pages); a bare "/p02-…" would 404 there.
+ * Pass a root-relative path like "/p02-storage-engines/b-trees-and-variants/01-…/".
+ */
+export function siteHref(path: string) {
+  return `${import.meta.env.BASE_URL.replace(/\/$/, '')}${path}`;
+}
+
 /* ------------------------------------------------------------- formatting */
 
 export const SERIES = [

@@ -20,7 +20,7 @@ storage, and almost nobody budgets for it.
 ## The cold pool is an arithmetic problem
 
 Nothing subtle happens when a pool is empty. Each logical read checks the page table, finds no
-frame ([page 1](/p02-storage-engines/buffer-pool/01-buffer-pool-structure-frames-page-table-and-pins/)),
+frame ([page 1](../../../p02-storage-engines/buffer-pool/01-buffer-pool-structure-frames-page-table-and-pins/)),
 allocates a victim frame, issues a physical read and blocks the caller on it. Two things follow
 immediately, and they are the two things your monitoring will show.
 
@@ -163,7 +163,7 @@ SELECT pg_prewarm('orders', 'buffer', 'main', 0, 2000000);
 
 MySQL's equivalent hand-tool is a query that forces the pages through the pool —
 `SELECT COUNT(*) FROM t FORCE INDEX (PRIMARY)` — which is cruder, competes with live traffic, and
-ignores [scan resistance](/p02-storage-engines/buffer-pool/05-scan-resistance-sequential-flooding-ring-buffers-and-midpoin/)
+ignores [scan resistance](../../../p02-storage-engines/buffer-pool/05-scan-resistance-sequential-flooding-ring-buffers-and-midpoin/)
 machinery at your peril.
 
 ## Standbys: warm for the wrong pages

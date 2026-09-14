@@ -40,7 +40,7 @@ vocabulary of this page:
 
 Put real numbers in. With 8 KB pages and 16-byte index entries, B is about 500 entries. A
 billion-row index is log<sub>500</sub>(10⁹) ≈ 3.3, so four levels; the root and the level below
-it are a few megabytes and live in the [buffer pool](/p02-storage-engines/buffer-pool/01-buffer-pool-structure-frames-page-table-and-pins/)
+it are a few megabytes and live in the [buffer pool](../../../p02-storage-engines/buffer-pool/01-buffer-pool-structure-frames-page-table-and-pins/)
 permanently, which is why a point lookup on a well-behaved index costs **one or two physical
 reads**, not four. That is the number the model exists to produce, and the lab above measures
 it: set N to 10⁹, and watch the measured B+tree line sit well under the dashed analytic one,
@@ -62,7 +62,7 @@ fanout B achieves it. This is the sense in which the B-tree is *optimal*, and it
 is the one dimension of a B-tree you cannot trade away: doubling the entry size halves the
 fanout, which does not double the depth but does push it across an integer boundary sooner,
 and each boundary crossed is one more physical read per lookup. Everything on
-[key layout, prefix compression and suffix truncation](/p02-storage-engines/b-trees-and-variants/06-key-layout-prefix-compression-and-suffix-truncation/)
+[key layout, prefix compression and suffix truncation](../../../p02-storage-engines/b-trees-and-variants/06-key-layout-prefix-compression-and-suffix-truncation/)
 is an attack on that one number.
 
 The scan bound is even blunter: reading N records that live in N/B blocks costs N/B transfers,
@@ -101,10 +101,10 @@ The **insert lane** is flat and then convex. While the growing index fits in M, 
 nothing: every leaf you touch is already resident. The moment the index exceeds memory, each
 random insert pays a leaf read plus an eventual leaf write, and the cost per record climbs to
 ~2. This is the same cliff as the working-set cliff from
-[the memory hierarchy](/p01-foundations/hardware-os-durability/01-memory-hierarchy-and-latency-numbers/),
+[the memory hierarchy](../../../p01-foundations/hardware-os-durability/01-memory-hierarchy-and-latency-numbers/),
 and it is why an index build that looked fine on a 10 GB test dataset runs overnight on the
 100 GB production one. The gap between the two lanes never closes, because it is a theorem —
-and it is why [bulk loading](/p02-storage-engines/b-trees-and-variants/05-bulk-loading-and-index-construction/)
+and it is why [bulk loading](../../../p02-storage-engines/b-trees-and-variants/05-bulk-loading-and-index-construction/)
 sorts first rather than replaying inserts.
 
 ## The insert/query curve: B-trees, Bε-trees and LSMs are three points on it
@@ -128,8 +128,8 @@ they are cheap and move them in blocks**. A node with fanout B<sup>ε</sup> spen
 its page on a message buffer, and a message is only pushed down a level when B<sup>1−ε</sup>
 messages travel together — so one transfer carries B<sup>1−ε</sup> inserts instead of one.
 This module stops at the bound; the structures themselves belong to
-[B-Tree Concurrency and Write-Optimized Variants](/p02-storage-engines/b-tree-concurrency-and-write-optimized-variants/01-b-tree-concurrency-latch-crabbing-and-lehman-yao/),
-and the LSM row to [Log-Structured Merge Trees](/p02-storage-engines/lsm-trees/01-append-only-logs-and-bitcask-hash-indexes/).
+[B-Tree Concurrency and Write-Optimized Variants](../../../p02-storage-engines/b-tree-concurrency-and-write-optimized-variants/01-b-tree-concurrency-latch-crabbing-and-lehman-yao/),
+and the LSM row to [Log-Structured Merge Trees](../../../p02-storage-engines/lsm-trees/01-append-only-logs-and-bitcask-hash-indexes/).
 Bε-trees did ship: Tokutek's fractal-tree indexes in TokuDB and TokuMX (since deprecated) and
 the BetrFS research filesystem.
 

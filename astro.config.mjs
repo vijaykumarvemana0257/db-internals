@@ -19,6 +19,10 @@ export default defineConfig({
       description:
         'Databases and distributed data explained visually — from bytes on disk to planet-scale consensus.',
       sidebar,
+      components: {
+        // Adds module, level, page depth and prerequisites under every lesson title.
+        PageTitle: './src/components/PageTitle.astro',
+      },
       customCss: ['./src/styles/custom.css'],
       lastUpdated: true,
       pagination: true,

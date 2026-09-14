@@ -106,7 +106,7 @@ Note what is *not* in the descriptor: anything about the page's contents. The po
 deliberately ignorant of tuples, keys and rows; that is the whole reason a single buffer manager
 can serve heap pages, index pages, free space maps and visibility maps at once. The byte layout
 inside the frame belongs to
-[Page anatomy and the slotted page](/p02-storage-engines/pages-tuples-heap-files/01-page-anatomy-and-the-slotted-page/).
+[Page anatomy and the slotted page](../../../p02-storage-engines/pages-tuples-heap-files/01-page-anatomy-and-the-slotted-page/).
 
 ## The pin contract
 
@@ -149,11 +149,11 @@ Step the visual through a miss and you are walking `ReadBuffer_common` → `Buff
    and refcount 0. If a full circuit finds nothing, it raises
    `ERROR: no unpinned buffers available` rather than break the pin contract. Which frame gets
    picked is the subject of
-   [Replacement policies](/p02-storage-engines/buffer-pool/03-replacement-policies-lru-clock-lru-k-2q-and-arc/).
+   [Replacement policies](../../../p02-storage-engines/buffer-pool/03-replacement-policies-lru-clock-lru-k-2q-and-arc/).
 4. **If the victim is dirty, write it out first.** The backend that wanted a frame pays for the
    write — which is why a plain `SELECT` can report buffers *written*. The WAL for that page
    must be flushed before the page itself may leave memory; that ordering rule is
-   [Dirty pages, write-back and the WAL-before-data rule](/p02-storage-engines/buffer-pool/06-dirty-pages-write-back-and-the-wal-before-data-rule/).
+   [Dirty pages, write-back and the WAL-before-data rule](../../../p02-storage-engines/buffer-pool/06-dirty-pages-write-back-and-the-wal-before-data-rule/).
 5. **Swap the tag.** Delete the old entry, insert the new one — two buckets, therefore two
    partition locks, acquired in a fixed order so that two backends swapping in opposite
    directions cannot deadlock.
@@ -212,7 +212,7 @@ ratio" dashboard tells you so little on its own — the 1% is where all the time
   `pg_stat_activity`.
 - **Resizing is not a knob you turn casually.** `shared_buffers` is fixed at postmaster start, so
   changing it is a restart and a completely cold pool; see
-  [Cache warm-up](/p02-storage-engines/buffer-pool/02-cache-warm-up-cold-pools-dump-load-and-prewarming/).
+  [Cache warm-up](../../../p02-storage-engines/buffer-pool/02-cache-warm-up-cold-pools-dump-load-and-prewarming/).
   InnoDB *can* resize online, in chunk-sized steps, but a shrink has to withdraw chunks and
   relocate or flush every page in them — watch `Innodb_buffer_pool_resize_status`, and expect a
   burst of writes plus a colder cache when it finishes. Drag the pool-size slider in the visual

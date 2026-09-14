@@ -1,0 +1,111 @@
+---
+title: Three routes through the same modules
+description: One front-to-back order serves nobody by default. Pick an engineering route or a concrete goal and see exactly which modules it needs, computed from the curriculum's own prerequisite graph.
+depth: basics
+sidebar:
+  order: 1
+---
+
+import RouteMapExplorer from '../../../../components/viz/RouteMapExplorer';
+
+This site is written in one order — foundations, storage engines, query processing,
+transactions, then distributed systems — and that order is a good default. It is not the only
+correct one. An application engineer who needs to fix a slow query this week should not be
+told to read about flash translation layers and latch-free reclamation first. A distributed-systems
+engineer needs a specific slice of single-node material, not all of it.
+
+What makes an alternative route *safe* is the prerequisite graph. Every module declares which
+modules it assumes, and a route is only honest if it includes everything its modules assume. So
+instead of describing routes in prose, the explorer below computes them.
+
+<RouteMapExplorer client:visible audience="engineering" />
+
+## How to read the map
+
+Each chip is a module, grouped by part. The colored bar on its left says why it is lit:
+
+- **On the route** — a module the route names explicitly.
+- **Prerequisite the route pulls in** — a module nobody listed, but that something on the route
+  declares it needs. These are the modules a hand-written reading list usually forgets.
+- **Dashed border** — the module is specified but not written yet. The site is being built
+  progressively, so the totals show both how much a route needs and how much of it you can read
+  today. Dashed chips are never links.
+
+Hover any chip to ring its direct prerequisites and see how many later modules build on it. That
+second number is a good proxy for how foundational a module is: the ones with long tails are the
+ones not to skim.
+
+## The three engineering routes
+
+**Application engineer.** For someone who writes queries and schemas for a living and needs to
+make them fast and correct. It runs through the SQL foundations, then straight into how a plan is
+built and read — logical plans, physical operators, cost-based optimization, EXPLAIN — then index
+selection, then the transaction and concurrency material that decides whether your code has race
+conditions, and finally the using-it-well modules on access patterns, pooling and schema change.
+It does not skip storage internals as cleanly as you might hope — select it and look at Part 2.
+Physical operators and index selection assume you know how pages, the buffer pool, B-trees, LSM
+trees and the other index structures behave, so those light up as prerequisites. What the route
+genuinely skips is the *deeper* storage material: latch coupling and latch-free trees, compaction
+internals, tries and vector indexes, column stores. You need a B-tree's cost shape, not how its
+latches are coupled. A reasonable place to stop is after the using-it-well leg; the operating leg
+is there for when you start owning the database, not just writing to it.
+
+**Storage internals.** For someone who wants to understand, or build, a single-node engine. This
+is the site's default order through the first four parts, plus the relational and embedded case
+studies that tie the mechanisms back to real engines. It skips nothing in those parts, so it is
+the longest single-node route, and the one every other route borrows from.
+
+**Distributed systems.** For someone working on replication, sharding, consensus or distributed
+transactions. It takes a deliberately thin slice of single-node material — the anatomy of an
+engine, transactions and isolation, application access — then all of transactions and recovery,
+then the distributed parts. Look at how many prerequisites it pulls in beyond what it names: that
+gap is the single-node knowledge distributed designs quietly depend on. The natural stopping point
+is after replication and consensus; the distributed-transaction and architecture material after
+it is where specialists go.
+
+## Goals are not modules
+
+The same dropdown offers goals — *make this query fast*, *survive a crash without losing data*,
+*design a sharded store*, *stop a race condition in my app*. Pick one and notice that a goal is
+never just its own module. "Make this query fast" names two modules and lights many more, because
+tuning a plan assumes you can read one, and reading one assumes you know what the operators do and
+what they cost.
+
+Then use **Then also learn…** to stack a second goal on the first. The modules marked **+** are
+what the second goal adds *beyond* what you already needed. Stacking two goals from the same
+region of the curriculum adds little; stacking a query-tuning goal with a sharding goal adds a
+whole second foundation, because sharding leans on replication, and replication leans on
+transactions and the write-ahead log.
+
+## Catching a route that lies
+
+Hand-written reading lists are often out of order in a way that is easy to miss: they put an
+exciting module first and circle back to its foundations later. The explorer checks for exactly
+that. Select **Distributed-first (a common mistake)** — a route that starts with replication and
+consensus, then turns to transactions and logging. The replication and consensus chips are marked
+**⚠**, and the note names the prerequisites they are listed ahead of: transactions and isolation,
+and write-ahead logging. Read in that order, the replication pages would lean on material the route
+only reaches afterwards.
+
+A prerequisite that a route never mentions is *not* flagged — it is simply pulled in and read first.
+The only thing flagged is a route that names both a module and its prerequisite, in the wrong order.
+
+:::tip[Use the table]
+Open **Show the numbers** under the map. It breaks the selected route into legs and shows, for each
+leg, how many modules and pages it adds on top of the legs before it and the running time. That is
+the honest answer to "how long will this take": a leg that looks short can be expensive because of
+the prerequisites it is the first to need.
+:::
+
+## Where the time estimates come from
+
+Every hour figure on these pages comes from one stated assumption — a fixed number of minutes per
+page, covering reading one of these pages and spending time with its simulator — multiplied by the
+page count the curriculum data reports. It is a planning number, not a promise. Skimming pages you
+already know is expected; the estimate is useful mainly for comparing routes with each other.
+
+:::note[What to take forward]
+A route is only as good as its prerequisites. Pick the route or goal that matches what you need,
+trust the modules it pulls in over the ones you would have guessed, and stop at the stopping point
+unless you are going to own that layer.
+:::

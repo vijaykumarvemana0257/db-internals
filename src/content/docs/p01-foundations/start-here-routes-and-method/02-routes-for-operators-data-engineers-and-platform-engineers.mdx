@@ -1,0 +1,99 @@
+---
+title: Routes for operators, data engineers and platform engineers
+description: The SRE/DBA, data-engineer and platform-engineer routes through the curriculum, what each genuinely needs, where each can stop, and the playbook pages to enter from mid-incident.
+depth: basics
+sidebar:
+  order: 2
+---
+
+import RouteMapExplorer from '../../../../components/viz/RouteMapExplorer';
+
+The [three engineering routes](../../../p01-foundations/start-here-routes-and-method/01-three-routes-through-the-same-modules/)
+are organized around what you build. The three routes on this page are organized around what you
+*run*: keeping a database up, moving data out of it into analytical systems, and operating a fleet
+of databases for other teams. They use the same modules and the same prerequisite graph, and they
+come with a second kind of entry point — a place to land when something is already on fire.
+
+<RouteMapExplorer client:visible audience="roles" />
+
+The explorer here lists the three role routes first and the engineering routes after them, so you
+can switch between, say, **SRE / DBA on call** and **Application engineer** and watch how much of
+the map they share.
+
+## SRE / DBA on call
+
+The SRE route follows the order in which things break a production database. It starts with the
+anatomy of an engine, then MVCC storage and vacuum — because long transactions, bloat and
+transaction-ID horizons are behind a large share of real incidents — then write-ahead logging and
+crash recovery, then replication and its operations, and finally the operating modules on
+observability, failover and poolers, backups, and incident response.
+
+The order is not arbitrary, and the explorer shows why. Write-ahead logging is listed after MVCC
+storage because the WAL module declares MVCC storage as a prerequisite: you cannot reason about
+what recovery replays until you know what a tuple version is. If you move those legs around in
+your head, the validator on the previous page is what would catch it.
+
+A reasonable stopping point is after the replication leg. Everything up to there is the mental
+model you need to *diagnose*; the operating leg is the tooling and procedure you need to *act*.
+
+**Sideways entry.** If you are paged, do not start at leg one. The triage playbooks in Part 12 are
+written to be entered from a symptom — replication lag, a disk filling up, a vacuum that cannot
+advance, a sudden connection storm — and they link back into the modules that explain each
+mechanism. Use the route for learning and the playbooks for incidents.
+
+## Data engineer
+
+The data-engineer route runs from data models to columnar storage, then analytical engines and
+lakehouse table formats, then logs and change data capture, then warehouse pipelines and how
+analytics are delivered.
+
+Select it and look at Parts 4 and 7 before you read further, because the most useful thing this
+route teaches is visible in what it pulls in. It *names* no transaction or replication modules,
+and a data engineer could reasonably expect to skip that material. The graph disagrees. Change
+data capture reads a database's replication log; a log-structured pipeline inherits partitioning,
+ordering and delivery guarantees from the systems underneath it; exactly-once claims are
+consensus and transaction claims in disguise. So a large share of both parts lights up as
+prerequisites. A pipeline that silently drops or duplicates rows during a failover is usually
+built by someone who took the shortcut the route *looks* like it offers.
+
+The natural stopping point is after logs and CDC. Warehouse pipelines and delivery semantics are
+where you go once you own the pipeline end to end.
+
+**Sideways entry.** The decision guides and comparison matrices in Part 12 are the pages to open
+when the question is "which system should this data live in" rather than "how does this system
+work".
+
+## Platform engineer
+
+The platform-engineer route is for the team that provisions, secures and upgrades databases that
+other teams depend on. It starts with provisioning and fleet lifecycle, then security, identity
+and tenant isolation, then observability and capacity, and ends with managed services, cost and
+upgrades.
+
+Observability and capacity come before managed services for the same reason as on the SRE route:
+the module on running databases on managed platforms declares the observability module as a
+prerequisite. Choosing a managed service well means knowing which signals you will lose visibility
+into and which capacity limits become someone else's knob.
+
+This route overlaps heavily with the application-engineer route — switch between the two and most
+of the lit foundation is the same. The platform engineer needs the application engineer's model of
+connections, transactions and schema change, because those are exactly the things a platform has
+to make safe at scale. A reasonable stopping point is after observability and capacity.
+
+**Sideways entry.** The lifecycle checklists and review gates in Part 12 are written for the moment
+a new database is about to take real traffic, or a major upgrade is scheduled: they list the
+evidence a system should produce before that happens.
+
+## The shared core
+
+Switch through all six routes and watch which chips stay lit. The anatomy of an engine,
+transactions and isolation, and the core storage and query modules are on nearly every route.
+That shared core is the part of the site worth reading carefully regardless of your role — the
+role-specific modules sit on top of it, and they are much faster to read once it is in place.
+
+:::note[What to take forward]
+Pick the route for the job you do, but read the prerequisites it pulls in rather than the ones you
+expected — for data engineers especially, the modules the route did not name are where pipelines
+break. When something is already broken, enter from the Part 12 playbooks instead of from the
+start of a route.
+:::

@@ -97,7 +97,9 @@ const SCRIPT = (() => {
   return Array.from({ length: 60 }, () => {
     const key = KEYS[Math.floor(rng() * KEYS.length) % KEYS.length];
     const r = rng();
-    return { key, kind: r > 0.82 ? ('tomb' as const) : ('put' as const), vsz: 32 + Math.floor(rng() * 12) * 48 };
+    // A size factor, not a size: scripted writes scale with the Value size control (0.5x-1.5x of it),
+    // so the restart comparison can reach the large-value case where hint files pay off.
+    return { key, kind: r > 0.82 ? ('tomb' as const) : ('put' as const), f: 0.5 + Math.floor(rng() * 11) / 10 };
   });
 })();
 
@@ -173,7 +175,10 @@ function apply(s: S, op: Op, cfg: Cfg): S {
     case 'del': {
       const steps =
         op === 'traffic'
-          ? Array.from({ length: 6 }, (_, i) => SCRIPT[(s.script + i) % SCRIPT.length])
+          ? Array.from({ length: 6 }, (_, i) => {
+              const st = SCRIPT[(s.script + i) % SCRIPT.length];
+              return { key: st.key, kind: st.kind, vsz: Math.max(16, Math.round((cfg.vsz * st.f) / 16) * 16) };
+            })
           : [{ key: cfg.key, kind: op === 'del' ? ('tomb' as const) : ('put' as const), vsz: cfg.vsz }];
       const full = s.segs.length >= MAX_SEGS && s.segs[s.segs.length - 1].recs.length >= MAX_ACTIVE;
       if (full) {
@@ -333,8 +338,8 @@ function apply(s: S, op: Op, cfg: Cfg): S {
       body =
         'The keydir was never persisted — it is a pure in-memory derivative of the files, so every record has gone ' +
         'grey: not lost, just unreachable until something rebuilds the index. A partially written trailing record is ' +
-        'the only on-disk damage possible, and the crc32 in each header catches it, so startup truncates the tail and ' +
-        'carries on. The cost of that simplicity is paid entirely at startup.';
+        'the only on-disk damage possible, and the crc32 in each header catches it, so startup stops at the last complete ' +
+        'record and carries on. The cost of that simplicity is paid entirely at startup.';
       break;
     }
 
