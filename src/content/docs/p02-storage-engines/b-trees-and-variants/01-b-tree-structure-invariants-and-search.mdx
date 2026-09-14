@@ -1,0 +1,220 @@
+---
+title: B+tree structure, invariants and search
+description: Why a fanout of a few hundred keeps a billion-row index four levels deep, the five invariants every engine maintains (or quietly doesn't), and exactly what a descent and a range scan cost.
+depth: basics
+sidebar:
+  order: 1
+---
+
+import BTreeDescentFanoutLab from '../../../../components/viz/BTreeDescentFanoutLab';
+
+A binary search tree over a billion keys is thirty pointer-chases deep, and on disk every
+chase is a separate page read. The B+tree is the answer to that: make each node a whole page,
+pack it with hundreds of keys, and the same billion keys are four page reads away. Everything
+else about the structure — the invariants, the separator keys, the sibling-linked leaf chain —
+exists to keep that property true while the tree is being modified.
+
+<BTreeDescentFanoutLab client:visible />
+
+## Height is a division, not a design choice
+
+You never choose a B+tree's height. You choose the two numbers on either side of one division:
+
+```
+fanout = (page size − page overhead) × fillfactor ÷ bytes per entry
+height = 1 + ⌈log_fanout(⌈rows ÷ entries per leaf⌉)⌉
+```
+
+Put real bytes in. A PostgreSQL nbtree page is 8192 bytes, minus 24 for `PageHeaderData` and 16
+for `BTPageOpaqueData` (the special area holding the level, flags and sibling links). An entry
+for a `bigint` key is an `IndexTupleData` header — 6 bytes of `t_tid` plus 2 bytes of `t_info` —
+plus the 8-byte key, MAXALIGNed to 16, plus the 4-byte `ItemIdData` line pointer in the slot
+array: **20 bytes**. At the default `fillfactor = 90`, that is **366 entries per page**.
+
+Stack them: one root, 21 pages at level 1, 7 466 at level 2, and 2.73 million leaves hold a
+billion rows. **Height 4.** The whole index is about 2.74 million pages — roughly 22 GB — and the
+top two levels are 22 pages, 176 KB, which will never leave memory on any machine you would run
+this on. In practice a point lookup on that index is one physical read, of the leaf, plus one
+more for the heap row.
+
+The lab does exactly this arithmetic. Push the key width from 8 bytes to 64 and fanout falls
+from 366 to 96; the tree gains a level, and every lookup in the system gains a page read.
+That is the entire reason key encoding gets its own page later in this module: the width of
+your key is a multiplier on the height of every index that contains it.
+
+The theoretical statement is the external-memory bound: with a block size of B keys, search is
+Θ(log<sub>B</sub> N) block transfers rather than the Θ(log₂ N) of an in-memory tree. The base of
+the logarithm is the whole trick, and it is why height moves so slowly — at fanout 366, going
+from a billion rows to a trillion adds **one** level. Why B and not some other base is
+[page 8](/p02-storage-engines/b-trees-and-variants/08-why-fanout-b-the-external-memory-model-optimality-bounds-and/).
+
+## The five invariants
+
+Everything an engine does to a B+tree — split, delete, rebalance — is in service of keeping
+these true. They are worth stating precisely, because the last one is not actually maintained by
+the engine you probably use.
+
+**1. All leaves are at the same depth.** This is what "balanced" means here, and it is the
+invariant that makes the cost model trivial: every key costs the same descent, so p50 and p99
+index latency differ only by what is cached. It survives insertion because a B+tree grows
+*upward*: a full node splits and pushes a separator into its parent, and only when the root
+itself splits does the tree get taller. No leaf ever gets deeper than its siblings. (The
+mechanics are [page 2](/p02-storage-engines/b-trees-and-variants/02-insert-split-delete-and-merge/).)
+
+**2. Keys within a node are sorted, and separators partition the key space.** A node with *c*
+children holds *c − 1* separators s₁ < s₂ < … < s꜀₋₁, and the subtree under child *i* contains
+exactly the keys in [sᵢ₋₁, sᵢ), with s₀ = −∞ and s꜀ = +∞. This is what the binary search in the
+lab depends on — probe a separator, discard half the children.
+
+**3. Separator keys need not be real keys.** A separator is a *routing* value; nothing requires
+that a row with that key exists. PostgreSQL leans on this hard: since version 12 (nbtree version
+4) it performs **suffix truncation**, storing in each pivot tuple only the shortest prefix of
+column values that still distinguishes the two subtrees. A composite index on
+`(tenant_id, created_at, id)` may have pivots that carry only `tenant_id`, which raises fanout in
+the internal levels for free; the encoding is
+[page 6](/p02-storage-engines/b-trees-and-variants/06-key-layout-prefix-compression-and-suffix-truncation/).
+`INCLUDE` columns, added in PostgreSQL 11, are truncated away entirely — they exist only in the
+leaves, which is the point.
+
+**4. Records live only in the leaves.** Internal nodes are pure routing. That is the "+" in
+B+tree, and it buys three things: pivots stay small (so fanout stays high), every search costs
+exactly `height` reads, and the leaf level is a single sorted sequence you can scan.
+
+**5. Every node is at least half full, except the root.** Bayer and McCreight's original
+invariant: a node holds between ⌈m/2⌉ and *m* children, which bounds height at
+log<sub>⌈m/2⌉</sub>(N) + 1 even in the worst case. The root is exempt because a tree with two
+keys has to start somewhere.
+
+:::caution[Invariant 5 is the one real engines break]
+PostgreSQL's nbtree **never merges underfull pages**. Deleting rows empties leaves; VACUUM can
+delete a page only once it is *completely* empty, after which the page is marked deleted and
+recycled through the free space map. A page left 5% full stays 5% full and stays in the descent
+path, which is why a table that is bulk-loaded and then heavily deleted grows a sparse, oversized
+index — the bloat you measure with `pgstattuple`'s `pgstatindex(...)`, whose `avg_leaf_density`
+and `leaf_fragmentation` columns exist precisely for this. The fix is `REINDEX CONCURRENTLY`, not
+a knob.
+
+InnoDB does merge: each index has a `MERGE_THRESHOLD` (default 50, settable per index with a
+table `COMMENT`), and when a delete or update drops a page below it, InnoDB merges the page with
+a sibling. So the classic invariant holds in InnoDB and is merely an aspiration in Postgres.
+:::
+
+## Searching: the descent, and the binary search inside the page
+
+A point lookup is two nested searches, and engineers routinely forget the inner one.
+
+The **outer search** is the descent: read the root, pick a child, read it, repeat. It costs
+`height` page reads — 4 in the worked example — and that number is fixed by the structure, not by
+the key. Step through it in the lab and watch the key range narrow by a factor of the fanout at
+each level.
+
+The **inner search** is inside a page. A B+tree page is a slotted page — the line-pointer array
+is kept *sorted by key* even though the tuples themselves are not moved, exactly as described in
+[Page anatomy and the slotted page](/p02-storage-engines/pages-tuples-heap-files/01-page-anatomy-and-the-slotted-page/)
+— so the engine binary-searches the slot array. PostgreSQL's `_bt_binsrch` does ⌈log₂ 366⌉ = 9
+comparisons per page, so a height-4 descent is ~36 key comparisons, each one a function call into
+a datatype's comparison operator (and, for `text`, into the collation library). InnoDB adds an
+intermediate structure: its **page directory** holds a slot per group of 4–8 records, so a search
+binary-searches the directory and then walks the few records in the group linearly, which keeps
+the directory small at the cost of a short scan.
+
+Two consequences that show up in profiles:
+
+- **The comparisons are not free.** For an index on a `text` column with a non-C collation, those
+  36 comparisons are 36 `strcoll`-family calls. This is why `COLLATE "C"` indexes and
+  `varchar_pattern_ops` are measurably faster to search, and why glibc collation changes have
+  historically corrupted indexes — the sort order the tree was built with must be the sort order
+  the search uses.
+- **Each probe is a cache miss.** Nine probes into an 8 KB page touch nine unrelated 64-byte cache
+  lines. For a fully cached index the descent is dominated by memory stalls, not I/O, which is the
+  starting point for every "cache-conscious B-tree" paper you will read later.
+
+## Range scans and the leaf chain
+
+The reason B+trees, rather than hash indexes, are the default access method is the fifth
+invariant plus one pointer. Because records live only in the leaves and the leaves are chained,
+a range scan is **one descent, then a sideways walk**:
+
+```
+cost(range) = height + ⌈rows returned ÷ entries per leaf⌉ − 1
+```
+
+Set *rows returned* to a million in the lab and watch this: at 366 rows per leaf, a million rows
+is 2 733 leaf pages, reached by a 4-page descent that already lands on the first of them —
+2 736 page reads, not a million descents. The same walk is what lets an
+index satisfy `ORDER BY`, feed a merge join, or answer `WHERE x BETWEEN …` without a sort node.
+
+The chain itself is a concrete field. In nbtree, `BTPageOpaqueData` holds `btpo_prev` and
+`btpo_next`, so leaves are doubly linked and a scan can run in either direction. InnoDB stores
+`FIL_PAGE_PREV` and `FIL_PAGE_NEXT` in every page header, linking pages at *every* level, not
+just the leaves. Each nbtree page also carries a **high key** — an upper bound on everything in
+the page, stored at the first slot of every page except the rightmost — which a scan uses to know
+it has run off the end of the page's range without consulting the parent.
+
+SQLite is the instructive counterexample: its b-tree pages have no sibling pointers at all. A
+cursor keeps the stack of pages it descended through (`BtCursor.apPage`) and `sqlite3BtreeNext`
+moves to the next row by ascending until it finds an unexhausted parent, then descending again.
+It works; it just means the traversal re-touches interior pages, which is what the lab counts
+when you flip to B-tree mode.
+
+## Where the records live
+
+Switch the lab's *records live in* control to **B-tree: every node** and the cost of the classic
+design becomes concrete. Give each entry a 120-byte record instead of a pointer and fanout falls
+from 366 to 52; the same billion rows go from height 4 to **height 6**. Every point lookup gains
+two page reads, permanently, and the range scan loses the leaf chain.
+
+The theoretical consolation — a B-tree can terminate early when the key is in an internal node —
+is worth almost nothing: with fanout *f*, a fraction (f − 1)/f of all keys still live in the leaf
+level. At f = 52 that is 98%.
+
+What a leaf entry actually contains is engine-specific, and it determines what a lookup costs
+*after* the descent:
+
+| Engine / index kind | Leaf entry holds | Cost of getting the row |
+|---|---|---|
+| PostgreSQL nbtree | `IndexTupleData` header whose `t_tid` is a 6-byte heap TID (block, offset), plus the key | A second read, of the heap page — unless an index-only scan and the visibility map spare it |
+| PostgreSQL, since v13 | Duplicate keys are collapsed into a **posting list**: one key, many TIDs (`deduplicate_items`) | Same, but far fewer leaf pages for low-cardinality columns |
+| InnoDB clustered index (`PRIMARY`) | The **entire row** | Nothing — the index *is* the table |
+| InnoDB secondary index | The secondary key plus the **primary key value** (not a physical pointer) | A second full descent of the clustered index, height and all |
+| SQLite table b-tree | Payload keyed by `rowid`; interior pages hold only `rowid` + child pointer | Nothing — it is a clustered B+tree |
+| SQLite index b-tree | Key columns + `rowid`; **interior index pages carry the key payload too** | A descent of the table b-tree by `rowid` |
+
+Two things fall out of that table. InnoDB's secondary-index lookup is a *double* descent, so a
+wide primary key inflates every secondary index and every lookup through one — the standard
+argument against a UUID primary key in MySQL. And SQLite's index b-trees are, by the strict
+definition, B-trees rather than B+trees: their interior cells carry payload, which is why an
+index on a wide column degrades SQLite's fanout the way the lab's B-tree mode does.
+
+## Where it bites in production
+
+- **A wide key silently adds a level.** A 40-byte composite text key at 8 KB pages yields a
+  fanout near 140 instead of 366. The index is bigger, the descent is longer, and nothing in the
+  plan changes to tell you. Check with `pgstatindex('idx')`, whose `tree_level` column is the
+  height minus one, and with `EXPLAIN (ANALYZE, BUFFERS)`: an Index Scan reporting
+  `Buffers: shared hit=5` where you expected 4 is the level you just paid for.
+- **The hard limits are hard.** PostgreSQL refuses any index tuple larger than roughly a third of
+  a page — the error carries the hint *"Values larger than 1/3 of a buffer page cannot be
+  indexed."* — because three entries must fit on a page for the structure to work at all. InnoDB's
+  equivalent is `ERROR 1071 (42000): Specified key was too long; max key length is 3072 bytes` on
+  DYNAMIC row format. Drag the lab's key width past 1 KB on a 4 KB page and it says so.
+- **Delete-heavy tables grow permanently sparse indexes in PostgreSQL.** Half-empty leaves are
+  never merged; the descent still visits them and the range scan still reads them. Watch
+  `avg_leaf_density` fall and schedule `REINDEX CONCURRENTLY`.
+- **Range scans are cheap in the index and expensive in the heap.** The leaf walk is sequential;
+  the TIDs it yields may point anywhere. That mismatch is why PostgreSQL has a bitmap heap scan
+  and why `correlation` in `pg_stats` swings the planner's index cost estimate by an order of
+  magnitude. Index selection has its own module; the structural fact is that a B+tree gives you
+  ordered *keys*, not ordered *rows*.
+- **Height is not a tuning knob.** There is no setting that makes a tree shallower. The levers are
+  narrower keys, a larger page size (InnoDB's `innodb_page_size` up to 64 KB), fewer indexed
+  columns, and a smaller primary key in InnoDB.
+
+:::note[What to take forward]
+Fanout — usable page bytes divided by entry bytes — sets height, and height is the page-read cost
+of every point lookup in the system; at a few hundred entries per page, a billion rows is four
+levels and a trillion is five. Records live only in the leaves so that pivots stay small and every
+search costs the same, and the leaves are chained so that a range scan is one descent plus a
+sideways walk. The invariants are worth knowing as stated *and* as implemented: PostgreSQL never
+merges underfull pages, so the half-full rule is an aspiration there and a guarantee in InnoDB.
+:::

@@ -1,0 +1,125 @@
+---
+title: Memory hierarchy and latency numbers
+description: The latency ladder from L1 cache to cross-continent round trips, and why every storage-engine decision is an answer to it.
+depth: basics
+sidebar:
+  order: 1
+---
+
+import LatencyLadder from '../../../../components/viz/LatencyLadder';
+import AccessPatternLab from '../../../../components/viz/AccessPatternLab';
+
+A database is a program that is almost never CPU-bound in the way normal software is.
+It is a program built around the fact that **data lives at wildly different distances**,
+and that the cost of reaching the far ones dwarfs everything else it does. Before pages,
+B-trees or buffer pools make sense, you need these distances in your hands.
+
+<LatencyLadder client:visible />
+
+## The two ratios worth memorizing
+
+You do not need the table. You need two ratios:
+
+- **DRAM is ~100× an L1 hit.** This is why in-memory layout matters — the 64-byte cache
+  line is the real unit of memory access, not the byte, and a row scattered across four
+  cache lines costs four times what a compact one does.
+- **An HDD seek is ~10⁵× a DRAM access** (and an NVMe random read is still ~200×). This
+  single ratio is why databases look the way they do.
+
+Everything downstream is a strategy for not paying the second ratio: buffer pools keep hot
+data on the fast rung, B-trees keep the number of far accesses logarithmic and small, LSM
+trees convert random writes into sequential ones, and column stores make each far access
+carry more useful bytes.
+
+## Why engines move pages, not rows
+
+If reaching the disk at all costs ~10 ms on a spinning drive, the marginal cost of reading
+16 KB instead of 100 bytes is almost nothing — the transfer is a rounding error next to the
+seek. So engines amortize: they read and write a **fixed-size page** and make it the unit of
+everything — caching, locking, checksumming, logging, free-space tracking.
+
+| Engine | Page size | Notes |
+|---|---|---|
+| PostgreSQL | 8 KB | Compile-time `BLCKSZ`; the WAL, buffer pool and checksums all speak pages |
+| MySQL / InnoDB | 16 KB | `innodb_page_size`, 4–64 KB; clustered index leaves *are* the table |
+| SQLite | 4 KB | `PRAGMA page_size`; default rose from 1 KB in 3.12 |
+| Oracle | 8 KB | Per-tablespace block size |
+| RocksDB | 4–64 KB blocks | Blocks inside an immutable SSTable, not mutable pages |
+
+The page size is a bet about the access-penalty-to-transfer ratio. Larger pages amortize the
+penalty better and shrink the index, but waste bandwidth and cache when you only wanted one
+row, and they make write amplification worse. You will see this same trade reappear as the
+RUM conjecture in [Log-Structured Merge Trees](/curriculum/).
+
+## Latency, bandwidth and IOPS are three different things
+
+They get used interchangeably and they are not the same:
+
+- **Latency** — how long *one* request takes. Sets how fast a single-threaded, dependent
+  chain of work can run: an index descent that reads a page, looks at it, then reads the
+  next page cannot be faster than 4 × the per-page latency.
+- **Bandwidth** — bytes/second when requests are large and streaming. Sets how fast a
+  sequential scan can go.
+- **IOPS** — requests/second. Sets how fast *many independent* small reads can go — and it
+  is achievable only with enough of them in flight at once.
+
+That last point is where modern hardware surprises people. An NVMe drive advertising 700 000
+IOPS does not deliver 700 000 to a program issuing one 4 KB read at a time; at queue depth 1
+it delivers roughly `1 / 20 µs` ≈ 50 000. The rest of the drive's parallelism — many NAND
+dies, many hardware queues — is only reachable if you keep it fed. This is why engines added
+asynchronous and batched I/O (Postgres 18's AIO, InnoDB's read-ahead, `io_uring`) and why a
+single-threaded scan can leave 90% of a drive idle.
+
+<AccessPatternLab client:visible />
+
+Push the request size up and watch the random/sequential gap collapse: the access penalty is
+paid once per request, so at 4 KB it is nearly all of the cost and at 1 MB it is noise. That
+collapse *is* the design rule — make far accesses few and large.
+
+## The cache line and the TLB
+
+Two numbers govern in-memory structures:
+
+- **The 64-byte cache line.** Memory moves in 64-byte units. A hash table that touches a
+  random cache line per probe costs a DRAM access per probe; one that keeps its probes in the
+  same line costs one. This is why modern in-memory joins use radix partitioning to make each
+  partition fit in cache, and why vectorized executors process batches of ~1024 values.
+- **TLB reach.** The TLB caches virtual→physical translations; with 4 KB pages and ~1500
+  entries, a process can reach only ~6 MB without a TLB miss. Past that, random access to a
+  large heap pays an extra memory access for the page-table walk. This is why database servers
+  enable huge pages (2 MB), which multiply reach ~500×.
+
+## Gray's five-minute rule
+
+Jim Gray and Gianfranco Putzolu asked in 1987: when is it cheaper to keep a page in RAM than
+to re-read it from disk? Keeping it costs memory; re-reading it consumes a slice of the
+drive's IOPS. Break even when
+
+```
+interval between accesses  =  (pages per MB of RAM × price per drive-IOP)
+                              ÷ price per MB of RAM
+```
+
+With 1987 hardware the answer was five minutes: a page touched more often than every five
+minutes should be cached, one touched less often should not. The rule's *value* changes with
+hardware — on DRAM-versus-NVMe today it lands in the tens of seconds to a few minutes,
+depending on prices — but the *method* is the point, and it is the honest way to answer "how
+much RAM should this database have?" The buffer pool module turns this into a policy, and
+the capacity-planning module turns it into a purchase.
+
+## The cliff you will meet again
+
+The most important operational consequence of this page is not a number, it is a shape.
+While the working set fits in RAM, almost every access is a DRAM access and performance is
+flat. When the working set grows past RAM, misses start going to the drive, and each miss is
+200–10 000× slower. Performance does not degrade gracefully — it **falls off a cliff**, often
+from a 10% increase in data.
+
+Recognizing that shape in a latency graph is a senior-engineer reflex, and you will see it
+again in the buffer pool, in vacuum-driven bloat, and in connection-pool queueing.
+
+:::note[What to take forward]
+Pages exist to amortize access penalties. Buffer pools exist to keep the working set on the
+fast rung. Sequential I/O is worth restructuring an entire storage engine for. Every one of
+these is a direct consequence of the ladder above.
+:::

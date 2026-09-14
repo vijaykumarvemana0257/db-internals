@@ -1,0 +1,255 @@
+---
+title: "The OS I/O path: syscalls, page cache and mmap"
+description: How read, write and mmap actually reach the device — the page cache, dirty-page writeback, readahead heuristics, and why a load instruction that faults inside a latch is an architectural problem.
+depth: intermediate
+sidebar:
+  order: 5
+---
+
+import PageCacheStepper from '../../../../components/viz/PageCacheStepper';
+import MmapFaultUnderLatch from '../../../../components/viz/MmapFaultUnderLatch';
+
+Between your engine and the NAND sits a cache you did not write, an eviction policy you cannot
+influence and a writeback timer you cannot see. Every storage engine has to decide whether to
+cooperate with that layer, work around it, or bypass it entirely — and the decision shows up in
+the syscalls it issues, in how it recovers from a crash, and in whether a page fault can stall a
+thread in the middle of a critical section.
+
+<PageCacheStepper client:visible />
+
+## The copy path
+
+A buffered `read()` on Linux resolves to `filemap_read()`, which looks the file offset up in an
+XArray hanging off `inode->i_mapping->i_pages` — that lookup table *is* the page cache. A hit
+copies the folio into your buffer with `copy_folio_to_iter()` and returns; nothing touches the
+device. A miss calls into the readahead machinery, sleeps until the I/O completes, then copies.
+
+`write()` is `generic_perform_write()`: find or allocate the folio for that offset, copy your
+bytes in, mark the folio dirty, tag it dirty in the XArray, call
+`balance_dirty_pages_ratelimited()`, return. The return value tells you how many bytes were
+copied **into volatile RAM**. Nothing has been submitted to the device. Nothing is durable. That
+is the single most important sentence about `write()`.
+
+Three consequences worth having in your hands:
+
+- **Every buffered access costs a memcpy.** ~300–500 ns per 4 KiB page, each way. An engine that
+  also caches the page holds it twice — once in the page cache, once in its own buffer pool. This
+  is *double buffering*, and it is why PostgreSQL's `shared_buffers` rule of thumb is 25% of RAM
+  rather than 80%: the kernel is expected to hold the other copy.
+- **A partial-page write can cost a read.** If you write 100 bytes into a page that is not
+  resident, the kernel has to read the surrounding 4 KiB from disk first to have something to
+  modify — read-modify-write. Engines write whole aligned pages for exactly this reason.
+- **`read()`/`write()` mutate the shared file offset.** `f_pos` lives in `struct file`, shared by
+  every thread and every process holding that descriptor, so `lseek()` + `read()` from two threads
+  is a race. `pread()`/`pwrite()` take the offset as an argument and touch no shared state — which
+  is why PostgreSQL backends, InnoDB and essentially every threaded engine use the positional
+  forms exclusively, and the vectored `preadv()`/`pwritev()` when they want to move several
+  adjacent blocks in one call.
+
+:::caution[write() returning success is not a durability signal]
+It means "copied into the page cache and marked dirty". The bytes survive a process crash — the
+page cache belongs to the kernel, not to you — but a power cut loses them. Only `fsync()`,
+`fdatasync()` or opening with `O_SYNC` changes that, and [what fsync actually
+promises](/p01-foundations/hardware-os-durability/06-fsync-write-barriers-and-the-durability-contract/)
+is narrower than most people assume.
+:::
+
+## Dirty pages, writeback timers and the throttle
+
+A dirty folio sits on its inode's dirty list until one of four things happens.
+
+1. **The periodic flusher.** A per-backing-device kworker wakes every
+   `dirty_writeback_centisecs` (default 500 = 5 s) and writes back anything dirtied longer ago
+   than `dirty_expire_centisecs` (default 3000 = 30 s). So a write that returned half a minute ago
+   can still be RAM-only.
+2. **The background threshold.** Once dirty memory exceeds `vm.dirty_background_ratio` (default
+   10% of dirtyable memory) the flusher starts immediately. Writers do not wait.
+3. **The hard threshold.** Once dirty memory exceeds `vm.dirty_ratio` (default 20%),
+   `balance_dirty_pages()` throttles the *writing process*: it sleeps proportionally to how far
+   over the limit the system is, and may be made to do writeback itself. The symptom is a
+   process stuck in `D` state with `balance_dirty_pages` in `/proc/PID/stack`, and a latency
+   spike across every writer on the box, not just the greedy one.
+4. **Reclaim.** Memory pressure evicts page-cache pages; a dirty victim must be written out
+   first, which turns an allocation into a synchronous write.
+
+Push the `dirty_ratio` slider down in the visual above and write a few pages: the throttle fires
+and the caller starts paying for writeback it did not ask for. That is the production failure in
+miniature.
+
+Two tuning notes that follow directly. On a large machine the *ratios* are the wrong unit — 10%
+of 512 GB is 51 GB of dirty data that some unlucky `fsync()` will eventually have to wait for, so
+production database hosts set the absolute forms (`vm.dirty_background_bytes` ≈ 64–256 MB,
+`vm.dirty_bytes` ≈ 512 MB–2 GB) to keep writeback continuous instead of cliff-shaped. And
+PostgreSQL's `checkpoint_completion_target = 0.9`, `checkpoint_flush_after = 256kB` and
+`bgwriter_flush_after` exist purely to spread this out: the flush-after knobs call
+`sync_file_range()` to push pages toward the device early so the checkpoint's final `fsync()`
+does not meet a mountain of dirty pages at once.
+
+:::danger[The kernel does not know your WAL rule]
+Writeback ordering is the kernel's business, not yours. The flusher will happily write a dirty
+data page to disk before the log record describing that change is durable — it has never heard of
+write-ahead logging. With `write()` you at least control *when the page enters the cache*, so the
+engine can hold a dirty page back until the log is flushed. With `mmap` you lose even that, which
+is the first and worst of the objections below.
+:::
+
+## Readahead: a small state machine that random access defeats
+
+Per open file, the kernel keeps a `struct file_ra_state`: `start`, `size`, `async_size`,
+`ra_pages`, `mmap_miss`, `prev_pos`. `ra_pages` comes from the block device's
+`read_ahead_kb` — 128 KB by default, so 32 pages of 4 KiB.
+
+`ondemand_readahead()` classifies each miss:
+
+- **Start of a sequence** (this page follows the previous access): seed the window with
+  `get_init_ra_size()` — a handful of pages — and issue one request for the whole window.
+- **Continuation** (the page falls inside `[start, start + size)`): **double** the window, capped
+  at `ra_pages`. Sequential reading ramps 4 → 8 → 16 → 32 pages and then streams.
+- **Neither**: treat it as a standalone random read. One request, exactly the pages asked for, and
+  the ramp resets. This is the correct behaviour and it is why buffered random reads are not
+  silently amplified 16×.
+
+The clever part is the asynchronous handoff. The kernel sets the `PG_readahead` flag on one page
+inside the window (at `start + size - async_size`). When a reader *hits* that page in cache, the
+kernel fires the next window in the background and returns immediately — so a sequential scan
+never stalls after the first miss. Click sequentially through the visual and watch the window
+double and the marker move ahead of you; then click randomly and watch it collapse to one page
+per access.
+
+You can override the heuristic:
+
+| Hint | Effect |
+|---|---|
+| `posix_fadvise(POSIX_FADV_SEQUENTIAL)` | Doubles `ra_pages` for this descriptor |
+| `posix_fadvise(POSIX_FADV_RANDOM)` | Sets readahead to zero — demand paging only |
+| `posix_fadvise(POSIX_FADV_WILLNEED)` | Starts the read now; the classic poor-man's async I/O |
+| `posix_fadvise(POSIX_FADV_DONTNEED)` | Drops clean pages — what backup tools use so a full-file read does not evict your working set |
+| `madvise(MADV_RANDOM / MADV_WILLNEED)` | The same hints for a mapping |
+
+PostgreSQL used `POSIX_FADV_WILLNEED` for years to prefetch bitmap-heap-scan and vacuum blocks,
+with `effective_io_concurrency` controlling how many hints were in flight. PostgreSQL 17 replaced
+the ad-hoc calls with the streaming read API and `io_combine_limit` (merge adjacent block reads,
+default 128 kB), and PostgreSQL 18 added a real AIO subsystem: `io_method` = `sync`, `worker`
+(default, with `io_workers` = 3) or `io_uring`, and a default `effective_io_concurrency` raised
+from 1 to 16. InnoDB, which runs with `O_DIRECT` and therefore gets no kernel readahead at all,
+implements its own: linear read-ahead fires when `innodb_read_ahead_threshold` (default 56) of the
+64 pages in an extent have been touched in order, plus an off-by-default
+`innodb_random_read_ahead`.
+
+## mmap: a load instruction that can go to the device
+
+`mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0)` creates a VMA and installs no page
+tables at all. The first touch of each page traps into `filemap_fault()`:
+
+- **Minor fault** — the folio is already in the page cache, so the kernel only installs a PTE
+  (~1 µs). On the way out, `fault_around` maps up to `fault_around_bytes` (64 KiB, 16 pages) of
+  already-cached neighbours for free, which is why the pages after a fault feel instant.
+- **Major fault** — the folio is not resident, and the faulting thread blocks *inside the load
+  instruction* until the device answers.
+
+One asymmetry catches people: a cold mmap fault does **not** do the careful ramp that `read()`
+does. `do_sync_mmap_readahead()` reads the entire `ra_pages` window on the first miss unless the
+VMA is marked `VM_RAND_READ` via `madvise(MADV_RANDOM)`, and it only stops once `mmap_miss` in that
+descriptor's `file_ra_state` — incremented on a wasted fault, decremented on a useful one —
+climbs past `MMAP_LOTSAMISS`, which is 100. A random-access mmap workload therefore pulls
+128 KB per 4 KiB you wanted, until the heuristic notices. Toggle `MADV_RANDOM` in the visual
+and compare the "device reads" and "readahead wasted" counters.
+
+<MmapFaultUnderLatch client:visible />
+
+The timeline above is the argument that matters. A buffer pool knows whether a page is resident,
+because residency is a field in its own hash table: it can discover the miss, issue the read, and
+only then take the page latch. The MMU has no such courtesy — it discovers the miss *while
+executing your load*, which is to say inside whatever critical section you were in. Raise the miss
+rate or pick a slower device and watch the latch convoy form: throughput stops scaling with worker
+count and starts tracking one thread's I/O latency.
+
+## The four arguments against mmap
+
+Crotty, Leis and Pavlo made the case directly in *Are You Sure You Want to Use MMAP in Your
+Database Management System?* (CIDR 2022). Their four problems, in the order they bite:
+
+1. **Transactional safety.** You cannot stop the kernel from writing a dirty mapped page to disk.
+   `msync()` flushes a range on demand, but there is no way to say "not yet" — so WAL-before-data
+   cannot be enforced by holding the page back. Nor is there ordering *between* ranges, nor
+   any atomicity: an 8 KiB page spanning two 4 KiB folios can reach the device half-written.
+2. **I/O stalls.** Any load can fault. `mincore()` can report residency but the answer is stale
+   the moment it returns, and there is no async fault — so every access is a potential
+   unbounded stall at a point you did not choose. The visual above is this argument.
+3. **Error handling.** A failed read behind a load arrives as `SIGBUS`, not an error return.
+   Touching a mapped region after the file is truncated: also `SIGBUS`. Handling it means
+   `longjmp`-ing out of a signal handler with latches held. And because there is no "read" event,
+   there is no natural place to verify a page checksum — you would have to validate on every
+   single access.
+4. **Performance.** Page-table work does not scale. Evicting a mapped page means clearing PTEs in
+   every process that maps it and sending a TLB-shootdown IPI to every core that might have cached
+   the translation, with the initiator spinning until all of them acknowledge. Their measurements
+   show mmap throughput collapsing once the working set exceeds RAM and refusing to scale past a
+   few threads, while `pread()` with `O_DIRECT` scales linearly and saturates the drives. Press
+   `munmap()` in the first visual to see the shootdown cost accounted; the kernel pays the same
+   price on every eviction of a mapped page.
+
+To that list add the one you feel first in production: **no eviction control**. The kernel's LRU
+does not know that this page is a B-tree root and that one is the last block of a bulk load. It
+will evict the root. `mlock()` is the only override, it needs `RLIMIT_MEMLOCK` headroom, and it
+pins whole ranges rather than expressing a policy.
+
+## Who maps files anyway, and why they get away with it
+
+| System | How it uses mmap | Why it is safe there |
+|---|---|---|
+| LMDB | The whole database is mapped; read-only by default (`MDB_WRITEMAP` optional) | Copy-on-write B+tree, single writer, pages never overwritten in place; a commit writes new pages, `fsync`s, then flips one of two meta pages and `fsync`s again. There is no ordering left for the kernel to get wrong |
+| SQLite | `PRAGMA mmap_size = N`; reads served from the map, writes still via `write()` | Rollback journal / WAL still provides atomicity. The docs state the risks plainly: a stray application pointer can corrupt the file, and I/O errors arrive as `SIGBUS` |
+| Lucene / Elasticsearch | `MMapDirectory` over immutable segment files | Segments are written with ordinary I/O and never modified afterwards. Mapping is a read path only |
+| MongoDB (MMAPv1) | Mapped data files with a journal | Deprecated in 4.0, removed in 4.2, replaced by WiredTiger and its own cache — the clearest verdict in the table |
+| MonetDB, RavenDB (Voron) | Mapped columnar/data files | Read-mostly, in-memory-sized working sets |
+
+The invariant they share: **the mapped bytes are immutable, or durability is provided by a
+separate ordered mechanism.** mmap is a fine way to read an append-only file. It is a bad way to
+implement an update-in-place page store.
+
+## The other philosophy: the engine owns its cache
+
+| Engine | Cache ownership | I/O path | Knobs |
+|---|---|---|---|
+| InnoDB | Buffer pool with midpoint-insertion LRU (`innodb_old_blocks_pct` = 37, `innodb_old_blocks_time` = 1000 ms) so a scan cannot flush hot pages | `O_DIRECT`, native AIO, own linear read-ahead, doublewrite for torn pages | `innodb_flush_method=O_DIRECT`, `innodb_buffer_pool_size`, `innodb_read_ahead_threshold` |
+| PostgreSQL | `shared_buffers` plus deliberate reliance on the kernel page cache (double buffering accepted) | Buffered `pread`/`pwrite`, `sync_file_range` hints, AIO since 18 | `shared_buffers`, `effective_io_concurrency`, `io_method`, `io_combine_limit`, `debug_io_direct` |
+| RocksDB | Block cache over immutable SSTables | Optional `use_direct_reads`, `use_direct_io_for_flush_and_compaction` | `block_cache_size`, `compaction_readahead_size` |
+| LMDB | None — the page cache *is* the cache | `mmap` reads, `write()` writes, two `fsync`s per commit | `mapsize`, `MDB_NOSYNC` family |
+
+The direction of travel is unmistakable. PostgreSQL, the last major holdout for kernel-managed
+caching, added `debug_io_direct` in 16, the streaming read API in 17 and the AIO subsystem in 18;
+InnoDB has run `O_DIRECT` for a decade. The reason is not that the page cache is badly written —
+it is that an engine knows things the kernel cannot: which page is a B-tree root, which scan is a
+one-shot, which write must not precede which log flush. [Direct I/O and
+io_uring](/p01-foundations/hardware-os-durability/09-direct-i-o-vs-buffered-i-o-and-io-uring/)
+takes this apart properly.
+
+## Where it bites in production
+
+- **A wall of dirty pages meets `fsync()`.** `grep -e Dirty -e Writeback /proc/meminfo` on a busy
+  host; if `Dirty` is tens of gigabytes, some checkpoint is going to wait for all of it. Fix with
+  `vm.dirty_background_bytes` / `vm.dirty_bytes` and the engine's flush-after knobs.
+- **Everything goes slow at once, and `iostat` looks fine.** Writers throttled in
+  `balance_dirty_pages()`; look for `D` state and `/proc/PID/stack`. The process that crossed the
+  threshold is not necessarily the one you notice.
+- **Read amplification on a mapped store.** 128 KB pulled per 4 KiB touched, until `mmap_miss`
+  gives up. `MADV_RANDOM`, or lower `read_ahead_kb` for that device.
+- **`SIGBUS` in the logs.** Either a media error or a file truncated under a live mapping. There
+  is no partial-failure story: the process dies.
+- **Double buffering wasting RAM.** With a 25%-of-RAM buffer pool plus the page cache holding the
+  same blocks, your effective cache is smaller than your RAM. `vmtouch` or `fincore` will show you
+  exactly what the kernel is holding.
+- **A backup evicts the working set.** A full-file read through the page cache pushes out
+  everything hot. `posix_fadvise(POSIX_FADV_DONTNEED)` after each chunk is the standard fix, and
+  the reason good backup tools use it.
+
+:::note[What to take forward]
+`write()` means "copied into the page cache and marked dirty" — writeback happens on the kernel's
+schedule, throttles the writer at `vm.dirty_ratio`, and respects no ordering rule of yours. The
+readahead state machine rewards sequential access and correctly refuses to help random access,
+while a cold mmap fault does the opposite until you tell it `MADV_RANDOM`. And mmap's central
+defect is not speed but control: a load can fault to the device inside a critical section, the
+kernel picks the eviction victim, an I/O error is a signal, and there is no way to order
+writeback — which is why engines that must respect write-ahead logging own their cache instead.
+:::

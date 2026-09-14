@@ -1,0 +1,214 @@
+---
+title: "Direct I/O and io_uring: alignment, submission and completion"
+description: The O_DIRECT kernel contract — aligned buffer, offset and length, DMA into user memory, no readahead, and still no durability — and how io_uring's shared rings replace a parked thread per in-flight read.
+depth: deep
+sidebar:
+  order: 9
+---
+
+import DirectIoAlignmentLab from '../../../../components/viz/DirectIoAlignmentLab';
+import SubmissionRingLab from '../../../../components/viz/SubmissionRingLab';
+
+An engine that manages its own buffer pool is already doing the page cache's job, and doing
+it with information the kernel does not have: which pages are index roots, which are about to
+be written back, which belong to a scan that will never be reread. `O_DIRECT` is how it tells
+the kernel to get out of the way. The price is a contract with three hard alignment rules, the
+loss of readahead, and a submission problem — because a `pread()` that goes straight to NAND
+still parks the calling thread for 20 µs.
+
+<DirectIoAlignmentLab client:visible />
+
+## The contract has exactly three clauses
+
+For a read or write on a file descriptor opened with `O_DIRECT`, all three of these must be
+multiples of the device's **logical block size**:
+
+1. the **virtual address** of the user buffer,
+2. the **file offset**, and
+3. the **length** of the transfer.
+
+Violate any one and the syscall returns `-1` with `errno == EINVAL`, having issued no I/O at
+all — no partial transfer, no short read. The error tells you nothing about which of the three
+was wrong, which is why every storage engine has a private `assert` on all three before it
+calls into the kernel. Historically the requirement was 512 bytes, because that was every
+disk's sector; on a 4Kn NVMe namespace it is 4096, and code that hardcoded 512 fails only once
+it reaches the drive you bought for production.
+
+Three ways to find the real number, in decreasing order of how much you should trust them:
+
+- `statx()` with `STATX_DIOALIGN` (Linux 6.1+) fills in `stx_dio_mem_align` — the buffer
+  alignment — and `stx_dio_offset_align` — the offset and length alignment. These can differ,
+  and on a stacked setup (LVM, dm-crypt, a loop device) only the filesystem knows the answer.
+- `ioctl(fd, BLKSSZGET)` for the logical sector size and `BLKPBSZGET` for the physical one,
+  on the block device. `lsblk -o NAME,LOG-SEC,PHY-SEC` prints both.
+- Assuming 4096 and moving on. This is what most engines do, and it is right almost always —
+  but it is an assumption, not a query.
+
+Getting an aligned buffer is `posix_memalign(&p, align, len)` or C11 `aligned_alloc()`, never
+`malloc()`, whose 16-byte guarantee is worthless here. Engines allocate the whole buffer pool
+as one aligned slab — InnoDB over-allocates each buffer-pool chunk and
+`ut_align()`s the base up to a page boundary, PostgreSQL aligns shared buffers to
+`PG_IO_ALIGN_SIZE` (4096, added in 16) precisely so that any buffer
+in the pool is a legal direct-I/O target — because carving frames out of an aligned slab makes
+every frame aligned for free.
+
+:::caution[512e drives accept what they cannot do]
+A 512e drive reports a logical block size of 512 and a physical block size of 4096. A
+512-byte-aligned request is legal, returns success, and makes the controller read a 4 KB
+physical block, merge your bytes, and write it back. `errno` never mentions it; you see it as
+write amplification and a fat p99. Align to 4 KB even when 512 is permitted — set the
+geometry to 512e in the lab above and watch the verdict change from "aligned" to "legal, but
+sub-physical-block".
+:::
+
+## What you are actually buying, and what you give up
+
+When the request is legal, the kernel pins your pages with `get_user_pages()`, builds a `bio`
+pointing at that physical memory, and the NVMe controller DMAs into your buffer pool frame. No
+`copy_to_user()`, no `struct page` in the cache, no second copy of the page in RAM. That last
+point is the real prize: with buffered I/O a hot 16 KB InnoDB page exists twice — once in the
+buffer pool and once in the page cache — so a machine with 128 GB of RAM that gives 100 GB to
+the pool is thrashing, and the engine's own replacement policy is making decisions about a
+cache that is no longer the one deciding what hits the drive.
+
+What you lose along with the copy:
+
+- **Readahead.** The kernel's sequential detector and its 128 KB default readahead window are
+  gone. A table scan issued as one 8 KB direct read at a time runs at queue depth 1 — about
+  50 000 IOPS on a drive that can do 700 000. The engine must now prefetch itself:
+  `posix_fadvise(POSIX_FADV_WILLNEED)` is not enough, you need real concurrency.
+  PostgreSQL's `io_combine_limit` (default 128 kB) exists to merge adjacent block reads into
+  one larger request for exactly this reason; InnoDB's linear read-ahead, keyed on
+  `innodb_read_ahead_threshold` (default 56 of the 64 pages in an extent), is the same idea from
+  a decade earlier.
+- **Cross-process sharing.** Two backends reading the same file page each DMA their own copy.
+  For a database with one shared buffer pool this is irrelevant; for PostgreSQL's
+  process-per-connection model it is one reason direct I/O had to wait for a real AIO
+  subsystem.
+- **Coherence is the kernel's problem, not yours.** Mixing buffered and direct access to the
+  same file is legal — the kernel writes back and invalidates overlapping page-cache pages
+  before a direct request — but it is slow and the ordering is unspecified. Pick one per file.
+- **Support is not universal.** `open(O_DIRECT)` on tmpfs fails with `EINVAL` at open time, and
+  older overlayfs did too. This is the classic container surprise: the engine works on the
+  host and refuses to start in the image.
+
+## Bypassing the page cache is not durability
+
+This is the most expensive misreading of `O_DIRECT` in production. A direct write skips the
+page cache. It does not skip the **drive's volatile write cache** — the few hundred megabytes
+of DRAM on the SSD that acknowledges your write long before any charge reaches a NAND cell.
+Pull the power and those bytes are gone exactly as if they had been sitting in the page cache.
+
+To make a direct write durable you still need one of:
+
+- `fdatasync()` after it, which issues a `REQ_OP_FLUSH` to the device;
+- `O_DSYNC` on the descriptor, which makes the kernel tag the write `REQ_FUA` (force unit
+  access) if the device supports it, and otherwise falls back to a flush after each write; or
+- `RWF_DSYNC` on `pwritev2()` / the equivalent io_uring flag, per request.
+
+And there is a second trap: if the write extended the file or filled a preallocated *unwritten*
+extent, the filesystem must journal a metadata change on completion. `O_DIRECT` does nothing
+for metadata. This is what MySQL's `innodb_flush_method=O_DIRECT_NO_FSYNC` is negotiating —
+it skips the `fsync()` after ordinary data-file writes, and MySQL 8.0.14 had to add the
+`fsync()` back for file extension and the first flush after file creation, because skipping it
+there loses whole files, not just bytes. The durability page in this module covers the flush
+itself; the point here is that the two mechanisms are orthogonal. `O_DIRECT` chooses *who
+caches*. `fsync` chooses *when it is safe*.
+
+## Now the other half: getting requests to the drive
+
+<SubmissionRingLab client:visible />
+
+A synchronous `pread()` does one thing well and one thing badly. Well: it is simple, and with
+`O_DIRECT` it is exactly one syscall. Badly: it blocks, so the only way to have *N* requests in
+flight is *N* threads, each parked in `io_schedule()` with 8 MB of stack address space
+reserved and a slot on the run queue. Every completed request costs a syscall (~1 µs with KPTI
+and retpolines on, versus ~100 ns before the 2018 mitigations) plus two context switches
+(~1.5 µs each) — call it 4–5 µs of CPU. Move the queue-depth slider to 64 with one core and
+watch the CPU ceiling land far below the drive's: at ~4.5 µs per request, one core can issue
+about 220 000 IOPS no matter how fast the NVMe is, and the drive sits two-thirds idle.
+
+Linux's first answer, `libaio` (`io_setup`/`io_submit`/`io_getevents`), removed the thread per
+I/O but kept the syscall per submission and per reap, and had a famous asterisk: it is only
+actually asynchronous on `O_DIRECT` file descriptors. Issue buffered I/O through `io_submit()`
+and it blocks inside the syscall, silently. It also only covers read and write, and
+`io_submit()` can still block on metadata or a full block-layer queue.
+
+**io_uring** replaces the syscall pair with shared memory. `io_uring_setup(entries, params)`
+returns a file descriptor that you `mmap()` to get two ring buffers plus an SQE array:
+
+- The **submission queue** — a ring of indices into an array of 64-byte SQEs. The application
+  writes an SQE (opcode `IORING_OP_READ`, fd, offset, address, length), then publishes it with
+  a release-store to the SQ **tail**. The kernel consumes from the **head**.
+- The **completion queue** — a ring of 16-byte CQEs, twice the SQ size by default, each
+  carrying the `user_data` you put in the SQE and the `res` that `pread()` would have
+  returned. The kernel publishes with a release-store to the CQ tail; the application reaps by
+  reading the CQ head. Reaping a completion is a **load and a pointer bump — no syscall at
+  all**.
+
+`io_uring_enter(fd, to_submit, min_complete, flags)` is the only syscall on the hot path, and
+it carries a whole batch: `to_submit` SQEs go down, and the call optionally waits for
+`min_complete` CQEs to come back. Push the batch slider in the lab from 1 to 32 and the
+syscalls-per-request stat drops to 0.03 while achieved IOPS climbs to the device ceiling. Turn
+on `IORING_SETUP_SQPOLL` and a kernel thread busy-polls the SQ tail, so submission costs *zero*
+syscalls — at the cost of a core burning cycles, which is why it is a fit for a dedicated
+storage node and a poor one for a shared box.
+
+Four more flags worth knowing by name, because engines turn them on:
+
+| Feature | What it removes |
+|---|---|
+| `IORING_REGISTER_BUFFERS` | The per-I/O `get_user_pages()` pin/unpin — pages are pinned once at registration (charged against `RLIMIT_MEMLOCK` on older kernels) |
+| `IORING_REGISTER_FILES` | The per-I/O `fget()`/`fput()` and its atomic refcount traffic |
+| `IORING_SETUP_IOPOLL` | The completion interrupt: the kernel polls the NVMe completion queue instead. `O_DIRECT` only, and it trades CPU for the last few microseconds of latency |
+| `IORING_SETUP_DEFER_TASKRUN` | Cross-CPU task-work interrupts; completions are processed only when the app calls `io_uring_enter`, which is what a single-threaded reactor wants |
+
+One caveat that matters more than it should: if an io_uring operation would block in a way the
+kernel cannot make async — a **buffered** read that misses the page cache being the usual case —
+it is punted to an `io-wq` kernel worker thread. You get the ring API and a thread pool
+underneath. `O_DIRECT` plus io_uring is the combination that is async all the way down, which
+is exactly why the two features arrive together in every engine's release notes.
+
+## What the engines actually ship
+
+| Engine | Direct I/O | Submission | Knobs |
+|---|---|---|---|
+| MySQL / InnoDB | `innodb_flush_method=O_DIRECT` (or `O_DIRECT_NO_FSYNC`) — standard in production because the pool is 70–80% of RAM | libaio, with dedicated I/O threads | `innodb_use_native_aio` (on), `innodb_read_io_threads`/`innodb_write_io_threads` (4 each), `innodb_io_capacity` |
+| MariaDB | Same flush methods | `tpool` over io_uring where the kernel has it (10.6+) | `innodb_use_native_aio` |
+| PostgreSQL 18 | `debug_io_direct` — still developer-only, because direct I/O without prefetch is a regression | `io_method = sync` \| `worker` \| `io_uring`; `worker` is the default | `io_workers` (3), `io_combine_limit` (128 kB), `effective_io_concurrency` (16 in 18) |
+| RocksDB | `use_direct_reads`, `use_direct_io_for_flush_and_compaction` | Its own background threads; iterators prefetch explicitly | `compaction_readahead_size`, `ReadOptions::readahead_size` |
+| ScyllaDB / Seastar | Always `O_DIRECT` — the engine owns the disk | linux-aio per shard, with a userspace I/O scheduler calibrated by `iotune` | shard-per-core, no shared pool |
+| TigerBeetle | Always `O_DIRECT`, sector-aligned by construction | io_uring, single-threaded | none — the point is that there are none |
+
+The pattern is not "direct I/O is better". It is that **an engine which owns its buffer pool
+must own its prefetch and its queue depth too**, and those three decisions are one decision.
+PostgreSQL kept `shared_buffers` small and leaned on the OS cache for twenty years precisely
+because it had neither the async submission nor the readahead to survive without it; version 18
+adds the first, which is what makes the second and third reachable.
+
+## Where it bites in production
+
+- **`EINVAL` on a drive you have never seen.** Code that aligns to 512 works on every laptop
+  and every 512e SATA SSD and dies on a 4Kn NVMe namespace. The symptom is a total failure to
+  read, not a slowdown. Check with `lsblk -o NAME,LOG-SEC,PHY-SEC`.
+- **`O_DIRECT` made everything slower.** Almost always the missing prefetch: sequential work
+  collapsed to queue depth 1. Confirm with `iostat -x 1` — `aqu-sz` near 1.0 with the device at
+  a few percent utilisation is the signature.
+- **io_uring is not available.** `kernel.io_uring_disabled=2` disables it outright, Docker's
+  default seccomp profile blocks the syscalls, gVisor's support is experimental and off by default, and several
+  large operators turned it off after the 2023 round of kernel CVEs. PostgreSQL's
+  `io_method=io_uring` will refuse to start; plan the fallback to `worker` deliberately rather
+  than discovering it during an incident.
+- **Double caching that nobody measured.** `free -m` showing tens of gigabytes of `buff/cache`
+  on a dedicated database box with a large buffer pool means you are storing the working set
+  twice and the engine's eviction policy is reasoning about the wrong cache.
+
+:::note[What to take forward]
+`O_DIRECT` is a three-clause contract — buffer address, file offset and length all aligned to
+the logical block size — enforced with a single undifferentiated `EINVAL`, and it buys DMA
+straight into the buffer pool at the cost of readahead and sharing. It says nothing about
+durability: the bytes land in the drive's volatile cache and still need `fdatasync` or FUA.
+And it is only half the job — a blocking `pread()` costs a parked thread and ~4.5 µs of CPU per
+4 KB read, so the engines that actually saturate NVMe pair direct I/O with batched submission:
+linux-aio for InnoDB and ScyllaDB, io_uring for PostgreSQL 18 and TigerBeetle.
+:::

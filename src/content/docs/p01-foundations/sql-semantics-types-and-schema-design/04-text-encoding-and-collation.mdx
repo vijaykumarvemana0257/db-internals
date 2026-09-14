@@ -1,0 +1,120 @@
+---
+title: Text, encoding and collation
+description: What a text column actually stores, what a length actually counts, and how a collation turns ORDER BY, equality and UNIQUE into three different answers about the same string.
+depth: intermediate
+sidebar:
+  order: 4
+---
+
+import TextTypeCollationSwitchboard from '../../../../components/viz/TextTypeCollationSwitchboard';
+
+A text column is three decisions wearing one name: a *type* that fixes how many bytes the row spends, an *encoding* that fixes which characters can exist at all, and a *collation* that fixes what "equal" and "less than" mean. Engineers choose the first deliberately, inherit the second from whoever ran `initdb`, and discover the third the day a `UNIQUE` index accepts `Zoe` and rejects `zoe` — or, worse, the day it silently accepts both when the business meant them to be one customer.
+
+<TextTypeCollationSwitchboard client:visible />
+
+Two knobs are worth abusing before you read on. Switch the engine to MySQL and the collation to `utf8mb4_0900_ai_ci`, and watch four distinct byte strings fuse into one equality class. Back on Postgres, switch the type from `text` to `char(20)` and watch the trailing-space row join the group it was next to a moment ago. Nothing about the data changed; the comparison function did.
+
+## The three text types are one storage path
+
+In PostgreSQL, `text`, `varchar(n)` and `char(n)` are the same C type (`varlena`) going through the same code. A value shorter than 127 bytes carries a **one-byte** header holding its length; longer values carry a four-byte header and become four-byte aligned. `varchar(n)` adds one check on assignment. `char(n)` blank-pads to `n` *characters* on the way in, and then every comparison strips those blanks again — you store the padding, cache it, index it, ship it over the wire and replicate it, and it never means anything. The documentation is blunt about this: there is no performance advantage to `varchar(n)` over `text`, and `char(n)` is usually the slowest of the three because of the padding.
+
+Past roughly 2 KB per tuple, Postgres compresses the value and then pushes it out of line into the table's TOAST relation, leaving an 18-byte pointer in the row. That is a real win for wide rows — a scan that does not touch the column never reads the TOAST chunks — and a real cost for one that does, because each detoast is an index lookup into `pg_toast_<oid>`.
+
+InnoDB is different in the places that matter for sizing:
+
+| | PostgreSQL | MySQL / InnoDB (DYNAMIC) |
+|---|---|---|
+| Per-value overhead | 1-byte varlena header under 127 bytes, else 4 | 1-byte length prefix when the column's *maximum* byte length is 255 or under, else 2 |
+| `char(n)` | blank-padded to `n` characters, stored | trailing spaces stripped, but never fewer than `n` bytes; also stripped again on retrieval unless `sql_mode` has `PAD_CHAR_TO_FULL_LENGTH` |
+| Long values | compressed, then moved to TOAST past ~2 KB | moved to an overflow page with a 20-byte pointer when the row will not fit |
+| `n` counts | characters | characters |
+| Index key limit | ~2704 bytes per btree tuple | 3072 bytes (767 on COMPACT/REDUNDANT) |
+
+The length-prefix rule is the one that bites during migrations. `VARCHAR(63)` in `utf8mb3` has a maximum of 189 bytes and costs one prefix byte; convert the table to `utf8mb4` and the maximum becomes 252 — still one byte. `VARCHAR(64)` crosses to 256 and every row in the table grows by one byte plus whatever the rebuild costs. Push `n` past 768 in the switchboard and you get the other half of it: `ERROR 1071 (42000): Specified key was too long; max key length is 3072 bytes`. On the older COMPACT and REDUNDANT row formats that ceiling is 767 bytes, which is the entire reason half the world's schemas contain `varchar(191)` — 191 × 4 = 764, the widest `utf8mb4` column that could still be indexed.
+
+## What a length counts
+
+Three numbers describe the string `👩‍👧`, and no engine gives you all three:
+
+- **11 bytes** — `octet_length()` in Postgres, `LENGTH()` in MySQL.
+- **3 code points** — `length()` / `char_length()` in Postgres, `CHAR_LENGTH()` in MySQL. Two emoji and a zero-width joiner.
+- **1 grapheme cluster** — what a human calls "one character", what a text cursor moves over, and what neither engine can count. Postgres has no grapheme function in core; MySQL has none at all.
+
+So `varchar(1)` rejects that value, and a UI that promises "up to 20 characters" is promising something the column does not enforce. The same gap in the other direction produces the classic truncation bug: slicing a `varchar` at a byte boundary splits a UTF-8 sequence and yields invalid text.
+
+:::caution[MySQL's `utf8` is not UTF-8]
+`utf8` in MySQL is an alias for `utf8mb3`: a maximum of three bytes per character, i.e. the Basic Multilingual Plane only. Every emoji, every supplementary CJK ideograph and every musical symbol is unstorable. In strict mode you get `ERROR 1366 (HY000): Incorrect string value: '\xF0\x9F\x8D\x94'`; with strict mode off you get a warning and a truncated string. MySQL 8.0 defaults to `utf8mb4` and deprecates the `utf8` alias, but tables created under 5.7 — whose default was `latin1` — carry their old charset forward through every upgrade. Select `utf8mb3` in the switchboard and watch both emoji rows drop out of the result set entirely.
+:::
+
+Postgres has the opposite failure mode, and it is quieter. `SQL_ASCII` is not an encoding; it is the *absence* of one. No validation on input, no conversion on output, so the database becomes a byte bucket in which `length()` degenerates to a byte count, `upper()` mangles non-ASCII text, and a single table can hold UTF-8, Latin-1 and Shift-JIS rows that no query can distinguish. A database's encoding cannot be changed in place — the fix is a dump, a re-`initdb`, and a restore.
+
+## Collation is a function, and it is part of the type
+
+A collation compares two strings by building **weight keys** at several levels and comparing them in order:
+
+1. **Primary** — the base letter. `a`, `A`, `á` and `Ä` all weigh the same here.
+2. **Secondary** — accents and diacritics.
+3. **Tertiary** — case.
+
+Strength decides where comparison stops. An accent- and case-insensitive collation (`utf8mb4_0900_ai_ci`, MySQL 8.0's default) stops after level 1, so `Zoe`, `zoe`, `zoë` and `zoe` + U+0308 are one value — to `=`, to `GROUP BY`, to `DISTINCT`, and to `UNIQUE`. The switchboard shows exactly which level decided each adjacent pair; flip through the collations and watch the decision points move.
+
+The interesting cases are the ones after the weights tie:
+
+- **`C` / `POSIX` / `utf8mb4_bin`** never build weights at all. They are `memcmp` on the stored bytes, so `Zoe` sorts before every lowercase word, `Ähre` sorts after `Zebra`, and — crucially — the ordering depends on nothing outside the data.
+- **A deterministic Postgres collation falls back to `memcmp` when the weights tie.** This is why NFC `zoë` (U+00EB, 4 bytes) and NFD `zoë` (`e` + U+0308, 5 bytes) are *never* equal in Postgres under `en_US.utf8` or `und-x-icu`, even though ICU says their weights are identical at every level. They sort adjacent and compare unequal. macOS filenames, some iOS keyboards and a few HTTP clients hand you the decomposed form; your web form hands you the composed one; the same user gets two accounts.
+- **A nondeterministic collation drops that tiebreak.** `CREATE COLLATION ci (provider = icu, locale = 'und-u-ks-level2', deterministic = false)` gives you a genuinely case-insensitive column: equal weights mean equal values, NFC equals NFD, and `UNIQUE` enforces what you meant. The price is that pattern matching is not supported on it — `LIKE` raises `ERROR: nondeterministic collations are not supported for LIKE` — which is why the older `citext` extension is still around.
+- **Pad semantics differ between collations of the same charset.** MySQL's UCA 9.0.0 collations (`utf8mb4_0900_*`) are NO PAD: trailing spaces are significant. The older `utf8mb4_general_ci` and `utf8mb4_unicode_ci` are PAD SPACE: `'zoe ' = 'zoe'` is true. A migration between them changes the answer to an equality test without touching a row.
+
+Providers disagree too, and not only about obscure scripts. glibc locales treat spaces and punctuation as *variable* — ignorable until a later level — so `zo e` sorts next to `zoe`. ICU's CLDR root sets `alternate = non-ignorable`, so the space gets a primary weight and `zo e` sorts before every `zoe*`. Both are "English". Toggle between `en_US.utf8` and `und-x-icu` in the switchboard and the list reorders. Postgres has supported ICU collations at the column and index level since version 10 and as a database-wide provider since 15; version 17 added a builtin provider offering `C` and `C.UTF-8` with no dependency on libc at all.
+
+:::danger[The collation version trap, in one sentence]
+A btree index is a *sorted* structure, and the sort was performed by a specific version of a specific collation library; upgrade the OS, get a new glibc, and the index is now sorted according to rules the engine no longer uses — so a query that finds nothing is "correct". Postgres records `collversion` in `pg_collation` and warns on the mismatch, `REINDEX` is the fix, and [the mechanics of turning a collation into index order](/p02-storage-engines/b-trees-and-variants/07-collation-unicode-and-byte-comparable-key-encoding/) and [the operational drill](/p10-production-practice/failover-stacks-poolers-and-upgrades/05-the-collation-trap-silent-index-corruption-after-an-os-upgra/) each get their own page. For now: `C` is the only collation an OS upgrade cannot change.
+:::
+
+## When a comparison quietly stops using the index
+
+Three of these are near-universal in production:
+
+**Prefix `LIKE` under a non-`C` collation.** In Postgres, `WHERE email LIKE 'ada%'` can only use a btree index if the index's collation is `C`, because otherwise the collation's ordering does not agree with prefix ordering. The fix is a second index with the `text_pattern_ops` operator class (or `varchar_pattern_ops`), which compares byte-wise regardless of the column's collation — and which, in exchange, cannot serve `ORDER BY email`.
+
+**A collation mismatch across a join.** After a partial charset migration, one table's column is `utf8mb4_0900_ai_ci` and another's is `utf8mb4_general_ci`. MySQL either refuses — `ERROR 1267 (HY000): Illegal mix of collations ... for operation '='` — or coerces one side, and the coerced side's index becomes unusable. The plan degrades from `ref` to a full scan with no error at all.
+
+**An implicit numeric cast.** `WHERE phone = 1234567890` against a `VARCHAR` column makes MySQL convert *both* sides to `DOUBLE`. The index on `phone` is dead, and `'01234567890'` now matches, because both cast to the same number. Postgres refuses the comparison instead, which is the better failure.
+
+## Constrained sets: enum, lookup table, CHECK
+
+| | Storage | Sort order | Adding a value | Removing one |
+|---|---|---|---|---|
+| Postgres `enum` | 4-byte OID | declaration order (`pg_enum.enumsortorder`) | `ALTER TYPE ... ADD VALUE`, catalog-only, but unusable in the transaction that added it | not supported at all |
+| MySQL `ENUM` | 1 byte up to 255 members, 2 above | *internal index*, not the string — so `ORDER BY status` gives declaration order | appending is cheap; inserting in the middle rewrites the table | rewrite, and every row holding it breaks |
+| `CHECK (col IN (...))` | the string itself, every row | collation order of the column | `ALTER TABLE ... ADD CONSTRAINT ... NOT VALID`, then `VALIDATE CONSTRAINT` — the two-step avoids a long exclusive lock | same |
+| Lookup table + FK | a 2- or 4-byte key | whatever the lookup table says | an `INSERT` | a `DELETE`, blocked by the FK if anything references it |
+
+The enum sort order is the trap. `ORDER BY status` on a MySQL `ENUM('pending','approved','rejected')` sorts by 1, 2, 3, not alphabetically, and `WHERE status = 1` matches `'pending'` by index. If the values ever need metadata — a display label, a colour, a "which of these is terminal" flag — you needed a table.
+
+## Arrays, composite types, and identifiers
+
+A Postgres array is a single varlena value with 24 bytes of header for the one-dimensional case (a 4-byte varlena length, `ndim`, `dataoffset`, the element type OID, then a length and a lower bound per dimension) before any element, plus a null bitmap if any element is null, plus alignment padding per element. It is a genuinely good fit for tags and small fixed sets, `@>` and `&&` are indexable with GIN, and it is a genuinely bad fit for anything you need a foreign key on: array elements cannot reference another table, and the only way to join through one is `unnest`. A composite type is worse still for storage — each value embeds a tuple header of about 24 bytes, per row — and you cannot index one of its fields without an expression index.
+
+Identifiers are where the byte arithmetic is starkest. Store a UUID as:
+
+| Column | Row bytes | Postgres btree entry | Comparison |
+|---|---|---|---|
+| `uuid` | 16 | 8-byte `IndexTupleData` + 16 = **24** | `memcmp`, no collation, no locale |
+| `bytea` / `BINARY(16)` | 17 (16 + varlena header) | 8 + MAXALIGN(17) = **32** | `memcmp`; MySQL `BINARY` pads with `0x00` and the pad bytes are significant |
+| `text` / `varchar(36)` | 37 | 8 + MAXALIGN(37) = **48** | the column's collation, on 36 characters |
+
+Exactly double the index entry for the text form, before you count that InnoDB appends the whole primary key to *every* secondary index entry, so a 36-byte text PK is copied into each of them once per row. And the text column accepts `'018F3A9C-...'` and `'018f3a9c-...'` as two different values that mean the same UUID, which no `UNIQUE` index will catch. Select the UUID value in the switchboard and step the type through `text`, `bytea` and `uuid` to watch both numbers move.
+
+## Where it bites in production
+
+- **Two accounts for one person.** A deterministic collation plus a decomposed accent, or a case-sensitive column behind a case-insensitive login form. Symptom: duplicate rows that look identical in the console. Diagnose with `SELECT octet_length(x), length(x)` — the byte counts differ.
+- **A `UNIQUE` index that stops accepting inserts after a collation change.** `ERROR 1062 (23000): Duplicate entry 'zoe' for key` on data that has been there for years, the moment someone converts the table to `utf8mb4_0900_ai_ci`.
+- **`ORDER BY` output changing after an OS upgrade,** or a query returning fewer rows than it should because the index's sort order no longer matches the collation's. Postgres warns about the version mismatch; nothing else will.
+- **A charset conversion that fails at `ALTER TABLE`,** with `ERROR 1071`, because a `VARCHAR(255)` that fit in 767 bytes as `utf8mb3` does not as `utf8mb4`. The other version of this is `ERROR 1118: Row size too large`, from a table with too many wide `VARCHAR` columns against the 65,535-byte row limit.
+- **A plan that flips to a sequential scan** with no schema change, because a `LIKE 'prefix%'` predicate lost its `text_pattern_ops` index, or a join now crosses two collations.
+- **Mojibake with no error anywhere,** which is almost always `SQL_ASCII`, a `latin1` connection charset against `utf8mb4` storage, or both.
+
+:::note[What to take forward]
+Pick `text` and put the length limit in a `CHECK` constraint you can change without a rewrite; pick `utf8mb4`/`UTF8` and never `SQL_ASCII`; and treat the collation as part of the column's type, because it decides equality and uniqueness, not just display order. When you need case-insensitive matching, declare a nondeterministic collation rather than sprinkling `lower()` through the codebase — and when you need an ordering that no OS upgrade can rewrite, declare `C` and normalize the text before it goes in.
+:::

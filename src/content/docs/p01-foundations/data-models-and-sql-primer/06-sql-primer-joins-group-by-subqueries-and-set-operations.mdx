@@ -1,0 +1,256 @@
+---
+title: 'SQL primer: joins, GROUP BY, subqueries and set operations'
+description: Joins as a filtered cartesian product with NULL padding, GROUP BY buckets and aggregate semantics, IN versus EXISTS, and set versus bag operators — with the full clause evaluation order.
+depth: basics
+sidebar:
+  order: 6
+---
+
+import JoinGroupPipeline from '../../../../components/viz/JoinGroupPipeline';
+import SetOpMultisetLab from '../../../../components/viz/SetOpMultisetLab';
+
+Single-table SQL is a filter over rows you already have. Everything interesting happens when
+two tables meet, and the meeting is defined by a rule that surprises almost everyone the first
+time they see it stated plainly: **a join is a cartesian product with a predicate applied to
+it**, and an outer join is that plus manufactured NULLs. Every confusing join result you have
+ever debugged — the duplicated revenue, the LEFT JOIN that quietly became an INNER, the
+`NOT IN` that returned nothing — falls straight out of that definition.
+
+<JoinGroupPipeline client:visible />
+
+## A join is a filtered cartesian product
+
+`FROM customers c JOIN orders o ON o.customer_id = c.id` means, semantically: form every pair
+of one customer row and one order row, then keep the pairs where the predicate is TRUE. Five
+customers and seven orders make 35 candidate pairs; the ON clause keeps six of them.
+
+No engine does this literally — it builds a hash table on one side, or merges two sorted
+inputs, and you will meet those algorithms in the join-execution module. But the *answer* is
+defined by the cartesian product, and that is why the join types line up so simply:
+
+| Join | Which rows | On the sample data |
+|---|---|---|
+| `CROSS JOIN` | all pairs, no predicate | 35 rows |
+| `JOIN` / `INNER JOIN` | pairs where ON is TRUE | 6 rows |
+| `LEFT [OUTER] JOIN` | those, plus every left row that matched nothing, right side NULL | 7 rows |
+| `RIGHT [OUTER] JOIN` | those, plus every right row that matched nothing, left side NULL | 7 rows |
+| `FULL [OUTER] JOIN` | those, plus both kinds of unmatched row | 8 rows |
+
+Three details in that table do real damage in production.
+
+**ON accepts any predicate, not just equality.** `ON o.amount >= 100` is a legal join (a *theta*
+join) and produces 15 rows out of 35 here. It is legal, occasionally necessary, and the reason a
+query can go quadratic: without an equality the engine cannot hash or merge, and it falls back
+to a nested loop over every pair.
+
+**"Unmatched" means matched by nothing at all, not matched by less.** A customer with three
+orders contributes three rows to a LEFT JOIN and no padded row. The padding appears only when
+the entire inner loop found zero partners.
+
+**NULL in the join key never matches.** Order 106 has `customer_id IS NULL`. `NULL = 4` is not
+false, it is UNKNOWN, and ON keeps only TRUE — so that order matches no customer under any
+equality predicate and disappears from an INNER or LEFT join entirely. Postgres and SQLite
+give you `IS NOT DISTINCT FROM` when you genuinely want NULL to match NULL; MySQL spells the
+same null-safe comparison `<=>`. Postgres cannot satisfy `IS NOT DISTINCT FROM` with a plain
+B-tree index lookup the way it can `=`, which is one more reason to keep FKs `NOT NULL` when the
+domain allows it.
+
+:::caution[The same predicate in ON and in WHERE are different queries]
+Set the join to LEFT and the ON clause to `o.customer_id = c.id AND o.status = 'paid'`: customers
+with only unpaid orders come back as NULL-padded rows. Now move the status test to WHERE instead.
+The padded rows have `o.status = NULL`, the comparison is UNKNOWN, and every one of them is
+filtered out — your LEFT JOIN has silently become an INNER JOIN. ON filters *pairs, before
+padding*; WHERE filters *joined rows, after padding*. For inner joins the two are
+interchangeable and the optimizer moves predicates freely between them; for outer joins they are
+not the same query and it cannot.
+:::
+
+The inverse of that trap is a useful idiom. `LEFT JOIN ... WHERE o.id IS NULL` keeps exactly the
+padded rows — customers with no orders. That is an **anti-join**, and `NOT EXISTS` expresses the
+same thing more directly; Postgres prints both as a `Hash Anti Join`. The matching positive form,
+`EXISTS`, is a **semi-join**: it returns each left row at most once no matter how many partners
+it has. Those two words are worth keeping, because the optimizer chapters use them constantly.
+
+Two shorthands are worth knowing and one is worth avoiding. `USING (customer_id)` requires the
+column to be named identically on both sides and collapses it into a single output column, which
+makes `SELECT *` cleaner. `NATURAL JOIN` joins on *every* identically-named column, which means
+adding a `created_at` column to two tables silently changes the meaning of existing queries. Do
+not use it.
+
+## GROUP BY makes buckets; HAVING throws buckets away
+
+`GROUP BY` routes each surviving row into exactly one bucket keyed by the grouping expression,
+and the SELECT list then collapses each bucket to a single row. Three rules cover most of what
+goes wrong.
+
+**NULL keys form one bucket.** Grouping compares keys with the null-safe "is not distinct from",
+not with `=`, so every row with a NULL key lands together. This is one of the few places in SQL
+where two NULLs count as the same value; set operators and `DISTINCT` are the others.
+
+**HAVING is WHERE for buckets.** It runs after aggregation and can therefore reference `count(*)`
+and `sum(...)`; WHERE runs before and cannot. A predicate that needs no aggregate belongs in
+WHERE, where it removes rows before they are grouped — putting it in HAVING is not wrong, just
+strictly more work, and on a large table it is the difference between aggregating a filtered
+subset and aggregating everything.
+
+**Every column in the SELECT list must be grouped or aggregated** — and engines disagree about
+how hard they enforce it. Postgres rejects a bare ungrouped column outright, except when it can
+prove functional dependency: if you group by a table's primary key, every other column of that
+table is uniquely determined and is allowed. MySQL has enforced the same rule since
+`ONLY_FULL_GROUP_BY` became a default SQL mode in 5.7.5; before that it returned a value from an
+arbitrary row in the group, and disabling the mode still does. SQLite permits bare columns by
+design and documents that the value comes from an arbitrary row — with one deliberate exception:
+in a query whose only aggregate is a single `min()` or `max()`, bare columns come from the row
+that achieved it, which is a genuinely handy "argmax" shortcut and completely unportable.
+
+### Aggregates and NULL
+
+Aggregate functions other than `count(*)` ignore NULL inputs, and the consequences are sharper
+than they sound:
+
+- `count(*)` counts **rows**. `count(o.amount)` counts **non-NULL values of that column**. On an
+  outer join the gap between the two is precisely the number of NULL-padded rows the join
+  manufactured — which is how you count "customers with no orders" and "orders" in the same
+  query without a second scan.
+- `sum()` over a group with no non-NULL values returns **NULL, not 0**. There is no row to add,
+  and SQL refuses to invent a zero. Wrap it: `coalesce(sum(o.amount), 0)`. Then notice that
+  `HAVING sum(o.amount) > 200` on such a group evaluates `NULL > 200` to UNKNOWN and drops the
+  bucket exactly as if the test had been false.
+- `avg()` is `sum` over the count of **non-NULL** values, so a column of `[10, 20, NULL]` averages
+  to 15, not 10. If NULL means zero in your domain, say so with `coalesce` before aggregating.
+- `count(DISTINCT x)` also ignores NULL, and is far more expensive than `count(x)` — it needs a
+  sort or a hash table per group rather than a running counter.
+
+One asymmetry deserves its own line because it breaks dashboards. `SELECT count(*) FROM t WHERE
+false` returns **one row containing 0**: with no GROUP BY, an aggregate query has a single
+implicit group over the whole result, and that group exists even when nothing reached it. Add
+`GROUP BY tenant_id` and the same empty input returns **zero rows**. Step the visual to the
+GROUP BY stage with an anti-join WHERE clause and you can watch the two behaviours diverge.
+
+## Subqueries, and the one that returns nothing
+
+A subquery in the WHERE clause comes in three shapes, and the difference between them is whether
+the inner query can see the outer row.
+
+```sql
+-- scalar: must return at most one row and one column
+SELECT * FROM orders WHERE amount > (SELECT avg(amount) FROM orders);
+
+-- uncorrelated IN: the inner query is evaluated once
+SELECT * FROM customers WHERE id IN (SELECT customer_id FROM orders);
+
+-- correlated EXISTS: conceptually re-evaluated for every outer row
+SELECT * FROM customers c
+WHERE EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = c.id AND o.status = 'paid');
+```
+
+"Conceptually re-evaluated per row" is the semantics, not the plan. Both Postgres and MySQL
+rewrite a correlated `EXISTS` into a semi-join and execute it with a hash or merge, which is why
+the old folklore that "EXISTS is faster than IN" is no longer true for the positive forms — on
+Postgres, `IN` over a subquery and `EXISTS` over the equivalent correlation usually produce the
+identical plan. A scalar subquery in the SELECT list is a LEFT JOIN in disguise and is the one
+shape that still routinely defeats decorrelation: if it stays a `SubPlan`, it runs once per
+output row.
+
+The negative forms are where they genuinely differ, and it is not about speed:
+
+:::danger[`NOT IN` with a NULL in the subquery returns no rows, ever]
+`x NOT IN (SELECT customer_id FROM orders)` expands to `x <> 101 AND x <> 102 AND ... AND x <> NULL`.
+That last conjunct is UNKNOWN, `TRUE AND UNKNOWN` is UNKNOWN, and UNKNOWN is not TRUE — so the
+predicate can never be satisfied while a single NULL exists in the subquery's result. The query
+returns an empty set with no error, no warning and a perfectly innocent-looking plan. `NOT EXISTS`
+has no such behaviour: it asks whether any matching row exists, which is a simple boolean. Use
+`NOT EXISTS`, or add an explicit `WHERE customer_id IS NOT NULL` to the subquery.
+:::
+
+That same NULL forces the optimizer's hand. `NOT EXISTS` becomes an anti-join; `NOT IN` cannot,
+unless the engine can prove both columns are `NOT NULL`, so Postgres typically leaves it as a
+hashed `SubPlan` filter. On a large outer table that is the difference between a hash anti-join
+and a per-row probe.
+
+## Set operators: sets or bags, and you must choose
+
+<SetOpMultisetLab client:visible />
+
+`UNION`, `INTERSECT` and `EXCEPT` combine two whole result sets rather than pairing rows. Both
+branches must produce the same number of columns with compatible types; the output column names
+come from the first branch, and a trailing `ORDER BY` applies to the combined result and may
+reference only those output names or ordinal positions.
+
+Every operator has two forms, and the plain form is the expensive one. The `ALL` form is
+arithmetic on multiplicities — `a + b` for UNION ALL, `min(a, b)` for INTERSECT ALL,
+`max(a - b, 0)` for EXCEPT ALL — and the engine can stream it; Postgres plans `UNION ALL` as a
+bare `Append` with essentially no memory footprint. The plain form clamps every non-zero
+multiplicity to 1, which requires proving each output row unique, which requires a hash table or
+a sort over the entire combined result: a `HashAggregate` above the `Append`, or `HashSetOp` for
+the other two. If that hash exceeds `work_mem` it spills to disk, and a query that was pure
+streaming starts writing temp files.
+
+Two more specifics. Set operators, like GROUP BY, treat NULLs as duplicates of each other —
+toggle the NULL rows in the lab and watch two NULLs fold into one. And precedence is not
+left-to-right: `INTERSECT` binds tighter than `UNION` and `EXCEPT`, so `a UNION b INTERSECT c`
+means `a UNION (b INTERSECT c)`. Parenthesize.
+
+Portability here is worse than for joins. MySQL has no `FULL OUTER JOIN` at all (the standard
+workaround is `LEFT JOIN UNION RIGHT JOIN`) and only gained `INTERSECT` and `EXCEPT` in 8.0.31.
+SQLite supports all four set operators but not the `ALL` variants of `INTERSECT` and `EXCEPT`,
+and only gained `RIGHT` and `FULL OUTER JOIN` in 3.39.0. Postgres supports the lot.
+
+## The evaluation order
+
+The clauses are written in one order and evaluated in another. This is the *logical* order —
+the order that defines what the answer is, not what the engine does:
+
+```
+FROM      →  JOIN/ON  →  WHERE  →  GROUP BY  →  HAVING  →
+SELECT    →  DISTINCT →  ORDER BY  →  LIMIT/OFFSET
+```
+
+Almost every "why can't I do that" in SQL is this list. You cannot use a SELECT alias in WHERE
+or ON, because the SELECT list has not been evaluated yet — but you *can* use it in ORDER BY,
+which runs after. (Postgres also accepts an output-column name in GROUP BY — an explicit
+extension, with input-column names winning ties — but not in HAVING; MySQL and SQLite accept
+aliases in HAVING too, which is convenient and not portable.) You cannot put an aggregate in
+WHERE, because grouping has not happened. `DISTINCT` applies to the SELECT output, after
+aggregation, so `count(DISTINCT x)` and `SELECT DISTINCT count(x)` mean entirely different
+things. And `LIMIT` runs last, which is why `LIMIT 10` over a `GROUP BY` still has to compute
+every group first. Window functions slot in between HAVING and DISTINCT — they see grouped rows
+and are themselves invisible to WHERE and HAVING — and they get their own module.
+
+The physical order is a different question entirely. The optimizer will push a WHERE predicate
+below a join, reorder the join tree, aggregate before joining when it can prove the result is
+the same, and skip work that provably cannot change the answer. The logical order tells you what
+the query *means*; the plan tells you what it *costs*.
+
+## Where it bites in production
+
+- **Fan-out double counting.** Join `customers` to `orders` (one-to-many) *and* to `shipments`
+  (one-to-many) in the same FROM clause, and every order row is duplicated once per shipment.
+  `sum(o.amount)` is now inflated by the shipment count, and nothing errors. The symptom is
+  revenue that is too high by a suspiciously round factor. The fix is to aggregate each branch
+  before joining — a subquery per branch, or `LATERAL` — never `sum(DISTINCT o.amount)`, which
+  silently discards two genuinely equal order amounts.
+- **The missing join predicate.** A comma-separated FROM with no matching WHERE clause is a
+  cross join. Two 100 000-row tables become 10¹⁰ rows; the query does not fail, it consumes the
+  machine. `EXPLAIN` shows it instantly as a `Nested Loop` with no join filter and an estimated
+  row count with too many digits.
+- **The outer join that wasn't.** A predicate on the nullable side moved into WHERE by a later
+  edit. Rows silently vanish from a report; the query is still spelled `LEFT JOIN`.
+- **`NOT IN` over a nullable column.** Zero rows returned, no error. It usually ships, because
+  the test data had no NULLs.
+- **`UNION` where `UNION ALL` was meant.** A dedup pass over millions of rows to remove
+  duplicates that could not exist. Look for a `HashAggregate` or `Unique` immediately above an
+  `Append` whose inputs are disjoint by construction.
+- **`count(col)` where `count(*)` was meant.** An under-count exactly equal to the NULL count in
+  that column, which is often zero in staging and not in production.
+
+:::note[What to take forward]
+A join is a cartesian product filtered by ON, and an outer join adds NULL-padded rows for
+whatever ON eliminated entirely — so ON and WHERE are interchangeable for inner joins and are
+two different queries for outer ones. GROUP BY sorts rows into buckets that NULL keys share,
+HAVING discards whole buckets after aggregation, and every aggregate except `count(*)` ignores
+NULLs, which is why `sum()` over nothing is NULL. Set operators are multiset arithmetic; the
+non-`ALL` forms buy uniqueness with a sort or a hash. And the clause evaluation order —
+FROM, JOIN, WHERE, GROUP BY, HAVING, SELECT, DISTINCT, ORDER BY, LIMIT — explains nearly every
+rule about what you are allowed to write where.
+:::

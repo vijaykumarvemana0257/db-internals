@@ -1,0 +1,251 @@
+---
+title: Normalization, functional dependencies and schema design
+description: Functional dependencies, attribute closure, the 2NF→3NF→BCNF ladder, the two tests a decomposition has to pass, and why the primary key you pick is also a physical storage decision.
+depth: intermediate
+sidebar:
+  order: 5
+---
+
+import NormalFormDecomposer from '../../../../components/viz/NormalFormDecomposer';
+
+A schema that stores the same fact twice has turned a one-row `UPDATE` into a scan-and-rewrite,
+and has created a state — the two copies disagreeing — that no constraint can forbid.
+Normalization is the mechanical procedure for finding those duplicated facts before they are in
+production: you write down the dependencies you are actually asserting, and an algorithm tells
+you where the schema stores one of them more than once.
+
+<NormalFormDecomposer client:visible />
+
+## A functional dependency is an assertion, not an observation
+
+`X → Y` holds on relation `R` if **every legal instance** of `R` has the property that two
+tuples agreeing on `X` agree on `Y`. That word *legal* is the whole difficulty. Today's rows can
+only ever **refute** a dependency; they can never confirm one. If no customer in your table
+shares an email address, that does not mean `email → cust_id` — it means nobody has tried yet.
+Dependencies come from the business, and getting them wrong in either direction is expensive:
+assert one that isn't true and you will normalize away a column you need, miss one that is true
+and you will store it redundantly forever.
+
+Armstrong gave the complete inference system for dependencies in 1974, and it is three rules:
+**reflexivity** (`Y ⊆ X` implies `X → Y`), **augmentation** (`X → Y` implies `XZ → YZ`), and
+**transitivity** (`X → Y` and `Y → Z` implies `X → Z`). Sound and complete means everything
+implied by `F` is derivable from those three, and nothing else is. The convenience rules you
+actually use — union (`X → Y`, `X → Z` gives `X → YZ`), decomposition, pseudotransitivity —
+are all derived from them.
+
+You never enumerate the closure of the whole dependency set; it is exponential and useless. You
+compute **attribute closure** instead: start with `X`, and repeatedly add the right side of any
+dependency whose left side you already have, until nothing changes. That single routine answers
+every question on this page:
+
+- `X` is a **superkey** iff `X⁺` is all of `R`.
+- `X` is a **candidate key** iff it is a superkey and no proper subset of it is.
+- An attribute is **prime** iff it appears in some candidate key.
+- `X → Y` is implied by `F` iff `Y ⊆ X⁺`.
+
+Click attributes in the lab to build `X` and watch `X⁺` grow. In `order_line`, `{order_id}⁺`
+pulls in the customer, the email, the tier, the warehouse and the region — but never `sku` or
+`qty`, so it stops short of the relation and is not a superkey. That gap is the schema's whole
+problem stated in one line.
+
+## The ladder, and the anomaly each rung removes
+
+| Rung | The rule | What it removes |
+|---|---|---|
+| 1NF | One value per cell; no repeating groups | Rows you cannot address with a `WHERE` clause |
+| 2NF | No non-prime attribute depends on a *proper subset* of a candidate key | Per-order facts stored once per order *line* |
+| 3NF | No non-prime attribute depends on a non-key attribute (no transitive dependency) | Per-warehouse facts stored once per order |
+| BCNF | *Every* non-trivial determinant is a superkey | The residue 3NF forgives when candidate keys overlap |
+
+**1NF** is the rung people assume is free and is not. The classical reading — atomic values —
+has been muddied by engines that ship non-scalar types deliberately: PostgreSQL arrays,
+`jsonb`, composite types, `hstore`. The useful operational test is not "is this value atomic"
+but **"does anything ever need to reach inside it?"** A `text[]` of tags that you only ever
+render is a perfectly good column. A comma-joined `sku_list` that a report has to split, unnest,
+`GROUP BY` and — the giveaway — enforce a foreign key against is a 1NF violation with a GIN
+index taped over the top; it cannot be constrained, cannot be joined efficiently, and every
+consumer reimplements the parser.
+
+**2NF** is about composite keys only. `order_line`'s key is `{order_id, sku}`, but `order_id`
+alone determines the customer and the warehouse, so those columns repeat on every line of a
+multi-line order. Switch the lab to 2NF and watch the partial dependency get lifted into its own
+relation, leaving `{order_id, sku, qty}` behind.
+
+**3NF** catches the next layer: `order_id → whse → region`. `region` depends on the key only
+because it depends on something else that does. Nothing about the key of `order_line` changes;
+the fact is still stored once per line.
+
+**BCNF** tightens 3NF's escape clause. 3NF forgives `X → A` when `A` is prime — when the
+dependent attribute belongs to some candidate key. That exemption only matters when candidate
+keys overlap, which is exactly the `address` preset: `{street, city, state}` and `{street, zip}`
+are both candidate keys, every attribute is prime, so `zip → city` is *legal in 3NF* while the
+city name is still stored once per street address in that ZIP. Load the address schema, leave it
+flat, and the lab shows it sitting in 3NF with redundant cells shaded.
+
+Every rung removes the same three anomalies in different guises. In flat `order_line`:
+
+- **Update anomaly** — customer `c1`'s email lives in four rows. One `UPDATE` has to hit all
+  four *atomically*; a `WHERE` clause that misses one leaves the database holding two emails for
+  one customer, and no `CHECK`, `UNIQUE` or foreign key can express that this is wrong.
+- **Insertion anomaly** — you cannot record a customer who has not ordered, because `order_id`
+  and `sku` are the primary key and cannot be `NULL`.
+- **Deletion anomaly** — delete the two lines of order `o-1003`, the only order customer `c2`
+  has ever placed, and `c2` disappears from the database entirely: their email and their tier
+  were only ever recorded as a side effect of having ordered something.
+
+## A decomposition has to prove two things
+
+Splitting a relation is not automatically safe. There are exactly two obligations.
+
+**Lossless join.** A binary decomposition of `R` into `R₁` and `R₂` is lossless when the shared
+attributes determine one of the halves: `R₁ ∩ R₂ → R₁` or `R₁ ∩ R₂ → R₂` (Heath, 1971).
+Otherwise the natural join of the two parts contains rows that were never in `R` — *spurious
+tuples* — and you have silently lost information by adding rows. Switch the lab to **naive** and
+slide the split point: it cuts the relation at an arbitrary column, joins the fragments back
+together, and shows you the invented rows marked `✕`. The check is not asserted, it is run: the
+fragments are projected from the instance and natural-joined, and the result is diffed against
+the original rows.
+
+This is why the BCNF algorithm splits where it does. When `X → Y` violates BCNF inside `R`, you
+produce `X⁺ ∩ R` and `X ∪ (R − X⁺)`. Those two share exactly `X`, and `X` is a key of the first
+by construction, so losslessness is free at every step.
+
+**Dependency preservation.** Each fragment can enforce the dependencies that fit inside it, as a
+primary key or a `UNIQUE` constraint. A dependency is *preserved* when it is implied by the union
+of the projections `πRᵢ(F)` — which is decided by a fixpoint: grow `Z` from `X` by adding
+`(Z ∩ Rᵢ)⁺ ∩ Rᵢ` for each fragment until nothing changes, then ask whether `Y ⊆ Z`. If it is
+not, that constraint can no longer be checked without a join.
+
+The two obligations do not always both survive:
+
+| Algorithm | Lossless | Dependency-preserving | Result |
+|---|---|---|---|
+| 3NF synthesis (Bernstein, 1976) — minimal cover, one relation per determinant, plus a candidate key | always | always | 3NF |
+| BCNF decomposition — recursive split on a violating determinant | always | **not always** | BCNF |
+
+Run the address schema to see the gap concretely. 3NF synthesis hands the relation back
+unchanged, because it is already in 3NF. BCNF splits it into `{zip, city, state}` and
+`{street, zip}` — and `{street, city, state} → zip` is now enforceable by nothing: the two
+attributes it constrains live in different tables. There is no dependency-preserving BCNF
+decomposition of that relation. Not "the algorithm doesn't find one" — none exists.
+
+In practice you pick one of three exits, and the right one is usually the first:
+
+1. **Stay in 3NF and declare both candidate keys.** Keep `address(street, city, state, zip)`
+   with `UNIQUE (street, city, state)` and `UNIQUE (street, zip)`; both dependencies are now
+   enforced by the engine, and you accept that `zip → city, state` repeats. This is the normal
+   answer.
+2. **Go to BCNF and re-enforce the lost dependency with machinery** — a trigger, a deferred
+   constraint, or a materialized helper table with a unique index. You have now reintroduced
+   write-time work to remove redundancy; sometimes worth it, rarely.
+3. **Discover the dependency was never true.** A good share of BCNF conflicts dissolve when
+   someone checks the claim against reality: ZIP codes do straddle city lines, and instructors do
+   teach two sections.
+
+## When to stop: BCNF plus judgement
+
+BCNF is the stopping point for almost every production schema. Beyond it lies 4NF and the theory
+of multivalued dependencies, and those matter for a specific, recognizable shape — two
+independent multi-valued facts crammed into one table — which the
+[optional next page](/p01-foundations/sql-semantics-types-and-schema-design/06-optional-deep-dive-multivalued-dependencies-4nf-and-the-chas/)
+covers. You can skip it and lose nothing on a first pass.
+
+What you should *not* do is treat denormalization as a modeling decision. It is a physical,
+read-versus-write trade, and the discipline is that **every duplicated value must have a
+mechanism that maintains it**. A copied column with no maintainer is a cache with no
+invalidation story, and it will drift — usually first noticed as a report that disagrees with
+the detail page.
+
+The mechanisms that qualify:
+
+| Mechanism | Maintained by | Staleness |
+|---|---|---|
+| Covering index (`INCLUDE` columns in PostgreSQL/SQL Server) | The engine, transactionally | None — it is not a second copy of the fact, it is a second copy of the bytes |
+| Generated column (PostgreSQL `STORED` since 12, MySQL virtual/stored since 5.7) | The engine, on write | None |
+| Indexed view (SQL Server), materialized view with `REFRESH FAST ON COMMIT` (Oracle) | The engine, synchronously | None, at a write cost |
+| `MATERIALIZED VIEW` (PostgreSQL) | You, via `REFRESH MATERIALIZED VIEW [CONCURRENTLY]` | Until the next refresh; `CONCURRENTLY` needs a unique index on the view |
+| Counter/summary table | Your triggers or your writer | Whatever your code guarantees |
+| Star-schema dimension (OLAP) | The load job | One load cycle — and deliberately so |
+
+The cost of the copy is not the disk. In PostgreSQL, an `UPDATE` that touches four rows writes
+four new tuple versions, leaves four dead ones for autovacuum, writes WAL for all of it, and —
+unless the update is HOT-eligible (no indexed column changed, and free space on the same page,
+which is why `FILLFACTOR` below the default 100 exists) — inserts new entries into every index
+on the table. The lab's "rows rewritten" stat is the leading indicator for all of that: flat
+`order_line` rewrites 6 rows to re-home one warehouse; the decomposed schema rewrites 1.
+
+## Choosing the key, which is also a storage decision
+
+In a clustered engine the primary key is not only an identity — it is the physical sort order of
+the table and the row locator in every secondary index. InnoDB *is* its primary-key B+tree, and
+every secondary index entry stores the full primary key as its pointer back to the row. Choose a
+16-byte random key and you have widened every secondary index on the table by 16 bytes per entry
+and randomized every insert.
+
+| Key | Bytes | Insert locality | Use when |
+|---|---|---|---|
+| `bigint` identity / `bigserial` | 8 | Perfect — monotonic, always the right-edge leaf | Default. Use `GENERATED BY DEFAULT AS IDENTITY` over `serial`; it is the standard spelling and owns its sequence properly |
+| UUIDv4 | 16 (`uuid`; never `text`) | Worst case — every insert lands in a random leaf | Identities minted by many clients that must not coordinate, and you accept the index cost |
+| UUIDv7 / ULID | 16 | Near-sequential: a 48-bit big-endian millisecond prefix | You need client-minted, globally unique *and* index-friendly keys |
+| Natural composite | Varies | Follows the natural key | Junction tables where the pair genuinely *is* the identity — `(order_id, sku)` |
+
+Random UUIDs are the expensive one, and the mechanism is worth being precise about. Inserts
+scatter across the whole B-tree, so the index's hot set is the *entire index* rather than its
+right edge; once that exceeds `shared_buffers` or `innodb_buffer_pool_size`, every insert becomes
+a read plus a write of a different page. Page splits happen at random interior points, leaving
+leaves around half full instead of nearly full. PostgreSQL softens one half of this — the heap is
+not clustered, so table inserts still append at the end and only the indexes suffer — while
+InnoDB, whose table *is* the clustered index, takes the full hit. Storing a UUID as 36-character
+text instead of the 16-byte `uuid` type (or MySQL `BINARY(16)` via `UUID_TO_BIN`) more than
+doubles it again.
+
+UUIDv7, standardized in RFC 9562 in 2024, fixes the locality without giving up client-side
+minting: the first 48 bits are a big-endian Unix millisecond timestamp, so new keys sort at the
+right edge like a sequence. PostgreSQL 18 ships `uuidv7()` as a built-in; before that you used
+the `pg_uuidv7` extension or generated it in the application. ULID is the same construction with
+a 26-character Crockford base32 text form. MySQL's older trick, `UUID_TO_BIN(uuid, 1)`, swaps the
+time fields of a v1 UUID to the same end. Two honest costs: a time-ordered key **leaks creation
+time** to anyone who can see it, and sequential keys concentrate every inserter on the same
+right-edge leaf page, which becomes a latch hotspot at high insert rates — the classic fixes are
+hash partitioning or, in Oracle, a reverse-key index.
+
+Natural keys deserve one rule. A natural key that can **change** is a fan-out update waiting to
+happen: every referencing row in every table has to change with it, `ON UPDATE CASCADE` or not,
+which is precisely the anomaly normalization was supposed to eliminate. Email addresses,
+usernames, ISBNs, tax IDs and SKUs all change in the real world. The discipline: declare the
+natural key as a `UNIQUE` constraint so the engine enforces it, and make an immutable surrogate
+the primary key that foreign keys point at. Composite natural keys inside junction tables are the
+exception — `(order_id, sku)` is not going to be re-issued — and there the composite key also
+gives you the clustering you want for free.
+
+## Where it bites in production
+
+- **The one-statement incident.** A single `UPDATE customers SET tier = ...` against a
+  denormalized `order_line` rewrites hundreds of thousands of rows, holds row locks on all of
+  them, produces an equivalent volume of WAL, and blocks replication apply behind it. The metric
+  that catches it is rows-written per logical change, which the lab's flat-versus-decomposed
+  counter is a miniature of.
+- **Drift you find in a report.** Two copies of a fact and one maintainer means the copy is
+  eventually wrong. If you cannot name the mechanism that maintains a duplicated column, it is
+  not denormalization, it is a bug with a schedule.
+- **The lost dependency nobody re-enforced.** After a BCNF split, the constraint that used to be
+  a `UNIQUE` index lives only in application code, and duplicates show up the first time two
+  requests race. If a decomposition loses a dependency, write down *where* it is now enforced
+  before you ship it.
+- **The insert cliff.** Steady write throughput that falls off a shelf when a UUIDv4-keyed
+  index outgrows the buffer pool. The signature is buffer reads per insert climbing while the
+  row rate falls and CPU stays flat.
+- **Over-normalization is real but rarer.** A screen that needs nine joins is a legitimate
+  complaint — but the fix is usually a covering index, a view, or a materialized rollup, not a
+  wide table. Denormalize the *read path*, never the source of truth.
+
+:::note[What to take forward]
+Write the dependencies down, compute closures to find the candidate keys, and split wherever a
+determinant is not a superkey. Every split must be lossless — the shared attributes have to be a
+key of one side — and any dependency it costs you has to be re-enforced somewhere you can name.
+BCNF plus judgement is enough for nearly every production schema; denormalize afterwards, on
+purpose, only with a mechanism that maintains the copy. And pick the primary key knowing it is
+also the physical order of a clustered table and the row locator in every secondary index — a
+subject Part 2 picks up in [B+tree structure](/p02-storage-engines/b-trees-and-variants/01-b-tree-structure-invariants-and-search/)
+and [splits under load](/p02-storage-engines/b-trees-and-variants/04-fill-factor-fragmentation-and-splits-under-load/).
+:::

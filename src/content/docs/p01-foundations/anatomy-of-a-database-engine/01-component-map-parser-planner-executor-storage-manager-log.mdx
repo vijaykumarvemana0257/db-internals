@@ -1,0 +1,245 @@
+---
+title: "Component map: parser, planner, executor, storage manager, log"
+description: The ten layers every SQL engine is made of, the four managers that cut across all of them, the seam where storage engines plug in, and which knob sizes each layer.
+depth: basics
+sidebar:
+  order: 1
+---
+
+import EngineComponentIndex from '../../../../components/viz/EngineComponentIndex';
+
+Every relational engine written since System R is the same short stack of layers, in the same
+order, with the same four managers cutting sideways through all of it. Once you can name the
+layers, every later mechanism in this course has an address — a B+tree split happens in the
+access methods, a phantom read is a lock-manager problem, `work_mem` belongs to exactly one
+layer and `shared_buffers` to a different one — and "the database is slow" becomes a question
+about which box.
+
+<EngineComponentIndex client:visible />
+
+## One statement, falling through ten layers
+
+Take `SELECT * FROM orders WHERE id = 42` arriving at a PostgreSQL backend. The path is
+concrete enough to read in the source, and every engine's version of it rhymes.
+
+**Wire protocol.** The bytes arrive as a protocol-3.0 `Query` message (or as
+`Parse`/`Bind`/`Describe`/`Execute` if your driver uses the extended protocol, which is how
+server-side prepared statements are expressed). In PostgreSQL the postmaster has already
+forked a dedicated backend process for this connection; in MySQL it is a thread. Either way
+the connection is an OS-scheduled thing with a stack and a memory footprint, which is the
+whole reason connection poolers exist.
+
+**Parser.** `pg_parse_query` runs a flex scanner and a bison grammar (`scan.l`, `gram.y`) and
+returns a *raw parse tree* — `SelectStmt`, `ColumnRef`, `A_Const`. It is pure syntax and it
+never touches the catalog, which is why `SELECT * FROM ordrs` is not a parse error. Misspelt
+table names die one layer later.
+
+**Binder / analyzer.** Parse analysis (`parse_analyze_fixedparams`, plain `parse_analyze` before
+PostgreSQL 15) resolves every name against the catalog through `search_path`, turning `orders` into a `pg_class` OID and `id` into an attribute number,
+resolving `=` to a specific operator for a specific type pair, and taking an `AccessShareLock`
+on the relation so nobody can drop it mid-query. Output is a `Query` — a bound tree with a
+range table. This is the first layer that can fail on *meaning* rather than form.
+
+**Rewriter.** Views and row-level security policies expand here (`rewriteHandler.c`). A
+PostgreSQL view is literally a rule, and the rewriter substitutes its body into the query tree
+before the planner sees anything — which is why a view costs nothing on its own, and why RLS
+policies show up as extra quals in `EXPLAIN` output you did not write.
+
+**Optimizer.** The planner enumerates access paths (sequential scan, index scan on
+`orders_pkey`, bitmap heap scan) and join orders, costs each with the model calibrated by
+`seq_page_cost`, `random_page_cost` and `effective_cache_size`, and emits one `PlannedStmt`.
+Join-order search is bottom-up dynamic programming until the FROM-list reaches
+`geqo_threshold` (12), at which point it switches to a genetic algorithm. Everything below this
+layer executes the chosen plan at full speed whether or not it was the right one.
+
+**Executor.** `ExecutorRun` walks the plan tree in the Volcano style: every node exposes the
+same "give me the next tuple" interface and pulls from its children. `work_mem` is enforced
+here, and it is a budget *per node per worker* — not per query and not per connection — so one
+plan with three hash joins running with four parallel workers can reserve twelve times the
+configured value.
+
+**The storage-engine seam.** Since PostgreSQL 12 the table layer is an interface: a *table
+access method* registered in `pg_am`, with `heap` as the default one. Index access methods
+(btree, hash, gist, gin, spgist, brin) have been pluggable far longer. MySQL's equivalent seam
+is much wider and much older — see below.
+
+**Access methods.** The btree AM descends three levels of `orders_pkey` and returns a TID —
+a `(block number, item offset)` pair. Because a PostgreSQL heap is unordered, the heap AM then
+fetches that block to get the row. InnoDB's primary-key index is *clustered*, so its leaf holds
+the row itself and the equivalent lookup ends one page earlier; switch engines in the visual
+and watch the page count drop from four to three.
+
+**Buffer pool.** Every one of those page reads is a request to the buffer manager: hash the
+`(relation, fork, block)` into the buffer table, pin the frame if it is resident, otherwise
+choose a victim by clock sweep, write it out if dirty, and read the page in. The hit/miss split
+here is the single biggest determinant of query latency, which is why the buffer-pool module spends
+seven pages on it.
+
+**Storage manager.** A miss becomes a real read: `smgr`/`md.c` maps `(relation, block)` onto a
+file descriptor and an offset under `base/<database oid>/<relfilenode>`, in 1 GB segments. The
+WAL lives in its own stream of pre-allocated, recycled 16 MB segments in `pg_wal`.
+
+That is the whole loop for a read. A write adds one thing — a log record, described at the end
+of this page and in detail in [the WAL primer](/p01-foundations/anatomy-of-a-database-engine/07-wal-primer-log-records-lsns-and-log-before-page/).
+
+## The four managers that cut across everything
+
+The layers above form a pipeline. The pieces that make it a *database* rather than a query
+engine over files do not sit in that pipeline at all — they are consulted from several layers
+at once. Hellerstein, Stonebraker and Hamilton's *Architecture of a Database System* (2007) is
+the canonical drawing of this, and the shape has not changed since.
+
+| Manager | What it owns | Who calls it | Where it goes wrong |
+|---|---|---|---|
+| Transaction manager | Transaction ids, snapshots, the list of in-flight transactions, commit ordering | Executor (to take a snapshot), access methods (visibility of each version) | A long-running transaction pins the snapshot horizon and blocks cleanup everywhere |
+| Lock manager | Logical locks — table, row, key range — with a wait-for graph for deadlock detection | Executor and access methods, for the length of the transaction | Lock waits, deadlock victims, DDL blocked behind a forgotten `BEGIN` |
+| Log manager | LSNs, the WAL buffer, the rule that the log record reaches durable storage before the page does | Access methods (emit records), buffer pool (may not evict ahead of the log), commit path (flush) | `fsync` latency becomes commit latency; log volume becomes replication lag |
+| Catalog / metadata | The engine's tables about your tables: `pg_class`, `pg_attribute`, `pg_statistic`, the InnoDB data dictionary, `sqlite_schema` | Binder, rewriter, optimizer, access methods | A catalog lock stalls parsing, planning and execution simultaneously |
+
+Select a manager column in the visual and its footprint lights up. The transaction and lock
+managers touch the executor *and* the access methods; the log manager touches the access
+methods, the buffer pool and the storage manager but never the parser; the catalog touches
+everything above the access methods. That asymmetry is why a parse-heavy workload and a
+lock-heavy workload look nothing alike in a profile.
+
+:::caution[A latch is not a lock]
+The lock manager handles *logical* locks: held for the duration of a transaction, tracked in a
+hash table, deadlock-detected. The buffer pool and the B-tree also use **latches** (PostgreSQL
+calls them LWLocks) — short-lived mutexes protecting an in-memory structure for a few
+instructions, never deadlock-detected, released before the call returns. They appear in
+monitoring as different wait event types (`Lock` vs `LWLock` in `pg_stat_activity`), they have
+different fixes, and conflating them is the most common vocabulary error in this subject. [The
+Buffer Pool](/p02-storage-engines/buffer-pool/01-buffer-pool-structure-frames-page-table-and-pins/)
+defines latches properly, where the structures they protect exist.
+:::
+
+## The seam: where a storage engine plugs in
+
+Somewhere between "executor" and "access methods" most systems draw a line and make everything
+below it replaceable. How wide that line is varies enormously.
+
+| System | The seam | What crosses it | What stays shared above |
+|---|---|---|---|
+| MySQL | `class handler` (`ha_innobase`, `ha_rocksdb`, `ha_myisam`, `ha_memory`) | `rnd_next()`, `index_read()`, `write_row()`, transaction callbacks, row estimates for the optimizer | Parser, optimizer, executor, the binlog — and *only* those |
+| PostgreSQL | Table access methods (`pg_am`, since 12) plus the much older index AM interface | Tuple slots, scan/insert/update/delete callbacks | Buffer pool, WAL, vacuum, the lock manager — an AM cannot bring its own log |
+| MongoDB | The storage engine API (WiredTiger, the default since 3.2) | Key-value record store, indexes, document-level concurrency | Query language, replication, the oplog |
+| CockroachDB / TiKV | A key-value store below the SQL/Raft layers — Pebble in CockroachDB, RocksDB in TiKV | `Get`/`Put`/`Scan` over encoded keys, snapshots | SQL, distribution, consensus, MVCC encoding |
+
+MySQL's seam is the widest in mainstream use, and the consequences are visible from the SQL
+prompt: `SHOW ENGINES` lists them, and MyRocks (an LSM tree) and InnoDB (a clustered B+tree)
+sit under the same parser with the same syntax and wildly different write amplification.
+Because the optimizer asks the engine for row estimates through handler methods, even the *plan*
+can differ per engine for identical SQL.
+
+PostgreSQL's seam is deliberately narrower. A table AM owns tuple layout and visibility but
+still writes to the shared WAL and lives in the shared buffer pool, which is exactly why a
+drop-in undo-based storage engine has been so hard to land: the pieces it would need to replace
+are not below the line.
+
+## Not every engine has every layer
+
+Toggle the engine in the visual and layers disappear rather than being renamed. Three cases
+worth internalising:
+
+- **RocksDB has no parser, binder, rewriter or optimizer at all.** Its API is the query
+  language: `Get(key)`, `Put(key, value)`, `NewIterator()`. There is no cost model because there
+  is no alternative plan to consider — the caller chose the access path when it chose the
+  method. Every plan decision in CockroachDB or TiKV happens above, in a SQL layer that treats
+  the store as a sorted byte-string map. The executor layer does not vanish so much as collapse
+  into the iterator, which merges the memtables and each SST level into one sorted stream.
+- **SQLite has no network layer and no separate bound-query representation.** It is a library:
+  `sqlite3_step()` runs on your thread, in your process, against a file, so concurrency is a
+  file-locking question rather than a connection-management one. Name resolution and code
+  generation are one pass, and the output is not an operator tree but a **VDBE program** — a
+  register machine whose opcodes `EXPLAIN` prints verbatim. Its pluggable seam is the VFS, one
+  layer *below* the storage manager: it replaces the operating system, not the storage engine,
+  which is how the same code runs on a phone, in a browser and over a filesystem it does not
+  trust.
+- **MySQL adds a layer PostgreSQL only half has.** The handler API shows up as its own row, and
+  the annotations above it (parser, optimizer) and below it (clustered B+tree, buffer pool)
+  belong to different codebases with different release cycles.
+
+Nothing about the *order* changes. No engine plans before it binds, and none lets the buffer
+pool answer a request the access method has not made.
+
+## Which module owns which layer, and which knob sizes it
+
+This is the map the rest of the course hangs on. Every knob below allocates or constrains
+exactly one layer; mixing them up is how servers get sized wrong.
+
+| Layer | Owning module | The knobs that size it |
+|---|---|---|
+| Wire protocol / connections | [Connections and Pooling](/p05-using-the-database-well/connections-pooling-and-process-models/01-connection-lifecycle-and-cost-tcp-tls-scram-and-process-per-/) | `max_connections` (100), `max_allowed_packet` |
+| Parser | [Parsing and the AST](/p03-query-processing/sql-to-logical-plan/01-parsing-and-the-ast/) | Compile-time limits; `sql_mode` in MySQL |
+| Binder / analyzer | [Binding and semantic analysis](/p03-query-processing/sql-to-logical-plan/02-binding-name-resolution-and-semantic-analysis/) | `search_path`; `table_open_cache`, `table_definition_cache` |
+| Rewriter | [Algebraic equivalences and rewrite rules](/p03-query-processing/sql-to-logical-plan/05-algebraic-equivalences-and-rewrite-rules/) | `row_security`; `optimizer_switch` |
+| Optimizer | [Cost-Based Optimization](/p03-query-processing/cost-based-optimization/01-cost-models-i-o-cpu-and-their-calibration/) | `random_page_cost` (4.0), `effective_cache_size` (4 GB), `geqo_threshold` (12), `optimizer_search_depth` |
+| Executor | [Execution Engines](/p03-query-processing/execution-engines-and-resource-control/01-volcano-iterator-model/) | `work_mem` (4 MB), `hash_mem_multiplier`, `max_parallel_workers_per_gather`, `join_buffer_size`, `sort_buffer_size` |
+| Access methods | [B-Trees](/p02-storage-engines/b-trees-and-variants/01-b-tree-structure-invariants-and-search/), [LSM Trees](/p02-storage-engines/lsm-trees/01-append-only-logs-and-bitcask-hash-indexes/) | `fillfactor`, `innodb_page_size` (16 KB), `write_buffer_size` (64 MB in RocksDB) |
+| Buffer pool | [The Buffer Pool](/p02-storage-engines/buffer-pool/01-buffer-pool-structure-frames-page-table-and-pins/) | `shared_buffers` (128 MB), `innodb_buffer_pool_size` (128 MB), `PRAGMA cache_size`, RocksDB `block_cache` |
+| Storage manager | [Pages, Tuples and Heap Files](/p02-storage-engines/pages-tuples-heap-files/01-page-anatomy-and-the-slotted-page/) | `wal_segment_size` (16 MB), `innodb_flush_method`, `PRAGMA journal_mode` |
+| Log manager | [Write-Ahead Logging](/p04-transactions-concurrency-control-and-recovery/write-ahead-logging-and-recovery/01-log-records-lsns-and-the-two-rules-of-write-ahead-logging/) | `wal_buffers`, `max_wal_size`, `full_page_writes`, `innodb_log_buffer_size` (16 MB), `innodb_flush_log_at_trx_commit` |
+| Transaction + lock managers | [Transactions](/p04-transactions-concurrency-control-and-recovery/transactions-and-isolation/01-acid-precisely/), [Locking](/p04-transactions-concurrency-control-and-recovery/lock-based-concurrency-control/01-two-phase-locking-and-strict-2pl/) | `max_locks_per_transaction`, `deadlock_timeout`, `innodb_lock_wait_timeout` |
+
+The defaults in that table are shipping defaults, not recommendations — `shared_buffers` at
+128 MB and `innodb_buffer_pool_size` at 128 MB are both sized to start on a laptop. Note also
+that the two are *not* the same decision: PostgreSQL deliberately keeps a modest pool and lets
+the kernel page cache hold the rest (so a page can be cached twice), while InnoDB is normally
+run with `innodb_flush_method=O_DIRECT` so the kernel does not cache the same pages again, and
+expects to own most of the machine's memory itself.
+
+## The one write-path fact you need before the next module
+
+Select the UPDATE statement in the visual. The ten layers do roughly what they did for the
+SELECT; what changes character is a manager that cuts across them. The log manager, which had
+nothing to do for the read, now emits a record
+describing the change, and the rule it enforces is absolute: **the log record must be durable
+before the modified page may be written home**. That is what makes recovery possible, and it is
+why the buffer pool is not allowed to evict a dirty page whenever it likes.
+
+Now tick "first write to the page since the checkpoint" with PostgreSQL selected, and the log
+volume for that one-row update jumps from a couple of hundred bytes to a full page. Tick it on
+the other three engines and nothing moves, because only PostgreSQL answers the torn-page
+problem inside the log record. PostgreSQL, with `full_page_writes`
+on, puts an entire 8 KB image of the page into the WAL the first time it is touched after a
+checkpoint, because a page torn by a partial hardware write cannot be repaired by a record that
+only describes a delta. InnoDB solves the same problem differently — it writes every dirty page
+twice, once into the doublewrite buffer and once home — and SQLite's WAL frames are always
+whole pages by construction. Three engines, three answers, one hardware fact underneath.
+
+The rest of the write path — where the new row version goes inside the page, what happens to the
+old one, how free space is tracked — needs the page layout defined first, so it belongs to
+[Pages, Tuples and Heap Files](/p02-storage-engines/pages-tuples-heap-files/01-page-anatomy-and-the-slotted-page/).
+
+## Where it bites in production
+
+- **Memory sized at the wrong layer.** `work_mem` is per node per worker, so 200 connections
+  running plans with two hash nodes each can commit to 400× the configured value. Servers are
+  OOM-killed far more often by the executor layer than by the buffer pool, because the buffer
+  pool's allocation is fixed at startup and the executor's is not.
+- **Blame assigned to the wrong box.** A slow query with a good plan and a bad hit rate is a
+  buffer-pool problem; the identical query with a bad plan is an optimizer problem; the same
+  query blocked for 30 s is a lock-manager problem. `EXPLAIN (ANALYZE, BUFFERS)` separates the
+  first two (`shared hit` vs `shared read`), and `pg_stat_activity.wait_event_type` separates
+  the third (`Lock`, `LWLock`, `IO`, `Client`).
+- **Parse and plan cost on short queries.** For a statement that touches four pages, planning
+  can cost more than execution. PostgreSQL caches plans for prepared statements, using a custom
+  plan for the first five executions and then switching to a generic one if it is not more
+  expensive (`plan_cache_mode` overrides the choice). A driver that sends unparameterised SQL
+  never reaches that cache, and pays the parser, binder and optimizer on every request.
+- **Catalog contention during deploys.** A migration taking an `ACCESS EXCLUSIVE` lock does not
+  just block writers: the binder needs `AccessShareLock` on the same relation, so new queries
+  pile up *before* they are even planned. The pileup looks like a connection-pool exhaustion
+  incident and is a catalog-lock incident.
+- **A seam you forgot exists.** On MySQL, one surviving
+  `SELECT table_schema, table_name FROM information_schema.tables WHERE engine = 'MyISAM'` hit
+  means part of your database is non-transactional and outside the redo log — invisible from the
+  SQL layer above the handler API, and not covered by a point-in-time restore the way InnoDB is.
+
+:::note[What to take forward]
+Ten layers in a fixed order — wire, parser, binder, rewriter, optimizer, executor, seam, access
+methods, buffer pool, storage manager — with the transaction, lock, log and catalog managers
+consulted from several of them at once. Engines differ by which layers exist and how wide the
+storage seam is, not by the order. Every knob you will tune belongs to exactly one layer, and
+every mechanism in the rest of this course is an expansion of exactly one box on this map.
+:::

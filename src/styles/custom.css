@@ -1,0 +1,412 @@
+/* ============================================================================
+   db-internals design system
+   ----------------------------------------------------------------------------
+   Starlight stamps data-theme="light" | "dark" on <html>.
+   Visualization panels (.viz) carry their OWN surface (the validated reference
+   chart surfaces) so the categorical palette stays validated against the
+   surface it actually renders on, independent of Starlight theme tweaks.
+   ========================================================================= */
+
+/* ---- Starlight accent + gray ramps (blue, matching series slot 1) -------- */
+:root {
+  --sl-color-accent-low: #104281;
+  --sl-color-accent: #256abf;
+  --sl-color-accent-high: #9ec5f4;
+  --sl-color-white: #ffffff;
+  --sl-color-gray-1: #eceef2;
+  --sl-color-gray-2: #c0c2c7;
+  --sl-color-gray-3: #888b96;
+  --sl-color-gray-4: #545861;
+  --sl-color-gray-5: #353841;
+  --sl-color-gray-6: #24272f;
+  --sl-color-black: #17181c;
+}
+
+:root[data-theme='light'] {
+  --sl-color-accent-low: #cde2fb;
+  --sl-color-accent: #256abf;
+  --sl-color-accent-high: #104281;
+  --sl-color-white: #17181c;
+  --sl-color-gray-1: #24272f;
+  --sl-color-gray-2: #353841;
+  --sl-color-gray-3: #545861;
+  --sl-color-gray-4: #888b96;
+  --sl-color-gray-5: #c0c2c7;
+  --sl-color-gray-6: #eceef2;
+  --sl-color-gray-7: #f5f6f8;
+  --sl-color-black: #ffffff;
+}
+
+/* ---- Visualization tokens ------------------------------------------------
+   Light values on :root; dark redefined under the dark theme scope only.
+   Every color has its definition on bare :root first.
+   ------------------------------------------------------------------------ */
+:root {
+  /* surfaces + ink */
+  --viz-surface: #fcfcfb;
+  --viz-plane: #f9f9f7;
+  --viz-ink: #0b0b0b;
+  --viz-ink-2: #52514e;
+  --viz-ink-muted: #898781;
+  --viz-grid: #e1e0d9;
+  --viz-axis: #c3c2b7;
+  --viz-border: rgba(11, 11, 11, 0.1);
+
+  /* categorical slots — fixed order, never cycled */
+  --viz-1: #2a78d6; /* blue */
+  --viz-2: #eb6834; /* orange */
+  --viz-3: #1baf7a; /* aqua */
+  --viz-4: #eda100; /* yellow */
+  --viz-5: #e87ba4; /* magenta */
+  --viz-6: #008300; /* green */
+  --viz-7: #4a3aa7; /* violet */
+  --viz-8: #e34948; /* red */
+
+  /* sequential (blue) — magnitude */
+  --viz-seq-100: #cde2fb;
+  --viz-seq-250: #86b6ef;
+  --viz-seq-400: #3987e5;
+  --viz-seq-550: #1c5cab;
+  --viz-seq-700: #0d366b;
+
+  /* diverging midpoint */
+  --viz-neutral: #f0efec;
+
+  /* status — reserved, never used as a series color */
+  --viz-good: #0ca30c;
+  --viz-warning: #fab219;
+  --viz-serious: #ec835a;
+  --viz-critical: #d03b3b;
+
+  /* semantic roles used across database visuals */
+  --viz-clean: var(--viz-1); /* clean / committed / durable */
+  --viz-dirty: var(--viz-2); /* dirty / uncommitted / in-memory only */
+  --viz-stale: var(--viz-ink-muted); /* dead / invalid / garbage */
+  --viz-radius: 10px;
+}
+
+:root[data-theme='dark'] {
+  --viz-surface: #1a1a19;
+  --viz-plane: #0d0d0d;
+  --viz-ink: #ffffff;
+  --viz-ink-2: #c3c2b7;
+  --viz-ink-muted: #898781;
+  --viz-grid: #2c2c2a;
+  --viz-axis: #383835;
+  --viz-border: rgba(255, 255, 255, 0.1);
+
+  --viz-1: #3987e5;
+  --viz-2: #d95926;
+  --viz-3: #199e70;
+  --viz-4: #c98500;
+  --viz-5: #d55181;
+  --viz-6: #008300;
+  --viz-7: #9085e9;
+  --viz-8: #e66767;
+
+  --viz-seq-100: #cde2fb;
+  --viz-seq-250: #86b6ef;
+  --viz-seq-400: #3987e5;
+  --viz-seq-550: #1c5cab;
+  --viz-seq-700: #184f95;
+
+  --viz-neutral: #383835;
+}
+
+/* ---- Visualization shell ------------------------------------------------ */
+.viz {
+  color-scheme: light;
+  background: var(--viz-surface);
+  color: var(--viz-ink);
+  border: 1px solid var(--viz-border);
+  border-radius: var(--viz-radius);
+  padding: 1rem;
+  margin: 1.75rem 0;
+  font-size: 0.875rem;
+  line-height: 1.5;
+  container-type: inline-size;
+}
+
+:root[data-theme='dark'] .viz {
+  color-scheme: dark;
+}
+
+.viz-title {
+  font-size: 0.9375rem;
+  font-weight: 600;
+  margin: 0 0 0.125rem;
+  color: var(--viz-ink);
+}
+
+.viz-sub {
+  margin: 0 0 0.875rem;
+  color: var(--viz-ink-2);
+  font-size: 0.8125rem;
+}
+
+/* Controls sit in one row above the figure. */
+.viz-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.625rem 1rem;
+  align-items: center;
+  margin-bottom: 0.875rem;
+}
+
+.viz-control {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  min-width: 0;
+}
+
+.viz-control > span {
+  font-size: 0.75rem;
+  color: var(--viz-ink-2);
+  white-space: nowrap;
+}
+
+.viz-control output {
+  font-variant-numeric: tabular-nums;
+  color: var(--viz-ink);
+  font-weight: 600;
+}
+
+.viz input[type='range'] {
+  accent-color: var(--viz-1);
+  width: clamp(7rem, 18vw, 12rem);
+  margin: 0;
+}
+
+.viz button,
+.viz select {
+  font: inherit;
+  color: var(--viz-ink);
+  background: var(--viz-plane);
+  border: 1px solid var(--viz-border);
+  border-radius: 6px;
+  padding: 0.3rem 0.7rem;
+  cursor: pointer;
+}
+
+.viz button:hover:not(:disabled),
+.viz select:hover {
+  border-color: var(--viz-1);
+}
+
+.viz button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.viz button[data-variant='primary'] {
+  background: var(--viz-1);
+  border-color: var(--viz-1);
+  color: #ffffff;
+}
+
+.viz :is(button, select, input, [tabindex]):focus-visible {
+  outline: 2px solid var(--viz-1);
+  outline-offset: 2px;
+}
+
+/* Segmented toggle */
+.viz-seg {
+  display: inline-flex;
+  border: 1px solid var(--viz-border);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.viz-seg button {
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
+
+.viz-seg button[aria-pressed='true'] {
+  background: var(--viz-1);
+  color: #ffffff;
+}
+
+/* Figure + wide content scrolls inside its own box, never the page. */
+.viz-figure {
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+}
+
+.viz svg {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  overflow: visible;
+}
+
+.viz text {
+  font-family: inherit;
+  fill: var(--viz-ink-2);
+  font-size: 11px;
+}
+
+.viz .viz-axis-line {
+  stroke: var(--viz-axis);
+  stroke-width: 1;
+}
+
+.viz .viz-grid-line {
+  stroke: var(--viz-grid);
+  stroke-width: 1;
+}
+
+/* Legend — always present for >= 2 series. */
+.viz-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.375rem 1rem;
+  margin-top: 0.75rem;
+  font-size: 0.75rem;
+  color: var(--viz-ink-2);
+}
+
+.viz-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+}
+
+.viz-swatch {
+  width: 10px;
+  height: 10px;
+  border-radius: 3px;
+  flex: none;
+  background: var(--viz-ink-muted);
+}
+
+/* Readouts / stat tiles */
+.viz-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(7.5rem, 1fr));
+  gap: 0.75rem;
+  margin-top: 0.875rem;
+}
+
+.viz-stat {
+  background: var(--viz-plane);
+  border: 1px solid var(--viz-border);
+  border-radius: 8px;
+  padding: 0.5rem 0.625rem;
+}
+
+.viz-stat-label {
+  font-size: 0.6875rem;
+  color: var(--viz-ink-2);
+  margin-bottom: 0.125rem;
+}
+
+.viz-stat-value {
+  font-size: 1.125rem;
+  font-weight: 600;
+  color: var(--viz-ink);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Tooltip */
+.viz-tooltip {
+  position: absolute;
+  z-index: 5;
+  pointer-events: none;
+  background: var(--viz-surface);
+  color: var(--viz-ink);
+  border: 1px solid var(--viz-border);
+  border-radius: 6px;
+  padding: 0.375rem 0.5rem;
+  font-size: 0.75rem;
+  box-shadow: 0 4px 14px rgb(0 0 0 / 0.14);
+  max-width: 18rem;
+}
+
+/* Narration line under a step-through */
+.viz-note {
+  margin-top: 0.75rem;
+  padding: 0.5rem 0.625rem;
+  border-left: 3px solid var(--viz-1);
+  background: var(--viz-plane);
+  border-radius: 0 6px 6px 0;
+  color: var(--viz-ink-2);
+  font-size: 0.8125rem;
+  min-height: 2.5rem;
+}
+
+.viz-note strong {
+  color: var(--viz-ink);
+}
+
+/* Data table fallback (identity never by color alone) */
+.viz-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.75rem;
+  margin-top: 0.75rem;
+}
+
+.viz-table :is(th, td) {
+  text-align: left;
+  padding: 0.25rem 0.5rem;
+  border-bottom: 1px solid var(--viz-grid);
+  font-variant-numeric: tabular-nums;
+}
+
+.viz-table th {
+  color: var(--viz-ink-2);
+  font-weight: 600;
+}
+
+.viz details.viz-data {
+  margin-top: 0.5rem;
+  font-size: 0.75rem;
+  color: var(--viz-ink-2);
+}
+
+.viz details.viz-data summary {
+  cursor: pointer;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .viz * {
+    transition: none !important;
+    animation: none !important;
+  }
+}
+
+/* ---- Page chrome -------------------------------------------------------- */
+.depth-badge {
+  display: inline-block;
+  font-size: 0.6875rem;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  padding: 0.125rem 0.5rem;
+  border-radius: 999px;
+  border: 1px solid var(--viz-border);
+  color: var(--sl-color-gray-2);
+}
+
+/* Key-idea callout used at the top of each page */
+.takeaway {
+  border-left: 3px solid var(--sl-color-accent);
+  background: var(--sl-color-gray-7, var(--sl-color-gray-6));
+  padding: 0.75rem 1rem;
+  border-radius: 0 8px 8px 0;
+  margin: 1.25rem 0;
+}
+
+.takeaway p:last-child {
+  margin-bottom: 0;
+}
+
+/* Wide tables in prose scroll themselves, not the page. */
+.sl-markdown-content table {
+  display: block;
+  overflow-x: auto;
+  max-width: 100%;
+}

@@ -1,0 +1,241 @@
+---
+title: Prefetching and asynchronous reads
+description: Why a scan at queue depth 1 leaves an NVMe drive 90% idle, how Linux readahead, PostgreSQL's effective_io_concurrency and read streams, InnoDB's linear read-ahead and RocksDB's iterator readahead each guess at the future, and what a wrong guess costs in bandwidth and frames.
+depth: intermediate
+sidebar:
+  order: 7
+---
+
+import PrefetchDepthScanTimeline from '../../../../components/viz/PrefetchDepthScanTimeline';
+
+A buffer pool miss costs somewhere around 100 µs on NVMe and 10 ms on a spinning disk, while the
+work the executor does with the page it gets back costs tens of microseconds. A scan that asks for
+one page, waits, processes it, and then asks for the next therefore spends almost all of its life
+blocked, and the drive spends almost all of its life idle — an NVMe SSD reaching its rated IOPS
+only when dozens of requests are outstanding sees exactly one. Prefetching is the buffer pool's
+attempt to have the page already on its way before anyone asks for it, and every part of the design
+follows from the fact that it is a *guess*.
+
+<PrefetchDepthScanTimeline client:visible />
+
+Start at depth 0 and watch the shape: one device lane busy, seven idle, the CPU row almost entirely
+stall. Raise the depth and the stalls close up until roughly four reads are in flight, and then
+stop — the consumer cannot eat faster than 25 µs per page no matter how much you queue. Now switch
+the demand pattern to strided: the kernel's guess is still right about *direction* and wrong about
+*density*, so it reads three blocks for every one the scan wants. Switch to random and readahead
+stops firing at all, at every depth — while engine prefetch, which reads a block list it already
+computed, is unaffected. That last contrast is the whole reason `effective_io_concurrency` exists.
+
+## Little's law sets the depth, and nothing else does
+
+The relationship is not a heuristic. For a system in steady state, Little's law says the number of
+requests in flight equals throughput times latency:
+
+```
+in-flight = throughput × latency
+```
+
+Turn it around for a scan. If the consumer needs a new page every `C` microseconds and a read takes
+`L` microseconds, you need `L / C` reads outstanding to never stall. A 90 µs NVMe read and 25 µs of
+CPU per page needs four. A network volume answering in roughly 700 µs — provisioned EBS is in that
+class — needs twenty-eight. Ten milliseconds of HDD seek and the same CPU needs four hundred, which is why prefetch on spinning
+rust was always about *sequentiality* rather than depth — you cannot buy your way out of a seek with
+concurrency.
+
+Below that depth you are latency-bound and the device idles. Above it, the extra requests do not
+make anything faster; they queue, and queueing shows up as response time rising linearly with depth
+while throughput stays flat. That is the knee, and it is why "set the queue depth to 1000" is never
+the answer. It is also why the same ratio, read latency over per-page CPU, is what every engine is
+really asking you for, even though each expresses it in different units: PostgreSQL as a literal count
+of concurrent requests (`effective_io_concurrency`), InnoDB as *whole extents* read ahead and a pool
+of `innodb_read_io_threads` to execute them, RocksDB as a readahead *size* that only becomes a depth
+once you divide it by the block size.
+
+## Two parties can guess, and they know different things
+
+**The kernel** sees a stream of block offsets arriving at a file descriptor and nothing else. Linux
+keeps a `struct file_ra_state` per open file — the last position read, the current window size, and
+a marker page — and runs the on-demand readahead algorithm in `mm/readahead.c`. When a miss looks
+like the continuation of an ascending run, it reads a window ahead of the request and tags one page
+inside it; when the application touches the tagged page, the kernel starts the *next* window
+asynchronously, so the application never catches up with the front of the readahead. The window
+grows by doubling up to `ra_pages`, which comes from `/sys/block/<dev>/queue/read_ahead_kb` and
+defaults to 128 KB (`blockdev --getra` reports the same thing in 512-byte sectors, so the default
+prints as 256).
+
+An application can steer that machinery directly:
+
+| Advice | Effect on Linux |
+|---|---|
+| `POSIX_FADV_SEQUENTIAL` | doubles `ra_pages` for this file description |
+| `POSIX_FADV_RANDOM` | sets `ra_pages` to 0 — readahead off, every read is exactly what you asked for |
+| `POSIX_FADV_WILLNEED` | starts an asynchronous read of the given range into the page cache now |
+| `POSIX_FADV_DONTNEED` | drops clean page-cache pages for the range |
+| `POSIX_FADV_NOREUSE` | a no-op on Linux for most of its life; since 6.3 it demotes the range, and only when MGLRU is enabled |
+| `readahead(2)` | the same thing as `WILLNEED`, as its own syscall |
+
+The advice is exactly that: advisory. Nothing tells you whether the page arrived, nothing reserves
+memory for it, and a page prefetched into the page cache can be evicted again before the reader
+reaches it. And all of it vanishes under `O_DIRECT`, which has no page cache to read ahead into —
+the engines that use direct I/O have no choice but to prefetch themselves. That trade-off is
+[Direct I/O and io_uring](/p01-foundations/hardware-os-durability/09-direct-i-o-and-io-uring-alignment-submission-and-completion/).
+
+**The engine** knows things the kernel cannot infer. It knows a bitmap heap scan will visit exactly
+these 900 block numbers in this order. It knows the sequential scan is going to read the relation
+end to end. It knows the merge is about to consume four sorted runs in parallel. Prefetch issued
+from there is never wrong about *which* page — only about *how many* to have in flight, and that is
+the one number Little's law already answers.
+
+## PostgreSQL: advice, then streams, then real asynchronous I/O
+
+PostgreSQL reads through the OS page cache, so kernel readahead has always done the heavy lifting
+for sequential scans. The gap was everything that is *not* physically sequential, and the canonical
+case is the bitmap heap scan: the index produces TIDs, the bitmap sorts them into block order, and
+the heap is then visited in ascending block order — but with gaps, so the kernel's detector cannot
+be relied on. `PrefetchBuffer()` issues `posix_fadvise(POSIX_FADV_WILLNEED)` for blocks the scan is
+about to reach, keeping `effective_io_concurrency` of them in flight. The default was `1`
+from its introduction through PostgreSQL 17 — a number that made sense for a single 7200 rpm disk
+and is absurd on NVMe; before PostgreSQL 13 the setting was not even a plain count, it was pushed
+through a formula that converted "number of spindles" into a prefetch distance.
+`maintenance_io_concurrency` is the same knob for VACUUM and other maintenance work and defaulted to
+10. PostgreSQL 18 raised both defaults to 16, so on 17 and earlier raising it yourself is the first
+thing to do on NVMe. Both can be set per tablespace, which is the right granularity when one
+tablespace is NVMe and another is network storage:
+
+```sql
+ALTER TABLESPACE fast SET (effective_io_concurrency = 64);
+```
+
+Prefetching into the *kernel's* cache has two structural weaknesses, and the lab shows both. The
+page lands in the page cache, not in `shared_buffers`, so the real read still happens later and
+still copies; and nothing pins it, so under memory pressure it can be evicted before the scan
+arrives — a read that cost bandwidth and delivered nothing.
+
+PostgreSQL 17 introduced the **streaming read API** (`read_stream.c`): a consumer hands the stream a
+callback that returns the next block number it will want, and calls `read_stream_next_buffer()` to
+get buffers back. The stream looks ahead on its own, and because it sees several block numbers at
+once it can merge adjacent ones into a single larger read — `io_combine_limit`, 128 KB by default —
+issued as one vectored `preadv` instead of sixteen 8 KB `pread` calls. Sequential scans and ANALYZE
+were converted first, with more scan types following.
+
+PostgreSQL 18 put a real asynchronous I/O subsystem underneath it. `io_method` selects how reads are
+executed: `sync` (the old behaviour), `worker` (the default — a small pool of `io_workers`, 3 by
+default, performs the reads), or `io_uring` on Linux builds that have it. Reads now complete
+*directly into shared buffers*, which removes the double copy and the eviction hole in one move:
+the buffer is allocated and pinned before the I/O is issued, so a prefetched page cannot be thrown
+away before use. That is the difference between the engine-prefetch and OS-readahead settings in
+the lab, made real.
+
+## InnoDB: read-ahead keyed on the extent
+
+InnoDB's buffer pool is the whole cache — production configurations commonly run
+`innodb_flush_method = O_DIRECT` precisely so the same page is not also sitting in the page cache —
+so read-ahead has to be InnoDB's own job. Its unit is the **extent**: 64 pages, 1 MB at the default
+16 KB page size.
+
+- **Linear read-ahead.** If at least `innodb_read_ahead_threshold` pages of an extent have been
+  accessed in order, InnoDB asynchronously requests the whole following extent. The default is 56
+  of 64, and the range is 0–64; setting it to 0 disables linear read-ahead. This is a deliberately
+  conservative detector: it wants strong evidence of a real scan before it spends 1 MB of bandwidth
+  on a guess.
+- **Random read-ahead.** If 13 consecutive pages from the same extent are already in the buffer
+  pool, InnoDB reads the rest of the extent — the trigger is residency, not the order they were
+  touched in. It was removed in MySQL 5.5 for doing more harm
+  than good, reinstated in 5.6 behind `innodb_random_read_ahead`, and remains **off** by default.
+
+The two status counters are the honest scoreboard, and every InnoDB installation should be graphing
+their ratio:
+
+```sql
+SHOW GLOBAL STATUS LIKE 'Innodb_buffer_pool_read_ahead%';
+-- Innodb_buffer_pool_read_ahead          pages brought in by read-ahead
+-- Innodb_buffer_pool_read_ahead_rnd      of those, by random read-ahead
+-- Innodb_buffer_pool_read_ahead_evicted  read ahead, then evicted without ever being read
+```
+
+`_evicted` approaching `_read_ahead` is the "wasted" bar in the lab measured on a live server: you
+are paying full price in device bandwidth and in frames taken from pages someone wanted. The reads
+themselves are issued asynchronously by `innodb_read_io_threads` (4 by default, up to 64) using
+native AIO when `innodb_use_native_aio` is on.
+
+## RocksDB: readahead as a property of the iterator
+
+An LSM tree has two very different read paths, and it prefetches for both. Compaction is the pure
+streaming case — read several SSTables end to end, write one — and
+`compaction_readahead_size` (2 MB in recent releases) covers it; the value matters most under direct
+I/O, where nothing else will do the readahead.
+
+Range scans are the interesting case. A RocksDB iterator reads blocks within a file in ascending
+offset order, so it can do the detection itself: after `num_file_reads_for_auto_readahead`
+sequential block reads in a file (2 by default) it starts reading ahead, beginning at 8 KB and
+doubling up to `max_auto_readahead_size`, 256 KB by default. `ReadOptions::readahead_size` overrides
+the whole heuristic when the caller already knows it is doing a big scan, and
+`ReadOptions::async_io` makes the iterator issue the next block's read asynchronously — backed by
+`io_uring` when RocksDB is built against liburing — so the block arrives while the current one is
+being decoded. Point lookups get the same treatment in bulk through `MultiGet`, which issues the
+per-file reads for a batch of keys in parallel rather than one dependent read at a time.
+
+## What prefetching cannot help: the dependent chain
+
+A B+tree descent reads the root, inspects it to learn which branch page to read, reads that, and so
+on. Each read's *address* is inside the previous read's *contents*. No amount of queue depth
+removes that: the concurrency of a pointer chase is 1 by construction, and a four-level index costs
+four serial latencies. Little's law here works against you — the only levers are fan-out (fewer
+levels) and caching (the upper levels are hot and effectively free).
+
+Leaf-to-leaf traversal is the one place an index can prefetch, because leaves carry sibling
+pointers: `btpo_next` and `btpo_prev` in PostgreSQL's `BTPageOpaqueData`, `FIL_PAGE_NEXT` and
+`FIL_PAGE_PREV` in InnoDB's page header. Holding leaf *N* you already know the address of leaf
+*N+1*, so a range scan can issue that read while it processes the current leaf — one step of
+lookahead, and only one, because leaf *N+2*'s address lives inside *N+1*. Going deeper requires
+either reading ahead physically (which only works while the index is unfragmented) or, as
+PostgreSQL's read stream does, generating block numbers from something other than the chain.
+
+The bigger prize is the *heap* fetches an index scan drives, which are independent of each other and
+therefore perfectly prefetchable — as long as somebody sorts them first. That is precisely what a
+bitmap heap scan does, and it is why the planner switches to it as selectivity rises: not because
+reading a bitmap is cheaper, but because block-ordered, prefetchable heap access is. Physical
+correlation decides how well that pays off; `pg_stats.correlation` for the leading index column is
+the number the planner uses, and an index whose key order has drifted from heap order turns every
+leaf-sibling step into a seek.
+
+## Where it bites in production
+
+- **A bitmap heap scan running at 1/50th of the drive.** `effective_io_concurrency = 1` on NVMe,
+  with the query spending its life in `DataFileRead` waits while `iostat -x` shows `aqu-sz` near 1
+  and the device 95% idle. The fix is one `SET` in the session, or the per-tablespace setting.
+- **Read amplification from readahead on random workloads.** `rkB/s` several times the engine's
+  logical read rate, and `rareq-sz` in `iostat -x` showing 128 KB average read size when the engine
+  reads 8 KB pages. On an OLTP host doing scattered index lookups, `read_ahead_kb` is spending
+  bandwidth and page cache on pages nobody wants; on an analytics host doing large scans, the same
+  default is too *small* and raising it to 512 KB or 1 MB is the win. There is no value that is right
+  for both, which is one reason mixed workloads are best separated at the device or instance level.
+- **`Innodb_buffer_pool_read_ahead_evicted` tracking `Innodb_buffer_pool_read_ahead`.** Read-ahead is
+  doing pure damage: bandwidth spent, frames taken, nothing consumed. Check whether
+  `innodb_random_read_ahead` was turned on by an old runbook, and consider raising
+  `innodb_read_ahead_threshold` toward 64.
+- **One analytic query raising p99 for everyone.** A deep prefetch queue is not polite. Fill a
+  device's queue with 64 speculative reads and the point lookup that arrives next waits behind them —
+  head-of-line blocking that shows up as OLTP latency doubling whenever a report runs. Depth is a
+  per-session setting for exactly this reason; below that, cgroup v2 `io.latency` or separate
+  instances are the real isolation.
+- **Cloud storage rewrites the arithmetic.** Network block storage has millisecond-class latency, so
+  Little's law demands a much deeper queue than local NVMe for the same throughput — but the
+  provisioned IOPS ceiling means requests past that ceiling just queue, and latency climbs. Deep
+  prefetch on a throttled volume converts a bandwidth problem into a latency problem.
+- **Prefetch that outruns the pool.** The lab's most violent failure: a window wider than the frames
+  available means pages are read, evicted before use, and read again. Engines avoid it structurally —
+  PostgreSQL's read stream pins each buffer it has queued, so the window is bounded by frames the
+  scan may hold, and the scan-resistance machinery in
+  [sequential flooding and ring buffers](/p02-storage-engines/buffer-pool/05-scan-resistance-sequential-flooding-ring-buffers-and-midpoin/)
+  keeps the trail behind the scan from taking frames from the window in front of it.
+
+:::note[What to take forward]
+Prefetch depth is not a tuning superstition: it is `read latency ÷ per-page CPU`, the number
+Little's law gives you, and past it extra requests only queue. The kernel can only guess from the
+block numbers it has already seen, so it wins on sequential access and is useless on anything
+scattered; the engine knows the block list in advance, which is why every serious engine issues its
+own — `effective_io_concurrency` and read streams in PostgreSQL, extent read-ahead in InnoDB,
+iterator readahead in RocksDB. And a wrong guess is never free: it costs device bandwidth for pages
+nobody wants, and a frame that a page somebody did want could have had.
+:::

@@ -1,0 +1,245 @@
+---
+title: "Why fanout B: the external-memory model, optimality bounds and cache-oblivious layouts"
+description: The DAM model in which scanning costs N/B and searching costs log_B N, the lower bounds that make the B+tree provably optimal, why sorting beats N inserts by a factor of B, and why engines hard-code a page size anyway.
+depth: deep
+sidebar:
+  order: 8
+---
+
+import ExternalMemoryCostLab from '../../../../components/viz/ExternalMemoryCostLab';
+import PermutationBoundRace from '../../../../components/viz/PermutationBoundRace';
+
+Every structural choice in the previous seven pages — a node the size of a page, a fanout in
+the hundreds, leaves chained in key order, a bulk load that sorts first — is a consequence of
+one model with two parameters. The model is old, crude, and it predicts real B-tree costs
+better than anything more detailed. It also comes with lower bounds, which is the part worth
+your attention: the B+tree is not merely a good idea, it is *provably* the best possible shape
+for a searchable structure in that model, and the sort-then-build of a bulk load provably beats
+inserting the same rows one at a time by a factor of roughly B.
+
+<ExternalMemoryCostLab client:visible />
+
+## The model: M, B, and the only thing you count
+
+The **external-memory model** (Aggarwal and Vitter, 1988), also called the DAM model for
+*disk access machine*, says: there is an internal memory holding **M** records and an unbounded
+external memory, and data moves between them only in **blocks of B records**. Computation on
+data already in memory is free. The cost of an algorithm is the number of **block transfers**.
+
+That is the whole model, and the "computation is free" part is exactly why it works. When the
+gap between a DRAM access and an SSD read is a factor of a few hundred, and a HDD seek a factor
+of 10⁵, counting anything else is noise. Four results follow, and they are the entire
+vocabulary of this page:
+
+| Problem | Cost in block transfers |
+|---|---|
+| Scan N records | Θ(N/B) |
+| Search a static ordered set | Θ(log<sub>B</sub> N) |
+| Sort N records | Θ((N/B)·log<sub>M/B</sub>(N/B)) |
+| Permute N records | Θ(min(N, (N/B)·log<sub>M/B</sub>(N/B))) |
+
+Put real numbers in. With 8 KB pages and 16-byte index entries, B is about 500 entries. A
+billion-row index is log<sub>500</sub>(10⁹) ≈ 3.3, so four levels; the root and the level below
+it are a few megabytes and live in the [buffer pool](/p02-storage-engines/buffer-pool/01-buffer-pool-structure-frames-page-table-and-pins/)
+permanently, which is why a point lookup on a well-behaved index costs **one or two physical
+reads**, not four. That is the number the model exists to produce, and the lab above measures
+it: set N to 10⁹, and watch the measured B+tree line sit well under the dashed analytic one,
+because the analytic line assumes a cold cache and the measurement does not.
+
+## Why log<sub>B</sub> N is a floor, not a happy accident
+
+A comparison-based search can do nothing with a block except learn where the target sits among
+the B keys it contains. One block transfer therefore narrows the candidate set to one of at most
+B+1 gaps — it yields log₂(B+1) bits. After t transfers you can have distinguished at most
+(B+1)<sup>t</sup> candidates, so finding one of N requires
+
+```
+t ≥ log_(B+1) N
+```
+
+transfers. No layout, no clever encoding and no amount of memory changes it, and a B+tree with
+fanout B achieves it. This is the sense in which the B-tree is *optimal*, and it is why fanout
+is the one dimension of a B-tree you cannot trade away: doubling the entry size halves the
+fanout, which does not double the depth but does push it across an integer boundary sooner,
+and each boundary crossed is one more physical read per lookup. Everything on
+[key layout, prefix compression and suffix truncation](/p02-storage-engines/b-trees-and-variants/06-key-layout-prefix-compression-and-suffix-truncation/)
+is an attack on that one number.
+
+The scan bound is even blunter: reading N records that live in N/B blocks costs N/B transfers,
+so a sequential scan is optimal by construction and an index that forces one random read per
+row is N transfers — a factor of B worse. That single ratio is what an optimizer's crossover
+point between an index scan and a sequential scan is approximating.
+
+:::caution[The model lies in one direction, usefully]
+The DAM model charges nothing for CPU, and at large B that becomes wrong. A 16 KB page holds
+~1000 entries; the binary search inside it (`_bt_binsrch` in Postgres) is ~10 dependent DRAM
+accesses, each a likely cache miss, and it happens on every level of every descent. A page size
+tuned only on the I/O model will be too large for a workload whose working set is already in
+memory. The model's answer is "bigger B is never worse"; reality's answer is "until you are
+CPU-bound inside the page".
+:::
+
+## Sorting, permuting, and why bulk loading wins by a factor of B
+
+Building an index is a permutation: N entries arrive in heap order and must end up in key
+order. The permutation bound above says that costs Θ(min(N, sort(N))) — and that `min` is not
+an artifact, it is two genuinely different strategies. Move the records one at a time and you
+pay ~1 transfer each, giving N. Sort them in bulk and you pay (N/B)·log<sub>M/B</sub>(N/B).
+For any realistic B and M, the second is smaller by roughly B / (2·log<sub>M/B</sub>(N/B)) —
+two orders of magnitude.
+
+<PermutationBoundRace client:visible />
+
+The shape of each lane is worth reading carefully. The **sort lane** is linear and its slope
+changes only in steps: with M = 64 MB and B = 8 KB, one merge pass fans in M/B ≈ 8000 runs, so
+a 100 GB sort (1600 runs) needs a single merge pass and a 10 TB sort needs two. Merge passes
+are a step function of M, which is why raising `maintenance_work_mem` from 64 MB to 1 GB
+sometimes halves an index build and sometimes changes nothing at all — it depends only on which
+side of a `log_{M/B}` boundary you land.
+
+The **insert lane** is flat and then convex. While the growing index fits in M, inserts cost
+nothing: every leaf you touch is already resident. The moment the index exceeds memory, each
+random insert pays a leaf read plus an eventual leaf write, and the cost per record climbs to
+~2. This is the same cliff as the working-set cliff from
+[the memory hierarchy](/p01-foundations/hardware-os-durability/01-memory-hierarchy-and-latency-numbers/),
+and it is why an index build that looked fine on a 10 GB test dataset runs overnight on the
+100 GB production one. The gap between the two lanes never closes, because it is a theorem —
+and it is why [bulk loading](/p02-storage-engines/b-trees-and-variants/05-bulk-loading-and-index-construction/)
+sorts first rather than replaying inserts.
+
+## The insert/query curve: B-trees, Bε-trees and LSMs are three points on it
+
+The B+tree spends its entire I/O budget making queries cheap. An insert costs the same
+log<sub>B</sub> N as a lookup, and — worse — it dirties a whole page to write ~16 useful bytes.
+Brodal and Fagerberg (2003) showed the full tradeoff and proved it tight: a dictionary can buy
+cheaper inserts with more expensive queries along a single optimal curve, parameterised by
+ε ∈ (0,1]:
+
+| Structure | Insert (amortized I/Os) | Point query (I/Os) | Range query |
+|---|---|---|---|
+| B+tree (ε = 1) | O(log<sub>B</sub> N) | O(log<sub>B</sub> N) | optimal: descent + k/B |
+| B<sup>ε</sup>-tree, ε = ½ | O(log<sub>B</sub> N / √B) | O(log<sub>B</sub> N) | descent + k/B |
+| B<sup>ε</sup>-tree, general ε | O(log<sub>B</sub> N / (ε·B<sup>1−ε</sup>)) | O(log<sub>B</sub> N / ε) | descent + k/B |
+| Leveled LSM, ratio T | O((T/B)·log<sub>T</sub>(N/M)) | O(log<sub>T</sub>(N/M)) runs, ≈1 with Bloom filters | merge of all runs |
+| Logging, no index | O(1/B) | O(N/B) | O(N/B) |
+
+The mechanism behind the Bε-tree row is the same one in all of them: **buffer the writes where
+they are cheap and move them in blocks**. A node with fanout B<sup>ε</sup> spends the rest of
+its page on a message buffer, and a message is only pushed down a level when B<sup>1−ε</sup>
+messages travel together — so one transfer carries B<sup>1−ε</sup> inserts instead of one.
+This module stops at the bound; the structures themselves belong to
+[B-Tree Concurrency and Write-Optimized Variants](/p02-storage-engines/b-tree-concurrency-and-write-optimized-variants/01-b-tree-concurrency-latch-crabbing-and-lehman-yao/),
+and the LSM row to [Log-Structured Merge Trees](/p02-storage-engines/lsm-trees/01-append-only-logs-and-bitcask-hash-indexes/).
+Bε-trees did ship: Tokutek's fractal-tree indexes in TokuDB and TokuMX (since deprecated) and
+the BetrFS research filesystem.
+
+Switch the lab to **Range scan** and the LSM row becomes visible as a cost rather than a
+footnote. Bloom filters reduce a point lookup to about one transfer regardless of how many runs
+exist, but they do nothing for a range: every level that might contain part of the range must
+be opened and merged, so the LSM pays one extra block per level on top of the k/B everyone pays.
+That asymmetry — cheap writes, cheap point reads, taxed scans — is the actual shape of the
+choice, not "LSM is for writes".
+
+The **RUM conjecture** (Athanassoulis et al., 2016) projects this onto a third axis: **R**ead
+overhead, **U**pdate overhead and **M**emory/space overhead. Optimise for any two and the third
+degrades. A B+tree at a 90% fill factor is read- and space-frugal and update-expensive; an LSM
+is update- and space-frugal and read-taxed; a covering index with a Bloom filter and a large
+buffer pool buys reads and updates with space. The conjecture is not a theorem, but as a
+checklist it catches the design that claims all three.
+
+## Cache-oblivious: hitting log<sub>B</sub> N without knowing B
+
+Here is the awkward truth behind the whole model: **there is no single B**. A modern access path
+crosses a 64-byte cache line, a 4 KB virtual-memory page, a 512-byte or 4 KB physical sector, a
+128 KB Linux readahead window, and — in a cloud — a 16 KiB billed I/O unit or a range-GET on
+object storage. A structure tuned for one of them is mistuned for the other four.
+
+**Cache-oblivious** structures (Frigo, Leiserson, Prokop and Ramachandran, 1999) hit the same
+asymptotic bounds *for every B and M simultaneously*, with neither constant appearing in the
+code. The core trick is the **van Emde Boas layout**: to lay out a complete binary tree of
+height h, split it at height h/2, lay out the top subtree recursively, then each of the ~2^(h/2)
+bottom subtrees recursively, contiguously. For any block size B, the recursion has a level at
+which subtrees are just under B bytes — and a root-to-leaf path crosses only O(log<sub>B</sub> N)
+of them, because each such subtree covers log₂(B/entry) levels of the path. The layout never
+mentions B; the blocks fall out of the recursion.
+
+Three more pieces complete the family:
+
+- A **packed-memory array** keeps the records themselves in key order with Θ(1) density and
+  gaps, so a scan is still k/B and an insert is O(1 + (log²N)/B) amortized. vEB index plus PMA
+  is the **cache-oblivious B-tree** (Bender, Demaine and Farach-Colton, 2000): search
+  O(log<sub>B</sub> N), scan optimal, no page size anywhere.
+- **Funnelsort** achieves the optimal (N/B)·log<sub>M/B</sub>(N/B) with no knowledge of M or B,
+  under the **tall-cache assumption** M = Ω(B²) — which every real memory level satisfies
+  comfortably and which is genuinely required, not a proof convenience.
+- The **cache-oblivious lookahead array** (COLA) is the write-optimized member: doubling sorted
+  runs merged on overflow, giving O((log N)/B) amortized inserts and O(log N) searches with
+  fractional cascading. It is, structurally, an LSM tree that was derived from the bound rather
+  than from engineering.
+
+Play the lab with this in mind. The vEB line is **flat across the x-axis** because there is no
+page size to set, and it moves only when you move B — always landing near the tuned B+tree's
+optimum without being told where that is. It also never wins outright: the alignment slop of
+the recursion (a subtree straddling a block boundary) costs a constant factor of roughly two.
+That constant is the real reason cache-oblivious B-trees are rare in production engines, not
+ignorance of the literature.
+
+## So why does every engine hard-code a page size?
+
+Because in a real storage engine, the page is not only the I/O unit. It is also:
+
+- the **latch** unit, and the buffer-pool **frame** unit — a frame array wants fixed-size slots;
+- the **checksum** unit (Postgres's `pd_checksum` in the page header, InnoDB's page trailer), so
+  torn or corrupt pages are detectable at exactly one granularity;
+- the **recovery** unit — `full_page_writes` logs an entire page on first touch after a
+  checkpoint, and InnoDB's doublewrite buffer writes whole pages, both to survive a torn write;
+- the **free-space** unit (Postgres's FSM, InnoDB's segment inventory);
+- the **prefetch** unit — readahead, `effective_io_concurrency`, InnoDB's linear read-ahead and
+  SQL Server's 64 KB extents all count pages;
+- the unit that fixes **TLB reach** — a buffer pool is one big array of equal frames precisely so
+  it can be mapped as one region on huge pages; at 4 KB virtual pages a few thousand TLB entries
+  cover only single-digit megabytes, so a large pool thrashes the TLB on every descent. That is
+  what Postgres's `huge_pages` (default `try`) and MySQL's `large_pages` exist for, and neither
+  is expressible if frames are variably sized;
+- the **compression** unit in columnar and LSM formats, where a block is the smallest thing that
+  can be decompressed.
+
+A cache-oblivious layout gives you one of these for free and takes the other six away. That is
+the trade, and every shipped engine has made it the same way: PostgreSQL's 8 KB `BLCKSZ` is a
+compile-time constant; InnoDB's `innodb_page_size` defaults to 16 KB and can only be chosen when the
+instance's data directory is initialized; Oracle's `db_block_size` defaults to 8 KB per tablespace; SQL Server's 8 KB page is not
+configurable at all; RocksDB's `block_size` defaults to 4 KB per SST. The named unit is worth more
+than the asymptotic elegance.
+
+## Where it bites in production
+
+- **An index build that crawls.** `CREATE INDEX` sorts through `tuplesort`; if
+  `maintenance_work_mem` is too small for the data, you get extra merge passes and the temp
+  files to prove it (`log_temp_files`, `pg_stat_progress_create_index` sitting in
+  `building index: loading tuples in tree`). The fix is a step change in M, not a slope.
+- **Rebuilding by INSERT.** `INSERT INTO new SELECT * FROM old ORDER BY ...` then adding the
+  index is the sort branch; adding the index first and inserting is the N branch. On a table
+  larger than memory that is the 100× in the race above, and it is the single most common
+  self-inflicted migration disaster.
+- **Page size on cloud block storage.** EBS gp3 meters I/O in 16 KiB units: a request smaller
+  than that still costs one whole I/O, and a larger one is billed as several. A 4 KB page
+  therefore throws away three-quarters of every billed I/O, so moving the same bytes costs up to
+  4× the provisioned IOPS — which is why a 16 KB `innodb_page_size` lines up with gp3 far better
+  than a 4 KB one, whatever the reason MySQL originally picked it.
+- **Page size too large for an in-memory workload.** Raising `innodb_page_size` to 32 KB or
+  `block_size` in RocksDB to 32–64 KB helps scans and hurts point lookups: more bytes
+  transferred, more decompression, more in-page binary search, and a block cache that holds
+  fewer distinct blocks.
+- **Range scans on an LSM.** The per-level tax is invisible in a point-lookup benchmark and
+  dominates a `WHERE k BETWEEN` workload; the symptom is scan latency that tracks the number of
+  levels, so it degrades between compactions and recovers after them.
+
+:::note[What to take forward]
+Count block transfers, not operations: scans cost N/B, searches cost log<sub>B</sub> N, sorts
+cost (N/B)·log<sub>M/B</sub>(N/B), and each of those is a proven floor, not an implementation
+detail. The B+tree exists because it meets the search bound; bulk loading exists because the
+permutation bound says sorting beats N inserts by a factor of ~B; write-optimized structures
+exist because the insert/query curve has other points on it. Cache-oblivious layouts show that B
+need never appear in the code — and production engines hard-code it anyway, because the page is
+also the unit of latching, checksumming, recovery and prefetch.
+:::

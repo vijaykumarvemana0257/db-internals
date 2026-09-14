@@ -1,0 +1,277 @@
+---
+title: Fill factor, fragmentation and splits under load
+description: Why the shape of your key stream decides an index's density, its physical order and its hottest page — and why fillfactor only helps at one of the two kinds of split.
+depth: intermediate
+sidebar:
+  order: 4
+---
+
+import LeafFillFragmentationLab from '../../../../components/viz/LeafFillFragmentationLab';
+
+A B+tree's height is decided by its fanout and barely moves. What moves — by a factor of two
+in size, and by orders of magnitude in range-scan cost — is how full its leaves are and
+whether the sibling chain still runs forward through the file. Both are decided by the shape
+of the key stream you feed it, and the only knob you get is a number that applies to one of
+the two kinds of split.
+
+<LeafFillFragmentationLab client:visible />
+
+## What fillfactor actually reserves
+
+`fillfactor` is a per-relation storage parameter that says how full to pack a page while
+leaving room for what comes later. For a PostgreSQL B-tree the default is **90** for leaf
+pages (`BTREE_DEFAULT_FILLFACTOR`); internal pages use a fixed 70
+(`BTREE_NONLEAF_FILLFACTOR`) and are not settable. You set it per index:
+
+```sql
+CREATE INDEX orders_placed_at_idx ON orders (placed_at) WITH (fillfactor = 70);
+ALTER INDEX orders_placed_at_idx SET (fillfactor = 70);   -- future splits use it; existing pages change only at REINDEX
+```
+
+InnoDB's equivalent is `innodb_fill_factor`, a server variable defaulting to 100 that governs
+sorted index builds. Even at 100 InnoDB does not fill a clustered-index page to the brim: it
+leaves **1/16 of the page** free for future growth, which is where the "15/16" number in
+InnoDB write-ups comes from. On the other side, InnoDB will merge a page into a sibling when
+its fill drops below `MERGE_THRESHOLD`, which defaults to 50% and is settable per index in a
+table comment.
+
+The reason to reserve room is not the same for a heap and for an index. In a heap, free space
+on the page is what lets an `UPDATE` be a **HOT update** — a new tuple version on the same
+page, with no index entry to write — which is why an update-heavy table is often given
+`fillfactor = 85`. In an index, reserved space absorbs the *next* key that sorts into that
+page without forcing a split. That is the whole benefit, and it is only available if new keys
+actually sort into pages that have room.
+
+:::caution[The fillfactor misconception]
+Setting `fillfactor` on a B-tree index does **not** cause pages to be maintained at that
+density. PostgreSQL applies the leaf fillfactor in exactly two places: when a page is built
+from sorted input (`CREATE INDEX`, `REINDEX`), and when the **rightmost** page of a level
+splits. Every other split is at the midpoint, 50/50. So on a randomly-inserted index,
+`fillfactor = 70` changes nothing at all after the rebuild has decayed — the pages fill to
+100%, split in half, and converge right back to where they were. Toggle the key stream in the
+lab from bigserial to UUIDv4 and drag the fillfactor slider: the density stat barely moves off
+ln 2 whatever you set, while the same drag on bigserial moves it point for point.
+:::
+
+## Two split points, and why the insert position picks one
+
+When a leaf overflows, the engine must decide where to cut it. `nbtsplitloc.c`'s
+`_bt_findsplitloc` evaluates candidate split points and applies the leaf fillfactor when the
+page is the rightmost one on its level: the left half keeps `fillfactor` percent of the space
+and everything after it moves to the new right page. For a strictly ascending key stream that
+is the *only* kind of split that ever happens, so the pattern is: fill a page to capacity,
+split, leave 90% behind, carry ~10% plus the new tuple forward, repeat. Steady-state leaf
+density lands at roughly the fillfactor, and the file grows strictly left to right.
+
+PostgreSQL 12 moved split-point selection out of `nbtinsert.c` into `nbtsplitloc.c`, where a
+set of secondary heuristics live alongside the fillfactor rule: a "split after the new item"
+case for when the incoming tuple sits at the end of the page, and a distinct strategy for
+pages full of duplicates. The naive midpoint rule wastes half of every page an append-only
+workload creates, and these are the rules that stop it.
+
+InnoDB reaches the same conclusion through the page header rather than through the tree
+shape. Each index page records `PAGE_LAST_INSERT`, `PAGE_DIRECTION` and `PAGE_N_DIRECTION`;
+after a run of inserts in the same direction, `btr_page_split_and_insert` calls
+`btr_page_get_split_rec_to_right` (or `..._to_left`) and splits **at the insertion point**
+instead of at the midpoint, so the page being appended to stays packed and the new page starts
+nearly empty.
+
+Uncheck **Rightmost-page split optimization** in the lab with bigserial selected. Every split
+becomes a midpoint split, each page freezes at half full the moment the next one is created,
+and the same rows need close to twice the pages — the textbook algorithm producing a 50%-dense
+index on the most common key pattern in OLTP.
+
+There is a second optimization for ascending keys, on the descent rather than the split.
+PostgreSQL 11 added a **fastpath insert**: `_bt_doinsert` caches the block number of the
+rightmost leaf on the relation, and if the incoming key sorts after that page's high key it
+conditionally locks the cached buffer and inserts there directly, skipping the root-to-leaf
+descent entirely. A `bigserial` primary key therefore costs one buffer access per insert
+instead of three or four.
+
+## Random keys: the 69% ceiling
+
+Now feed the same tree UUIDv4. Each key is 122 random bits, so each insert lands on a
+uniformly random leaf, and every one of those leaves is an interior page of the level. The
+fillfactor rule never fires; every split is a midpoint split.
+
+The steady state of that process is a classical result: under random insertions, B-tree node
+occupancy converges to **ln 2 ≈ 69.3%** (Yao, 1978). Pages oscillate between 50% right after a
+split and 100% just before the next one, and the time-average is ln 2, not 75%, because a page
+that just split takes longer to refill than a nearly-full page takes to overflow. That is the
+"50–70% fill" you see quoted for randomly-keyed indexes, and it is a floor you cannot tune
+away — it is a property of the split rule, not of a setting.
+
+The density is the least of it. Three other costs arrive with random keys:
+
+- **The write working set becomes the whole index.** Watch the "leaves touched, last 200
+  inserts" stat. Ascending keys touch only the handful of pages the right
+  edge advanced through; UUIDv4 touches very nearly every leaf in the index, each of which must
+  be read into the buffer pool, dirtied, and eventually written. Once the index
+  exceeds memory, every insert becomes a random read *and* a random write.
+- **Full-page writes multiply.** The first time a page is dirtied after a checkpoint,
+  PostgreSQL writes the entire 8 KB image into the WAL (`full_page_writes`, on by default, and
+  the reason `wal_compression` exists). Scattering inserts across thousands of pages per
+  checkpoint interval means thousands of full-page images instead of a handful.
+- **The key is twice as wide.** A `bigint` index entry costs 20 bytes on the page (8-byte
+  `IndexTupleData` header + 8-byte key + 4-byte line pointer); a `uuid` costs 28. On an 8 KB
+  leaf with 8152 usable bytes that is about 400 entries versus about 290 — before the density
+  difference. Store the same UUID as `char(36)` text and the tuple MAXALIGNs to 48 bytes,
+  52 with its line pointer, so about 155 per page — the single most expensive schema mistake
+  in this area.
+
+In InnoDB the damage is larger still, because the clustered index *is* the table: a random
+primary key scatters the **rows**, not just index entries, and every secondary index carries a
+copy of that 16-byte PK as its row pointer.
+
+## Fragmentation: when key order stops being file order
+
+A split needs a new page. A growing index has no free pages to hand back, so the new block is
+allocated at the end of the relation file and the sibling pointer of the page being split is
+redirected to it. Key order and block order are identical only until the first non-rightmost
+split; after that, walking the leaf chain means walking backwards and forwards through the
+file.
+
+That is exactly what the lines in the lab encode. Top row is the sibling chain in key order;
+bottom row is the same pages in block-number order — the order a sequential read returns them.
+Under bigserial the lines are parallel. Under UUIDv4 they are a mesh, and every crossing is a
+seek some range scan will pay.
+
+PostgreSQL will tell you the numbers directly:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pgstattuple;
+SELECT * FROM pgstatindex('orders_id_idx');
+--  version | tree_level | index_size | root_block_no | internal_pages | leaf_pages
+--  | empty_pages | deleted_pages | avg_leaf_density | leaf_fragmentation
+```
+
+`avg_leaf_density` is the occupancy number above — around 90 on a freshly built index, drifting
+toward 69 under random inserts, and far lower on an index whose keys are deleted in bulk.
+`leaf_fragmentation` is deliberately conservative: it counts the percentage of leaf pages whose
+right sibling sits at a **lower** block number than the page itself. A forward jump of 500
+blocks does not count. So a non-zero `leaf_fragmentation` is not a warning, it is proof the
+chain is genuinely scrambled — and the true random-I/O cost is always worse than the number
+suggests.
+
+The stat that matters for a query is the one the lab calls **runs**: the number of maximal
+stretches of consecutive blocks in the part of the chain a scan touches. One run means the
+kernel's readahead and the engine's prefetching see a sequential stream and can fetch a
+megabyte at a time. Forty runs over forty leaves means forty independent I/Os at queue depth
+one — on NVMe that trades one large sequential transfer for forty serialised round-trips, and
+on network-attached storage or spinning disk the gap is orders of magnitude, not a factor.
+Widen the range-scan slider and watch runs grow linearly with the window on
+a fragmented index and stay at 1 on a clean one.
+
+:::note[This is not the same as heap correlation]
+`pg_stats.correlation` measures whether the *heap* is in index order, and drives the planner's
+choice between an index scan and a bitmap heap scan. `leaf_fragmentation` measures whether the
+*index's own leaf pages* are in key order. A table can be perfectly clustered while its index is
+shredded, and vice versa. The planner models the first and not the second, which is one reason a
+fragmented index produces plans that look fine and run slowly.
+:::
+
+## The rightmost leaf is one page, and everyone wants it
+
+The reward for ascending keys is a dense index in file order. The bill is that every concurrent
+inserter wants the same buffer. Watch the "inserts on the rightmost leaf" stat sit at 100% for
+bigserial: with 64 connections inserting, that is 64 sessions serialising on one page's content
+lock, plus the fastpath's conditional lock attempt, plus — when the page finally splits — a
+brief exclusive hold while two pages and a parent are updated.
+
+This shows up by name in every engine. SQL Server calls it *last-page insert contention* and
+you see it as `PAGELATCH_EX` waits on one page of one index; SQL Server 2019 added the index
+option `OPTIMIZE_FOR_SEQUENTIAL_KEY` specifically to schedule those waiters instead of letting
+them convoy. Oracle's traditional answer is a **reverse key index**, which byte-reverses the key
+so consecutive values land on different blocks — and thereby destroys range scans on that index
+completely — or a hash-partitioned index, which spreads the hot spot across N right edges while
+keeping local ordering. InnoDB users hit it as index-page latch contention on the clustered
+index's right edge.
+
+The protocols that make concurrent descents safe while a split is in flight — latch crabbing,
+Lehman–Yao high keys, Blink trees — are the subject of their own module. What belongs here is
+the shape of the trade: **fully ordered keys maximise density and locality and minimise the
+number of pages under contention to exactly one.** Fully random keys do the reverse on every
+axis. You are picking a point on that line.
+
+## UUIDv7, ULID, and getting both
+
+The point that gets you most of both is a time-ordered identifier. RFC 9562 (2024) standardised
+**UUIDv7**: a 48-bit big-endian Unix millisecond timestamp followed by random bits, so values
+generated in different milliseconds sort in generation order while values inside one millisecond
+are unordered. ULID has the same layout (48-bit ms + 80 random bits) in a different textual
+encoding. Select UUIDv7 in the lab: density returns to the fillfactor, fragmentation goes to
+zero, the write working set collapses to a handful of leaves — and the rightmost-leaf share drops
+below 100%, because the intra-millisecond scramble spreads inserts over the last page or two,
+which is a mild contention win as well.
+
+Practical notes that matter more than the encoding:
+
+- **PostgreSQL 18** ships a built-in `uuidv7()` (and `uuidv4()`); before that, generate it in
+  the application or use an extension. Store it in the `uuid` type, never text.
+- **MySQL** has had `UUID_TO_BIN(uuid, swap_flag)` since 8.0: with `swap_flag = 1` it reorders a
+  UUIDv1's time fields into big-endian order and returns 16 bytes, turning a scattering PK into
+  a monotonic one. `BINARY(16)` with a swapped UUID is the standard InnoDB pattern.
+- **Third option: don't use a UUID as the clustered key at all.** A `bigserial`/`AUTO_INCREMENT`
+  primary key with a separate unique UUID column gives the dense clustered index and keeps the
+  externally-visible opaque identifier; the cost is one extra random-keyed unique index instead
+  of all of them.
+- **UUIDv7 leaks creation time** to anyone holding an ID. If that matters, it is a real reason
+  to accept v4 and pay for it in fill.
+
+This is also the one case where fillfactor is doing exactly the job it was designed for. Drag
+the slider to 100 with UUIDv7 selected and watch fragmentation jump: packing the left page full
+means the next key that jitters backwards into it — an ordinary event inside one millisecond —
+splits a page that is no longer the rightmost one, at the midpoint, with a new block at the end
+of the file. The reserved 10% is what absorbs that jitter.
+
+The lab's fourth stream — `(created_at, id)` at second resolution — is the common composite
+case, and it separates two things that are easy to conflate. Locality stays excellent: the write
+working set is a handful of leaves and the range-scan window stays inside a narrow region of the
+file. But the hot band is several pages wide, so splits inside it are midpoint splits: density
+falls back toward 70% and block order scrambles *locally*. Coarser timestamps widen the band and
+give more scatter, not less.
+
+## Repair, and where it bites
+
+Nothing reclaims index fill or reorders blocks incrementally. PostgreSQL never merges
+half-empty B-tree pages back together; emptied pages are eventually recycled into the same
+index's free space map, so the file does not shrink and the chain does not straighten. The
+repairs are all rebuilds:
+
+| Action | What it does | Locking |
+|---|---|---|
+| `REINDEX INDEX x` | Rebuilds from a fresh sort, packed to `fillfactor` | `SHARE` on the parent table (reads fine, writes blocked) plus `ACCESS EXCLUSIVE` on the index |
+| `REINDEX INDEX CONCURRENTLY x` | Same, building a shadow index and swapping it (PostgreSQL 12+) | No blocking of reads/writes; two passes, and it leaves an `_ccnew` invalid index behind if it fails |
+| `pg_repack` | Rebuilds table and indexes via triggers and a swap | Brief exclusive lock at the swap |
+| `OPTIMIZE TABLE t` (InnoDB) | Mapped to `ALTER TABLE ... FORCE`: an online rebuild of the clustered index and all secondaries, with the note *"Table does not support optimize, doing recreate + analyze instead"* | Online (`ALGORITHM=INPLACE`) unless `--skip-new` / `old_alter_table` |
+
+Rebuilding also needs the space: `REINDEX CONCURRENTLY` holds the old and new index at once, so
+plan for the index's size in free disk, and remember that the rebuild is a full write of the
+index into the WAL.
+
+What this looks like in production:
+
+- **An index bigger than its table.** A UUIDv4 primary key on a narrow row, at 69% fill with
+  28-byte entries, routinely produces an index in the same order of magnitude as the heap.
+  `\di+` plus `pg_relation_size` against row counts is the check; `pgstatindex` tells you whether
+  it is density, bloat from deletes, or both.
+- **A range scan whose plan did not change but whose runtime tripled.** Same `Index Scan`, same
+  row estimate, more I/O — `EXPLAIN (ANALYZE, BUFFERS)` shows the shared block reads climbing
+  while the rows returned stay flat. That is fragmentation, and `pgstatindex` confirms it.
+- **p99 insert latency on one statement while CPU is idle.** Lock/latch waits on a single index
+  page: `pg_stat_activity.wait_event` showing `BufferContent` on a hot index, or
+  `PAGELATCH_EX` in SQL Server, both pointing at the rightmost leaf.
+- **Checkpoint-time write storms** proportional to the scatter of your keys, because every
+  distinct page dirtied since the last checkpoint has to be written and the first touch of each
+  emitted a full-page image into the WAL.
+- **A nightly REINDEX in cron.** It works, which is why it survives; it is also a signal that
+  the key choice is wrong, because a time-ordered key needs no maintenance at all.
+
+:::note[What to take forward]
+Fillfactor is a *build-time and rightmost-split* knob, not a maintained density — on a randomly
+keyed index it does nothing once the rebuild has decayed to ln 2 ≈ 69%. Ascending keys buy
+density, file order and a one-page working set, and pay for them with contention on a single
+leaf; random keys pay everywhere and buy nothing but opacity. Time-ordered identifiers —
+UUIDv7, ULID, a swapped `UUID_TO_BIN` — are how you get the first set without the second, and
+they are the only fix that does not need a recurring rebuild.
+:::

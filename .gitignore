@@ -1,0 +1,29 @@
+# build output
+dist/
+.astro/
+
+# dependencies
+node_modules/
+
+# logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# environment variables
+.env
+.env.production
+
+# macOS
+.DS_Store
+
+# editors
+.vscode/
+.idea/
+
+# planning workflow cache (large agent transcripts)
+_planning/workflow-cache/
+
+# local-only build notes, never published
+.claude/

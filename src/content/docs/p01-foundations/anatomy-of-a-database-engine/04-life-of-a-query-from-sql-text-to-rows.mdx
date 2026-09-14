@@ -1,0 +1,302 @@
+---
+title: 'Life of a query: from SQL text to rows'
+description: One SELECT traced end to end — protocol message, parse tree, catalog resolution, view expansion, cost-based plan choice, and next() calls pulling tuples through the buffer pool.
+depth: basics
+sidebar:
+  order: 4
+---
+
+import QueryLifecycleStepper from '../../../../components/viz/QueryLifecycleStepper';
+
+A SQL statement is a request, not a program. Between the bytes arriving on a socket and the
+first row going back out, an engine runs four separate compilers and one interpreter, and
+each of them can be the reason your query is slow, wrong or locked. This page traces one
+`SELECT` with a `WHERE` and a `JOIN` through all five, naming the structure each stage
+produces so the rest of the curriculum has somewhere to attach.
+
+<QueryLifecycleStepper client:visible />
+
+Two things in that lab are worth doing before you read on. Load the default query and drag
+**random_page_cost** from 4.0 down to about 2.0: the plan flips from a `Hash Join` that
+streams 770 pages of `orders` to a `Nested Loop` that re-descends an index 160 times. Nothing
+about the data changed — one number about how expensive a random page is, changed. Then
+switch to **Execute** and press **Run** on each plan, and compare the disk reads. The nested
+loop issues *more* physical reads than the hash join and is still the cheaper plan at a low
+`random_page_cost`, because the cost model is not counting reads; it is counting reads
+weighted by how much each one hurts.
+
+## The wire is not SQL
+
+Your client does not send SQL. It sends a framed protocol message, and which message it sends
+changes how much of the pipeline runs.
+
+PostgreSQL's **simple query** protocol packs the whole statement into one `Query` message
+(tag `Q`) and runs every stage below, every time. The **extended query** protocol splits it:
+`Parse` (`P`) compiles the text into a named prepared statement, `Bind` (`B`) attaches
+parameter values and produces a portal, `Describe` (`D`) asks for the result shape, `Execute`
+(`E`) runs it, `Sync` (`S`) closes the message sequence and, unless you opened an explicit
+`BEGIN`, closes the implicit transaction around it — committing it, or rolling it back if a
+message in the sequence errored. Results come back as one
+`RowDescription` (`T`) naming the columns and their type OIDs, then one `DataRow` (`D`) per
+tuple, then `CommandComplete` (`C`) and `ReadyForQuery` (`Z`). MySQL's equivalents are
+`COM_QUERY` versus `COM_STMT_PREPARE`/`COM_STMT_EXECUTE`.
+
+The split matters because parse, analyze and rewrite happen once, at `Parse` time, and are
+reused across every later `Bind`/`Execute` pair. Planning happens at `Bind`, because it may
+want the parameter values — but from the sixth execution onward the server may cache a
+parameter-independent *generic* plan and reuse that too. That is most of what "prepared
+statements are faster" means — it is not the parsing that was expensive, it is the planning. It is also
+where a subtle production failure lives, which we come back to at the end.
+
+## Parse: text into a tree that knows nothing
+
+The raw parser is a lexer and an LALR grammar — `scan.l` and `gram.y`, flex and bison — and
+its output is a **raw parse tree**: `SelectStmt` holding a `targetList` of `ResTarget`s over
+`ColumnRef`s, a `fromClause` of `RangeVar`s and `JoinExpr`s, a `whereClause` of `A_Expr` and
+`A_Const` nodes. Open the **Parse** stage in the lab and that is exactly the tree you get.
+
+The important property is what it does *not* contain. There are no OIDs, no types, no
+relations opened, no locks taken. `SELECT * FROM no_such_table` parses perfectly. This is
+deliberate: the grammar has no catalog dependency, so it can run before any lock is acquired
+and before the engine knows whether it is even going to execute this statement. Misspell a
+keyword and you get
+
+```
+ERROR:  syntax error at or near "FORM"
+LINE 1: SELECT * FORM customers;
+                 ^
+```
+
+which is the only error class in the whole pipeline that can be produced without touching a
+single catalog page.
+
+## Analyze: names become OIDs, Vars and OpExprs
+
+Parse analysis (`parse_analyze()`) turns the raw tree into a `Query`, and this is where the
+catalog enters. Each `RangeVar` is resolved against `pg_class` into a **range table entry**
+carrying a `relid`. Each `ColumnRef` becomes a `Var` with `varno` (which range-table entry)
+and `varattno` (which attribute number, from `pg_attribute`) and a resolved type. Each
+`A_Expr` becomes an `OpExpr` whose `opno` was looked up in `pg_operator` by operator name and
+argument types — `texteq`, `int4gt`, `numeric_ge` — inserting implicit casts where the types
+do not match exactly. Flip the lab to **Analyze** and every node grows its resolution.
+
+Two consequences you will meet in production. First, this stage takes an `AccessShareLock` on
+every relation named, which is why a query that has not executed yet can already be blocked
+behind an `ALTER TABLE`. Second, this is the stage that produces the *semantic* errors:
+
+```
+ERROR:  column "citty" does not exist
+ERROR:  relation "custmers" does not exist
+ERROR:  operator does not exist: text = integer
+```
+
+Type `SELECT id FROM customers WHERE city = 5` into the lab to see the last one: the grammar
+was perfectly happy, the catalog was not.
+
+## Rewrite: views and policies expand here
+
+`QueryRewrite()` applies the rule system. A view is not a planner concept at all — `CREATE
+VIEW` stores an `ON SELECT DO INSTEAD` rule, and the rewriter substitutes the view's `Query`
+for the reference and then pulls the resulting subquery up into the parent. Row-level-security
+policies are injected as extra quals at the same stage, as are `DO ALSO`/`DO INSTEAD` rules on
+tables.
+
+Load the **Through a view** example and step to **Rewrite**: the `big_orders` range-table
+entry becomes `orders`, and `amount > 1500` appears in the `WHERE` clause, tagged as added by
+the rewriter. By the time the planner runs, the view has no separate existence — which is why
+a view costs nothing by itself, why its predicates get merged with yours and can use the same
+indexes, and why `EXPLAIN` never mentions the view's name. It is also why the failure mode of
+a self-referencing view is
+
+```
+ERROR:  infinite recursion detected in rules for relation "v"
+```
+
+rather than a hang.
+
+## Plan: the only stage that guesses
+
+Everything so far was a translation. Planning is an *estimate*, and every bad plan you will
+ever debug is a wrong number here propagating downward.
+
+### Statistics
+
+`ANALYZE` samples rows — 300 × `default_statistics_target`, so 30,000 rows at the default
+target of 100 — and stores per-column statistics in `pg_statistic`, readable through the
+`pg_stats` view:
+
+| Statistic | What it answers |
+|---|---|
+| `null_frac` | how often `IS NULL` matches |
+| `n_distinct` | equality selectivity for non-common values, and join fan-out |
+| `most_common_vals` / `most_common_freqs` | exact selectivity for skewed values |
+| `histogram_bounds` | range selectivity for `<`, `>`, `BETWEEN` |
+| `correlation` | how closely physical row order tracks index order — decides whether an index scan reads the heap in near-sequential order or bounces |
+
+The lab's toy catalog carries four of these: an `n_distinct` per column, an MCV list on
+`city` (so `= 'Kirkland'` is 0.008 and `= 'Seattle'` is 0.22), a range on `amount` standing in
+for a histogram, and a correlation per index.
+Selectivity × `reltuples` is the `rows=` estimate you see on every plan node, and it is the
+input to everything downstream.
+
+### Cost
+
+Costs are in an artificial unit: **one sequential 8 KB page read = 1.0**. The knobs, with
+their real defaults:
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `seq_page_cost` | 1.0 | a page fetched in a sequential scan |
+| `random_page_cost` | 4.0 | a page fetched at random |
+| `cpu_tuple_cost` | 0.01 | processing one tuple |
+| `cpu_index_tuple_cost` | 0.005 | processing one index entry |
+| `cpu_operator_cost` | 0.0025 | evaluating one operator or function |
+| `effective_cache_size` | 4 GB | how much the planner assumes the OS and buffer pool hold, used for index-scan re-fetch estimates |
+| `work_mem` | 4 MB | memory per sort/hash node before it spills to temp files |
+
+The 4:1 ratio between random and sequential is the storage physics of the previous module,
+compressed into one number. It was calibrated for spinning disks; on NVMe, where random reads
+cost maybe 1.1× a sequential one *and* the page is often already cached, leaving it at 4.0
+systematically over-penalizes every index and nested-loop plan. Lowering
+`random_page_cost` to 1.1–2.0 is one of the two or three highest-value knobs on a modern
+PostgreSQL, and the lab lets you watch exactly which decision it changes.
+
+### Paths
+
+For each relation the planner builds every access path it can and keeps the cheapest —
+`add_path()` uses a 1% fuzz factor, so a path must be more than 1% better to displace an
+incumbent:
+
+- **Seq Scan** — `relpages` pages at `seq_page_cost`, plus `cpu_tuple_cost` for *every* tuple
+  in the table, whether it matches or not, plus `cpu_operator_cost` per qual evaluated. That
+  CPU is why the lab's scan of the 20,000-row `customers` table costs 473 and not 223: 223 for
+  the pages, 200 for the tuples, 50 for evaluating the one filter.
+- **Index Scan** — walk the index, fetch each matching heap tuple. Heap page count comes from
+  the Mackert–Lohman estimate `2·T·t / (2·T + t)` for `t` tuples over `T` pages, and the I/O
+  cost is interpolated between fully random and fully sequential by `correlation²`. A
+  perfectly correlated index (a serial primary key) reads the heap almost sequentially; a
+  correlation near zero pays `random_page_cost` per tuple.
+- **Bitmap Heap Scan** — build a bitmap of matching ctids from the index, sort it implicitly by
+  page, then read each heap page **once** in physical order. Cost per page is interpolated
+  between random and sequential by `√(pages_fetched / relpages)`, so the more of the table you
+  touch the more it behaves like a scan. This is the path that wins in the wide middle of the
+  selectivity range, and it is why turning on the `customers(city)` index in the lab produces a
+  bitmap scan rather than an index scan.
+- **Index Only Scan** — the same as an index scan with no heap fetch at all, available when the
+  index contains every column needed and the visibility map says the page is all-visible. It is
+  covered with the rest of the B-tree material.
+
+### Joins
+
+With two relations the planner enumerates join methods and both join orders, and takes the
+cheapest combination:
+
+- **Nested Loop** — cost is `outer_cost + outer_rows × inner_rescan_cost`. Only competitive when
+  the outer side is genuinely small *and* the inner side has an index on the join key; that
+  product is brutally sensitive to the outer row estimate.
+- **Hash Join** — build a hash table on the smaller side, then probe once per outer row. Cost is
+  roughly both scans plus CPU, and it does not care about correlation at all. If the build side
+  exceeds `work_mem` it splits into batches and both sides spill to temp files.
+- **Merge Join** — both inputs sorted on the join key; cheap when the inputs are already sorted
+  (from an index) and expensive when they are not.
+
+Join *order* is a search, not a formula: PostgreSQL runs dynamic programming over the join
+graph up to `geqo_threshold` (12) relations, and a genetic algorithm beyond that, because the
+number of orderings grows factorially. Planning time is itself a cost, which is why the
+threshold exists.
+
+A `LIMIT` changes the comparison rather than truncating the answer: the planner multiplies run
+cost by the fraction of rows it expects to need, so plans with low **startup** cost — a nested
+loop, an index scan that returns rows immediately — beat plans with a cheaper total but a
+blocking node in the way. That is the `startup..total` pair printed on every node.
+
+## Execute: next() through the operator tree
+
+The chosen plan is a tree of operators, and PostgreSQL's executor is the classic **Volcano /
+iterator model** from Goetz Graefe's work around 1990: every node exposes the same interface,
+`ExecProcNode()`, which returns one tuple or NULL, and pulls whatever it needs from its
+children by calling their `ExecProcNode()`. No intermediate result is materialized unless an
+operator has to.
+
+Step the lab's **Execute** stage and watch which operators light up. The distinction that
+matters is **pipelined** versus **blocking** nodes:
+
+- A `Nested Loop` returns its first row after one outer tuple and one index descent.
+- A `Hash Join` cannot return anything until the `Hash` node has drained its entire child. Press
+  Step once on a hash-join plan and the whole build side executes inside that single `next()`.
+  `Sort`, `Hash`, `Materialize` and most aggregates are blocking for the same reason.
+
+`EXPLAIN ANALYZE` prints exactly this structure back at you: `actual rows` and `loops` per node,
+where `loops > 1` means an inner side was rescanned and the printed row and time figures are
+**per loop** — a nested loop with `loops=160` did 160 times the work its line appears to show.
+
+Every tuple access goes through the buffer pool, never straight to a file. A sequential scan
+pins a page once and reads all ~130 tuples on it, so it costs one `ReadBuffer` per page; an
+index scan fetches a heap page per matching tuple, which is why re-reading the same page shows
+up as hits rather than reads. `EXPLAIN (ANALYZE, BUFFERS)` reports this as
+`shared hit=… read=…`, and only the `read=` half ever reaches the operating system. The lab's
+frame strip is that pool: 64 frames of 8 KB, LRU, with hits, misses and evictions counted per
+operator. Give a 993-page workload 64 frames and the hit rate is zero and the eviction count is
+enormous — the cliff from the memory-hierarchy page, in miniature.
+
+One tuple per function call per operator is a lot of overhead for a scan of a hundred million
+rows, which is why the alternatives exist: vectorized executors process batches of ~1024 values
+per call, PostgreSQL JIT-compiles expression evaluation above `jit_above_cost` (100,000), and
+SQLite skips the tree entirely — its planner emits **bytecode for a register VM**, the VDBE, so
+`EXPLAIN` on SQLite prints opcodes, not operators. MySQL 8.0 moved to an iterator executor and
+gained `EXPLAIN ANALYZE` in 8.0.18; its cost constants live in the editable `mysql.server_cost`
+and `mysql.engine_cost` tables.
+
+## Rows back on the wire
+
+Each tuple the root produces is converted to the client's requested format and written out as
+one `DataRow`, preceded once by `RowDescription`. Because the executor is a pull pipeline, rows
+start flowing before the query has finished — unless a blocking node upstream has to consume
+everything first. A cursor (`DECLARE … CURSOR`, or the extended protocol's row-count argument to
+`Execute`) suspends the pipeline between fetches rather than restarting it.
+
+The catch is on the client. `libpq` accumulates the entire result set in memory before handing
+it to you unless you call `PQsetSingleRowMode()`; `psql` exposes the same thing as
+`\set FETCH_COUNT`. This is why a `SELECT *` over 40 million rows OOMs the *application*
+while the server sits at a few megabytes of memory, and why streaming exports need a cursor.
+
+## Where it bites in production
+
+- **One wrong estimate, one catastrophic join.** A plan node reading `rows=1` where the
+  reality is `actual rows=3215984` turns a nested loop from 1 index descent into 3.2 million.
+  This is the single most common serious plan pathology, and `EXPLAIN ANALYZE` names it
+  instantly: find the deepest node where estimated and actual diverge by orders of magnitude,
+  and fix *that* estimate — more statistics (`ALTER TABLE … ALTER COLUMN … SET STATISTICS`),
+  extended statistics for correlated columns (`CREATE STATISTICS`), or a rewritten predicate.
+  Do not start by disabling the join method.
+- **Stale statistics after a bulk load.** Autovacuum's analyze threshold is proportional to
+  table size, so a freshly loaded or freshly grown table can be planned against statistics
+  describing an empty one. Run `ANALYZE` explicitly at the end of a load.
+- **`random_page_cost = 4` on an SSD with a warm cache.** Every index and nested-loop plan is
+  taxed 4× for pages that were already in the buffer pool. Symptom: sequential scans the
+  planner insists are cheaper, on a machine whose disks are idle.
+- **Generic plan regressions.** After five executions, PostgreSQL will consider a *generic*
+  plan built without knowing the parameter values, and keeps it if it is not more expensive
+  than the average custom plan. On skewed data — where `status = 'pending'` matches 200 rows
+  and `status = 'shipped'` matches 60 million — the generic plan can be disastrous for one
+  value. `plan_cache_mode = force_custom_plan` is the escape hatch.
+- **`work_mem` spills.** A hash or sort that exceeds `work_mem` writes temp files; you see
+  `Batches: 8` or `Sort Method: external merge  Disk: 412000kB` in `EXPLAIN ANALYZE`,
+  `temp read=/written=` under `BUFFERS`, and messages in the log if `log_temp_files` is on.
+  Because the limit is per node per connection, raising it globally multiplies by both.
+- **Planning time itself.** A 20-table join can spend more time planning than executing.
+  `EXPLAIN` prints `Planning Time` and `Execution Time` separately; if planning dominates, that
+  is an argument for prepared statements, not for a faster disk.
+
+`pg_stat_statements` tells you which statements to look at, and `auto_explain` captures the plan
+of the slow execution you were not watching. Both are extensions you want installed before the
+incident, not after.
+
+:::note[What to take forward]
+Parse, analyze and rewrite are deterministic translations — they fail loudly, with different
+error classes, and they are cheap. Planning is the one stage that *guesses*, and it guesses
+using statistics about your data and constants describing your hardware; every plan disaster is
+one of those two being wrong. Execution is then just an iterator tree pulling tuples, where
+every page request goes through the buffer pool and only the misses cost what the previous
+module said they cost.
+:::

@@ -1,0 +1,243 @@
+---
+title: "Memory beyond the pool: shared, per-backend and context allocation"
+description: The rest of a database process's RAM — shared segment, per-backend budgets, memory contexts and page tables — and why the configuration file describes an upper bound that nothing enforces.
+depth: intermediate
+sidebar:
+  order: 1
+---
+
+import ServerMemoryBudgetMap from '../../../../components/viz/ServerMemoryBudgetMap';
+import MemoryContextArenaLab from '../../../../components/viz/MemoryContextArenaLab';
+
+Every capacity conversation about a database server starts with the buffer pool and then stops,
+which is why so many of them end with an OOM kill. The pool is the one allocation that behaves
+like a reservation: one number, taken at startup, never exceeded. Everything else — the lock
+table, the per-connection sort grants, the catalog caches, the page tables that map the pool into
+each backend — is either derived from knobs you did not think you were setting, or is a *product*
+of four numbers that no component in the server multiplies out and checks.
+
+<ServerMemoryBudgetMap client:visible />
+
+## The shared segment is the honest half
+
+PostgreSQL computes the size of its shared memory segment before it does anything else, allocates
+it once, and never grows it. If it cannot get it, the server does not start — a good failure. You
+can ask for the number without starting anything:
+
+```
+$ postgres -C shared_memory_size -D $PGDATA
+8832MB
+$ postgres -C shared_memory_size_in_huge_pages -D $PGDATA
+4416
+```
+
+Both are runtime-computed GUCs (PostgreSQL 15 and later), and the second one is exactly what you
+put into `vm.nr_hugepages`. Once the server is up, `pg_shmem_allocations` lists the named pieces —
+`Buffer Blocks`, `Buffer Descriptors`, `Shared Buffer Lookup Table`, `XLOG Ctl`, `LOCK hash`,
+`PROCLOCK hash`, `PREDICATELOCK hash`, one row per SLRU — with their real byte counts. That view
+is the ground truth for everything in this section.
+
+| Shared allocation | Sized by | Notes |
+|---|---|---|
+| Buffer blocks | `shared_buffers` | The frames themselves, 8 KB each |
+| Buffer descriptors, mapping table, checkpoint sort array | derived | ~64 B of cache-line-padded `BufferDesc` plus a hash entry and a sort slot per frame — on the order of 1–2% *on top of* `shared_buffers`. The [buffer pool structure page](/p02-storage-engines/buffer-pool/01-buffer-pool-structure-frames-page-table-and-pins/) owns what is in them |
+| WAL buffers | `wal_buffers` | Default `-1`: one thirty-second of `shared_buffers`, clamped to at least 64 kB and at most one 16 MB WAL segment |
+| Lock manager | `max_locks_per_transaction` × (`max_connections` + `max_prepared_transactions`) | A fixed-size hash of lockable objects, not a per-transaction limit |
+| Predicate lock manager | `max_pred_locks_per_transaction` × the same | Only used by `SERIALIZABLE`, allocated regardless |
+| SLRU caches | `transaction_buffers`, `subtransaction_buffers`, `multixact_offset_buffers`, `multixact_member_buffers`, `commit_timestamp_buffers`, `notify_buffers`, `serializable_buffers` | Ring buffers over `pg_xact`, `pg_subtrans`, `pg_multixact` and friends. PostgreSQL 17 turned these into real GUCs measured in 8 kB blocks; several default to 0, meaning "derive from `shared_buffers`" |
+| Proc array, fast-path locks, sinval queue | `max_connections` | A few kilobytes per *connection slot*, whether or not anyone connects |
+
+Three of those rows are why `max_connections` is not free even when the connections are idle: it
+sizes the proc array, the lock table and the predicate lock table simultaneously. And the lock
+table's failure mode is the one people meet first, because it does not queue, it errors:
+
+```
+ERROR:  out of shared memory
+HINT:  You might need to increase max_locks_per_transaction.
+```
+
+That comes from a single transaction touching more distinct objects than its share of the table —
+classically a query against a table with thousands of partitions, or a `pg_dump` of a schema with
+tens of thousands of relations. There is no wait and no spill; the table was sized at startup.
+
+InnoDB's map is shorter but has the same shape. `innodb_buffer_pool_size` is rounded up to a
+multiple of `innodb_buffer_pool_chunk_size` (128 MB) × `innodb_buffer_pool_instances` (8 once the
+pool is at least 1 GB), so on a default 8-instance pool the granularity is 1 GB and a request for
+5.5 GB silently becomes 6 GB; MySQL's manual also warns that the real allocation runs roughly 10%
+above the configured figure once block descriptors, the page hash and the adaptive hash index are
+counted. `innodb_log_buffer_size` (16 MB) is the redo equivalent of
+`wal_buffers`. The interesting one is `temptable_max_ram`: a 1 GB **global** budget for internal
+temporary tables, which is a genuinely different design from PostgreSQL's per-session `work_mem` —
+past it the TempTable engine falls back to on-disk internal temporary tables (InnoDB by default;
+the older mmap'd-file overflow was deprecated in 8.0.28), and it does so against a shared ceiling
+instead of letting every session have its own.
+
+## The per-backend column is a product, not a budget
+
+`work_mem` is the knob everyone gets wrong, and the reason is that it is scoped to none of the
+things people assume. It is not per query, not per connection, and not per server. It is the
+amount of memory **one plan node in one process** may use before it spills. So the real worst case
+is a multiplication:
+
+```
+work_mem × (hash nodes × hash_mem_multiplier + sort nodes) × (1 + parallel workers) × active sessions
+```
+
+Defaults: `work_mem` 4 MB, `hash_mem_multiplier` 2.0 since PostgreSQL 15 (so a hash join or hash
+aggregate node may take 8 MB where a sort takes 4). A plan with two hash joins and a sort, running
+with `max_parallel_workers_per_gather = 2`, holds 60 MB in one session at default settings. Raise
+`work_mem` to the 256 MB an analyst asked for and the same plan is 3.8 GB — in one session. Drag
+the sliders in the map above until the bar crosses the dashed line: nothing in the server stops
+you, because nothing in the server computes that product.
+
+The rest of the private column:
+
+- **`maintenance_work_mem`** (64 MB) is a separate, larger budget for `VACUUM`, `CREATE INDEX` and
+  `ALTER TABLE ... ADD FOREIGN KEY`. `autovacuum_work_mem` defaults to `-1`, meaning each of
+  `autovacuum_max_workers` (3) can take a full `maintenance_work_mem` at once. Before PostgreSQL
+  17, vacuum's dead-TID array was also capped at 1 GB no matter what you set; 17 replaced it with a
+  radix-tree TID store that both removed the cap and cut the memory needed for the same number of
+  dead tuples, which is the rare knob that got *better* by being used less.
+- **`temp_buffers`** (8 MB) is per session, for temporary-table pages, allocated lazily — and never
+  released until the session disconnects. A pooled connection that once created a big temp table
+  keeps its high-water mark for the life of the process.
+- **Catalog caches.** `relcache` and `syscache` entries accumulate in `CacheMemoryContext` as a
+  backend touches relations, and nothing prunes them. A schema with 10 000 partitions and a pooler
+  that spreads queries evenly across 200 long-lived backends means 200 copies of a large catalog
+  cache. `pg_backend_memory_contexts` shows your own backend's tree; `pg_log_backend_memory_contexts(pid)`
+  makes any other backend dump its tree into the server log.
+
+MySQL's equivalents — `sort_buffer_size`, `join_buffer_size`, `read_rnd_buffer_size`,
+`tmp_table_size` — are also per-operation, not per-connection, so they multiply the same way; the
+difference is that MySQL 8.0.28 added `connection_memory_limit` and `global_connection_memory_limit`,
+which actually enforce a ceiling and kill the offending statement. PostgreSQL has no equivalent;
+the closest thing is a cgroup, and a cgroup's response is the OOM killer.
+
+:::caution[Flip the engine toggle and watch the page-table row]
+PostgreSQL forks a process per connection, so every backend that touches the shared segment builds
+its own page tables for it. At 4 kB pages, 16 GB of `shared_buffers` needs 4 194 304 PTEs × 8 bytes
+= 32 MB of page tables **per backend**; at 400 backends that is 12.8 GB of kernel memory that
+appears in no configuration file. `mysqld` is one process with threads, so it pays that cost once.
+This is the single biggest reason huge pages matter more to PostgreSQL than to MySQL.
+:::
+
+## Memory contexts: how a database palloc's without leaking
+
+Inside a backend, almost nothing calls `malloc` directly. PostgreSQL allocates from a **memory
+context** — a node in a tree rooted at `TopMemoryContext`, with `CacheMemoryContext`,
+`MessageContext`, `TopTransactionContext`, per-portal and per-executor children hanging off it.
+`palloc()` carves from `CurrentMemoryContext`; the interesting operation is not `pfree()` but
+`MemoryContextReset()`.
+
+<MemoryContextArenaLab client:visible />
+
+The default allocator, **AllocSet** (`aset.c`), does three things worth knowing:
+
+- **Size classes.** A request is rounded up to a power of two, minimum 8 bytes, plus an 8-byte
+  chunk header (PostgreSQL 16 halved that header from 16 bytes). `palloc(130)` therefore consumes
+  264 bytes. Set the size slider to 130 B in the lab and watch the padding band.
+- **Doubling blocks.** Chunks come out of blocks that start at 8 kB and double toward 8 MB, so a
+  context that keeps growing makes exponentially fewer `malloc` calls. A request larger than
+  `allocChunkLimit` (8 kB at default settings) skips this entirely and gets a block sized exactly
+  for it.
+- **Freelists that never shrink.** `pfree()` pushes the chunk onto a per-size-class freelist owned
+  by that context. The block stays mapped. Only a later `palloc` from the *same context* rounding
+  to the *same class* can reuse it. This is why a backend's RSS is a high-water mark and why
+  "the memory is not being released" is usually not a bug.
+
+The payoff is the reset. Freeing a context costs one `free()` per **block**, no matter how many
+chunks are in it — nothing walks the allocations, nothing runs a destructor. That is what makes
+per-tuple memory practical: `ExprContext` is reset for every tuple the executor produces, and
+because reset keeps the first "keeper" block, that per-tuple reset allocates nothing at all after
+the first tuple. It is also the reason `elog(ERROR)` is safe in a codebase with tens of thousands
+of `palloc` calls and no cleanup code: the abort path resets the transaction context and every
+allocation made since the last savepoint vanishes at once, leak-free by construction.
+
+Two specialised allocators exist because AllocSet's freelists are the wrong shape for some
+workloads. **Generation** (`generation.c`) bump-allocates with no freelists and no rounding, and
+returns a block to libc only when its last chunk is freed — ideal when allocations die in roughly
+the order they were made, pathological when one survivor pins an 8 kB block (switch the lab to
+Generation, allocate a dozen chunks, free all but one, and watch the block stay). **Slab**
+(`slab.c`) cuts one fixed chunk size with a per-block free list, so it never fragments and can
+always hand a block back. Logical decoding's ReorderBuffer uses both, which is exactly the
+workload — thousands of same-sized change records with unpredictable lifetimes — they were written
+for.
+
+Underneath all of it sits the general allocator, and it has its own arena story. glibc's `malloc`
+creates per-thread arenas, up to eight times the core count, and each arena keeps its own free
+memory; a thread-per-connection engine on a 64-core box can therefore show hundreds of megabytes of
+RSS that no allocation owns. `MALLOC_ARENA_MAX` is the knob, and switching MySQL or RocksDB to
+jemalloc (with explicit `MALLOC_CONF` decay settings) is the standard production answer. RocksDB
+goes further and makes the budget explicit: memtables are arena-allocated, and a `WriteBufferManager`
+can charge both memtable memory and index/filter blocks to the same block cache, so one number
+bounds the whole engine instead of three numbers that sum to more than the container.
+
+## Huge pages, and why TLB reach is a database problem
+
+A page pool is a random-access structure over gigabytes, which is the worst case for address
+translation. With 4 kB pages, a core's second-level dTLB — on the order of 1 500 to 3 000 entries
+on current x86 — reaches something like 6–12 MB. Everything past that pays a page-table walk on
+top of the DRAM access, and the [latency ladder](/p01-foundations/hardware-os-durability/01-memory-hierarchy-and-latency-numbers/)
+already told you what an extra memory access costs. Two-megabyte pages multiply that reach by 512
+and cut the page tables by the same factor; the second panel of the memory map shows both numbers
+moving as you toggle them.
+
+The knobs are explicit and worth getting right:
+
+- PostgreSQL's `huge_pages` defaults to `try`, which **silently falls back** to 4 kB pages if the
+  pool cannot be reserved. Set it to `on` in production so a misconfigured `vm.nr_hugepages` fails
+  loudly at startup rather than quietly costing you the translation win you sized the box for, and size `vm.nr_hugepages`
+  from `postgres -C shared_memory_size_in_huge_pages`. `huge_page_size` picks 2 MB vs 1 GB where
+  the platform offers both.
+- MySQL's equivalent is the `large_pages` server variable, which maps the buffer pool from the
+  HugeTLB pool.
+- **Transparent huge pages are a different thing** and the usual advice is to disable them
+  (`/sys/kernel/mm/transparent_hugepage/enabled = never`, or at least `defrag = never`): khugepaged
+  compaction stalls show up as multi-hundred-millisecond latency spikes with no corresponding query
+  activity, which is a miserable thing to debug. Explicit huge pages give you the TLB win without
+  the compactor.
+
+## effective_cache_size allocates nothing
+
+It deserves its own heading because it is the knob most often "tuned" in the belief that it
+reserves memory. `effective_cache_size` (default 4 GB) is a *planner input*: it feeds the
+Mackert–Lohman formula that estimates how much of an index will still be cached when a nested loop
+re-reads it, and its only effect is to make index scans look cheaper or dearer than sequential
+scans. Setting it to 48 GB on a 64 GB box allocates nothing and reserves nothing; it tells the
+planner that the pool plus the OS page cache together hold about that much. Set it from the map
+above: pool + whatever is left unallocated.
+
+## Where it bites in production
+
+- **The OOM killer picks a backend, and the log lies about who was big.** Summing RSS across
+  backends double-counts every shared page they have touched, so 200 backends "using 1 GB each" on
+  a box with 8 GB of `shared_buffers` is mostly one 8 GB pool counted 200 times. Read `Pss` from
+  `/proc/PID/smaps_rollup`, not `Rss`, and treat `pg_shmem_allocations` plus
+  `pg_backend_memory_contexts` as the real accounting.
+- **PostgreSQL's own "out of memory" error dumps the context tree** into the server log —
+  every context with its `total`, `used` and `free` bytes, ending in a `Grand total:` line. The
+  largest context names the culprit directly: `ExecutorState` means a hash node, `CacheMemoryContext`
+  means catalog bloat, `MessageContext` means a gigantic query string or parameter list.
+- **The incident is always a plan change, never a config change.** A box runs for months at 40%
+  memory because the product is never realised; then statistics shift, a nested loop becomes a hash
+  join across 300 sessions, and the private column triples in a minute. The defence is bounding the
+  multiplicands — a connection pooler to cap active sessions, `work_mem` set per role or per
+  statement rather than globally, and `max_parallel_workers_per_gather` kept modest on OLTP boxes.
+- **Huge pages you think you have.** `huge_pages = try` plus a reboot that reset `vm.nr_hugepages`
+  is invisible until you check `AnonHugePages`/`HugePages_Free` in `/proc/meminfo` against the
+  running server.
+- **Overcommit.** The PostgreSQL documentation recommends `vm.overcommit_memory = 2` with a tuned
+  `overcommit_ratio` on dedicated hosts so that an allocation fails cleanly in one backend instead
+  of the kernel killing an arbitrary process; the postmaster can also be protected by setting its
+  `oom_score_adj` low. Container memory limits change this calculus again, and belong to the
+  Operating part of the curriculum along with cgroup accounting of the page cache.
+
+:::note[What to take forward]
+The shared segment is a real reservation, computed at startup from `shared_buffers` *and* from
+`max_connections` in three separate places; everything private is an upper bound that is a product
+of grants, plan nodes, workers and active sessions, and nothing in the engine multiplies it out.
+Memory contexts make that private memory disposable — reset costs one `free()` per block, which is
+what makes per-tuple allocation and error recovery cheap — but they never return chunks to libc, so
+RSS is a high-water mark. And the pool is only free of the kernel until you count page tables: one
+copy per backend at 4 kB pages, 512× smaller with explicit huge pages.
+:::

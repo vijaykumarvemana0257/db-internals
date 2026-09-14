@@ -1,0 +1,253 @@
+---
+title: Catalog storage, the bootstrap problem and cache invalidation
+description: pg_class and pg_attribute are heap tables with xmin and xmax like any other, which raises the question of how a backend finds pg_class before it can read pg_class — and what stops two backends disagreeing about a table's shape.
+depth: intermediate
+sidebar:
+  order: 7
+---
+
+import CatalogBootstrapInvalidationLab from '../../../../components/viz/CatalogBootstrapInvalidationLab';
+
+Everything on the previous six pages assumed the engine already knew what a tuple looked like:
+how many attributes, how wide each one is, which are `NOT NULL`, where the TOAST table lives.
+That knowledge is itself stored in tuples, on pages, in heap files, under the same MVCC rules —
+which creates a genuine circularity (you need a tuple descriptor to read the table that holds
+tuple descriptors) and a genuine consistency problem (every backend caches this data
+aggressively, and DDL makes those caches wrong).
+
+<CatalogBootstrapInvalidationLab client:visible />
+
+## The catalogs are tables, with all the consequences
+
+In PostgreSQL there is no separate metadata store. `pg_class` is a heap relation with an OID,
+a relfilenode, pages, line pointers and tuples carrying `xmin`/`xmax`. So is `pg_attribute`,
+`pg_index`, `pg_type` and the rest of the system catalogs. You can read them with an ordinary
+`SELECT`, and the planner will show you an index scan:
+
+```sql
+SELECT attnum, attname, atttypid::regtype, attlen, attalign, attisdropped
+FROM   pg_attribute
+WHERE  attrelid = 'orders'::regclass
+ORDER  BY attnum;
+```
+
+The division of labour is worth memorizing, because every later module reads these:
+`pg_class` holds one row per relation — table, index, sequence, view, TOAST table, partition —
+with `relnatts`, `relfilenode`, `relpages`, `reltuples`, `relhasindex`, `relfrozenxid`.
+`pg_attribute` holds one row per column *per relation*, including the columns of indexes, with
+`attnum`, `attlen`, `attalign`, `attnotnull`, `attisdropped`. `pg_type` holds `typlen`,
+`typbyval`, `typalign` and `typstorage` — precisely the four fields the tuple deformer needs.
+`pg_index` holds one row per index with the key column list and the two booleans that gate it:
+`indisready`, meaning writers maintain it, and `indisvalid`, meaning the planner may use it.
+`pg_statistic` holds the sampled column statistics the planner costs with — written by `ANALYZE`,
+and the hand-off to the cost-based optimization module.
+
+Because these are MVCC tables, DDL behaves like an `UPDATE`. `ALTER TABLE … ADD COLUMN` writes
+one new `pg_attribute` tuple and a *new version* of the `pg_class` row, leaving the old version
+dead on the page. `DROP COLUMN` writes a new version of the `pg_attribute` row — `attisdropped` set
+true, the name rewritten to `........pg.dropped.4........` — and never reduces `relnatts`,
+because attnums are never reused and every existing heap tuple still contains that column's
+bytes in exactly that position. The deformer keeps skipping the right width because `attlen`
+and `attalign` are deliberately left untouched. Step the lab through DROP COLUMN and watch what
+does *not* change.
+
+The MVCC-ness has a second consequence: catalogs bloat, and they are vacuumed like anything
+else. A workload that creates thousands of temporary tables a second writes a `pg_class` row,
+a `pg_type` row (every relation gets a composite type), several `pg_attribute` rows and
+`pg_depend` rows for each one, then kills them all. `pg_attribute` in the tens of gigabytes on a
+database with four hundred user tables is a real shape, not a hypothetical.
+
+One catalog write deliberately escapes MVCC: `ANALYZE` and `VACUUM` overwrite `relpages` and
+`reltuples` inside the *existing* `pg_class` tuple with `heap_inplace_update()` rather than
+writing a version. A planner statistic nobody reads transactionally therefore creates no dead
+tuple — and survives a `ROLLBACK`. Run the lab's `ANALYZE` step and compare that row's outline
+with every other row it writes.
+
+:::note[Catalog reads do not use your transaction snapshot]
+A `REPEATABLE READ` transaction sees a frozen view of user data, but catalog scans take a
+*fresh* catalog snapshot (`GetCatalogSnapshot()`), invalidated whenever a relevant message
+arrives. So DDL committed by somebody else after your transaction began **is** visible to your
+catalog lookups, even while the table's rows are not. This is not a bug — it is what makes it
+possible to bound how stale a definition can be at all.
+:::
+
+## The bootstrap problem
+
+Now the circularity. To read a tuple out of `pg_class` a backend needs a tuple descriptor for
+`pg_class`; to build that descriptor it normally reads `pg_class` and `pg_attribute`; and
+before any of that it needs to know *which file on disk* holds `pg_class`, which is recorded in
+the `relfilenode` column of the `pg_class` row describing `pg_class`.
+
+PostgreSQL breaks the circle in two places, both of them outside the catalogs.
+
+**Nailed relations.** `relcache.c` contains `formrdesc()`, which builds relcache entries for
+four catalogs — `pg_class`, `pg_attribute`, `pg_proc`, `pg_type` — from hard-coded schema
+structs generated at build time from the catalog headers. These descriptors exist in the
+binary; no tuple has to be read to obtain them, and they are never evicted. Everything else can
+then be read normally.
+
+**The relation map.** Knowing the *shape* of `pg_class` does not tell you the *file*. That is
+what `pg_filenode.map` is for: a fixed 512-byte, CRC-protected flat file — `global/pg_filenode.map`
+for the shared catalogs and `base/<dboid>/pg_filenode.map` per database — read directly with
+no catalog machinery at all. Relations whose location lives there are **mapped relations**, and
+they advertise it by storing zero in the catalog column:
+
+```sql
+SELECT relname FROM pg_class WHERE relfilenode = 0;   -- the mapped relations
+SELECT pg_relation_filenode('pg_class');              -- the function consults the map
+```
+
+The reason the map exists is not startup, it is rewriting. `VACUUM FULL` and `REINDEX` give a
+relation a brand-new relfilenode, and you cannot record pg_class's new filenode in pg_class —
+the row saying where the file is would be inside the file that just moved. So the mapping is
+updated by rewriting the whole 512-byte file and WAL-logging it as an `XLOG_RELMAP_UPDATE`
+record, and a `relmap` invalidation goes out to every backend. Run `VACUUM FULL pg_class` in
+the lab and watch the map entry move while the catalog column stays 0.
+
+Shared catalogs — `pg_database`, `pg_authid`, `pg_tablespace` — need the map for a further
+reason: a backend must find `pg_database` *before* it knows which `base/<dboid>/` directory it
+is supposed to be looking in.
+
+The third piece is an optimization rather than a necessity. Building relcache entries for every
+system catalog and every catalog index with individual index scans is slow to do on every
+connection, so the first backend to do it serializes the result into `base/<dboid>/pg_internal.init`
+and later backends read it sequentially in one go. Any DDL commit unlinks that file; the next
+backend rebuilds and rewrites it. Press **Cold start backend B** in the lab, then run a DDL
+commit first and cold-start again, and compare the read counts — this is why the first
+connection after a migration is measurably slower than the next thousand.
+
+## What every backend caches, and what it costs
+
+Two caches sit on top of those rows, both private to a single backend process:
+
+- The **relcache** (`RelationData`, keyed by relation OID) — the expanded form of everything
+  needed to touch a relation: the `TupleDesc` (a materialized join of `pg_attribute` and
+  `pg_type`), the index list, the access-method routines, the rules and triggers, the
+  relfilenode. Built by `RelationIdGetRelation()`.
+- The **syscache**, or catcache (`catcache.c`) — a set of per-catalog hash tables over
+  individual rows, reached by `SearchSysCache1(RELOID, …)`, `ATTNAME`, `ATTNUM`, `TYPEOID`,
+  `PROCOID`, `INDEXRELID`, `STATRELATTINH` and so on.
+
+The payoff is large: a hit is a hash lookup and a pointer dereference, where a miss is a dozen
+index scans across five catalogs before the statement can even be parsed. The cost is that
+these caches live in each backend's `CacheMemoryContext` and are not evicted on an LRU basis —
+entries live until something invalidates them. A pooled connection that has touched fifty
+thousand partitions holds fifty thousand relcache entries, and the backend's RSS never comes
+back down until the connection is recycled.
+
+## Invalidation is a queue, and nobody waits
+
+PostgreSQL is multi-process: backend A cannot reach into backend B's memory. So a DDL
+transaction accumulates **invalidation messages** locally as it modifies catalog tuples —
+`CacheInvalidateHeapTuple()` produces a relcache message for the relation and a catcache
+message per modified tuple — and at commit it appends them to a shared circular buffer in
+shared memory, the *sinval* queue. Then it returns. It does not wait for anyone to read them.
+
+Every other backend drains that queue at `AcceptInvalidationMessages()`, which runs at the
+start of each command and — crucially — inside `LockRelationOid()` immediately after the lock
+is granted, retrying the drain if the lock had to wait. Draining does not rebuild anything; it
+marks entries invalid, and the rebuild happens lazily on the next `RelationIdGetRelation()`. A
+backend that never touches the altered table again never pays.
+
+So yes, a backend can hold a stale definition, and the lab lets you read one: commit the DDL in
+A, then read in B before accepting the messages, and B will cheerfully report the old column
+list and the old plan. The bound on that staleness is not timing, it is **lock ordering**. The `ALTER TABLE` forms that
+change a tuple descriptor take `AccessExclusiveLock` on the table; every reader holds at least
+`AccessShareLock` for as long as it is touching it; and acquiring a lock drains the queue. B
+therefore cannot be using the stale definition at any moment when the new one is committed — tick
+*"B holds an open transaction"* and watch `ALTER TABLE` block before it can even start. Not every
+DDL statement needs that: `CREATE INDEX` takes `ShareLock` and both `CREATE INDEX CONCURRENTLY`
+and `ANALYZE` take `ShareUpdateExclusiveLock`, none of which conflict with a reader — which is why
+CIC has to *wait for older transactions to end* between its commits instead, and why the lab
+stalls there when B's transaction is open. Where you genuinely can observe a stale
+answer is for state that is not protected by a relation lock: role membership, settings,
+cached plans that have not yet been revalidated.
+
+Two failure modes fall out of the queue being finite. `sinvaladt.c` sizes it at
+`MAXNUMMESSAGES = 4096`. A backend that lags gets a catchup signal telling it to drain. A
+backend that lags far enough that its unread messages would be overwritten cannot know what it
+missed, so it gets a **reset** flag: `InvalidateSystemCaches()` throws away the relcache, every
+catcache and the catalog snapshot, and the next few hundred statements in that backend pay full
+catalog lookups. Press **Flood the sinval ring** to see it. The writer is never blocked; the
+reader always pays.
+
+:::tip[Reproducing invalidation bugs on purpose]
+The GUC `debug_discard_caches` (PostgreSQL 14 and later; a compile-time option called
+`CLOBBER_CACHE_ALWAYS` before that) forces cache invalidation at every legal opportunity. It
+makes the server roughly a hundred times slower and is how extension authors find code that
+holds a cached pointer across an invalidation point.
+:::
+
+## The same problem in other engines
+
+| Engine | Where the dictionary lives | Bootstrap | Cache and invalidation |
+|---|---|---|---|
+| PostgreSQL | `pg_class`, `pg_attribute`, … — ordinary MVCC heap tables | 4 nailed catalogs + `pg_filenode.map` + `pg_internal.init` | relcache + syscache per process; sinval ring drained at lock acquisition |
+| InnoDB (MySQL 8.0+) | Hidden InnoDB tables in `mysql.ibd`; plus per-tablespace SDI | Core DD table definitions compiled into the server | `dict_sys` + server `TABLE_SHARE` cache; invalidation by MDL inside one process |
+| MySQL ≤ 5.7 | `.frm` files *and* InnoDB `SYS_TABLES`/`SYS_COLUMNS` | Directory scan + internal SYS_ tables | Two dictionaries that could disagree; DDL was not atomic |
+| SQLite | `sqlite_schema` on page 1 — the literal `CREATE` text plus a root page number | Page 1 is at a known offset; parse the SQL | Per-connection parsed schema; a 4-byte schema cookie in the header |
+| Oracle | `SYS`-owned dictionary tables in the SYSTEM tablespace | `bootstrap$`, whose own definition is compiled in | Row cache in the shared pool; DDL invalidates dependent cursors in the library cache |
+
+**InnoDB** solved the same problem differently and recently. Before 8.0 there were two
+dictionaries — the server's `.frm` files and InnoDB's own `SYS_TABLES`, `SYS_COLUMNS`,
+`SYS_INDEXES` — which could disagree after a crash, and DDL was not atomic because the file
+rename and the InnoDB transaction were separate events. MySQL 8.0 moved everything into InnoDB
+tables in a single protected tablespace, `mysql.ibd`; a dictionary update is now a transaction
+in the same engine as the data, which is what made atomic DDL possible. The bootstrap answer is
+the same idea as nailing: definitions for a small set of core dictionary tables are compiled
+into the server, enough to open `mysql.ibd` and read the rest. Each tablespace also carries
+Serialized Dictionary Information (SDI) describing the objects inside it, so an `.ibd` file is
+self-describing enough to be imported into another server — `ibd2sdi` will print it. Because
+`mysqld` is one process with one address space, there is no message queue: the cached
+`TABLE_SHARE` (sized by `table_definition_cache`) is protected by metadata locks, and DDL takes
+an exclusive MDL that forces every other thread to close and reopen the share.
+
+**SQLite** has the opposite constraint — many processes, no shared memory to broadcast into —
+and takes a pull model. `sqlite_schema` (called `sqlite_master` before 3.33) sits on page 1 and
+stores, for each object, its type, name, root page number and the original `CREATE` statement
+text. A connection builds its in-memory schema by re-parsing that SQL. The invalidation channel
+is a single 4-byte **schema cookie** at offset 40 of the database header, bumped by any schema
+change. Every prepared statement records the cookie it was compiled against and the VDBE
+verifies it when it opens its read transaction; a mismatch yields `SQLITE_SCHEMA`. With
+`sqlite3_prepare_v2()` the statement is transparently re-prepared; with the legacy
+`sqlite3_prepare()` the error reaches your application. Note what `VACUUM` does here: it moves
+b-tree root pages, which rewrites `sqlite_schema`, which bumps the cookie, which makes every
+connection in every process reparse the entire schema.
+
+## Where it bites in production
+
+- **Catalog bloat from temp tables.** A pooled application creating temporary tables per request
+  writes several catalog rows per table and leaves dead versions behind. Symptoms: `pg_class`
+  and `pg_attribute` with huge `n_dead_tup` in `pg_stat_all_tables`, catalog lookups and
+  relcache rebuilds slowing down, autovacuum permanently busy on system catalogs. The cure —
+  `VACUUM FULL`/`REINDEX` on a catalog — needs an `AccessExclusiveLock` on the thing every
+  session needs to read.
+- **`cache lookup failed for relation 16385`.** An `elog` from the syscache, usually alongside
+  `could not open relation with OID 16385`. It almost always means something resolved an OID
+  and then used it without holding a lock while a concurrent `DROP` committed in between.
+  Treat it as a locking bug, not a corruption report.
+- **Invalidation storms.** Heavy DDL makes every other backend drain, invalidate and rebuild;
+  at high enough rates backends start getting full cache resets and burn CPU rebuilding
+  descriptors, with contention visible on the `SInvalReadLock`/`SInvalWriteLock` wait events.
+- **Per-backend memory with many partitions.** Thousands of partitions × long-lived pooled
+  connections × no cache eviction = hundreds of megabytes of `CacheMemoryContext` per backend
+  that only goes away when the connection does. `pg_backend_memory_contexts` will show you.
+- **Indexes stuck at `indisvalid = false`.** A cancelled `CREATE INDEX CONCURRENTLY` leaves a
+  `pg_index` row that writers still maintain and the planner never uses: you pay the write cost
+  for nothing. Find them with `SELECT indexrelid::regclass FROM pg_index WHERE NOT indisvalid`,
+  then `DROP INDEX` and rebuild.
+- **MySQL dictionary cache pressure.** `Table_open_cache_overflows` and
+  `Table_open_cache_misses` climbing means `table_open_cache`/`table_definition_cache` are too
+  small for the schema and every miss goes back to the dictionary tables in `mysql.ibd`.
+
+:::note[What to take forward]
+The engine's self-description is stored in exactly the same structures as your data — heap
+tuples on slotted pages with MVCC visibility — which is why DDL is fast, why catalogs bloat,
+and why finding `pg_class` needs an escape hatch outside the catalogs: four nailed descriptors
+compiled into the binary plus a 512-byte `pg_filenode.map`. Every backend caches the result in
+a relcache and syscache it owns privately, so DDL cannot update those caches directly; it
+broadcasts invalidation messages into a shared ring and moves on. Correctness comes from lock
+ordering rather than timing — a backend drains the queue when it takes the lock it needed
+anyway — and the visible failure modes are a lagging backend forced into a full cache reset, a
+bloated `pg_attribute`, and an OID used without a lock.
+:::

@@ -1,0 +1,219 @@
+---
+title: 'Storage abstractions: files, block devices and object stores'
+description: What a POSIX file, a raw block device and an S3 bucket each let an engine do — offsets, appends, atomic publish, durability acks — and why the differences reshape storage engines.
+depth: basics
+sidebar:
+  order: 3
+---
+
+import StorageBackendWritePath from '../../../../components/viz/StorageBackendWritePath';
+
+A storage engine is not written against a disk. It is written against an **interface**, and
+there are only three that matter: the POSIX file, the raw block device, and the object store.
+They differ on exactly the four operations an engine leans on hardest — overwrite bytes at an
+offset, append, publish a new version atomically, and be told the data is durable. Take one
+of those away and the engine's on-disk layout has to change shape.
+
+<StorageBackendWritePath client:visible />
+
+Switch the backend from NVMe to S3 and watch the path stop being a sequence of syscalls: the
+append has nowhere to go, `fdatasync` has no equivalent, and updating 4 KB in place turns into
+moving the whole segment twice. That rewrite is the entire reason object-store engines are
+log-structured.
+
+## A file is a map of extents, not a byte array
+
+`open`/`pread`/`pwrite` present a file as a flat array of bytes. Underneath, the inode holds
+an **extent map** — ext4 stores four `ext4_extent` records inline in the inode's 60-byte `i_block`
+and spills to an on-disk extent tree beyond that; XFS uses a B+tree — mapping file offset ranges
+to contiguous logical block addresses on the device. Three consequences
+leak through the abstraction and every serious engine deals with all three.
+
+**Preallocation.** Extending a file writes metadata: a new extent record, an inode size update,
+a journal transaction. `fallocate(fd, 0, offset, len)` reserves the blocks up front, so later
+writes only touch data. This is why PostgreSQL creates WAL segments at their full 16 MB
+(`wal_segment_size`) and then *recycles* rather than deletes them, why InnoDB grows tablespaces
+in `innodb_autoextend_increment` chunks (64 MB by default), and why RocksDB calls fallocate on
+each new SSTable. It also buys the difference between `fsync` and `fdatasync`: `fdatasync`
+skips the inode metadata flush *only if the file size did not change*, so writing into
+preallocated space is a materially cheaper flush than appending past EOF.
+
+**Sparse files.** Seek to offset 1 GB in an empty file and write 4 KB, and the filesystem
+allocates one block, not 262 144. Reads of the hole return zeros with no I/O, `ls -l` reports
+1 GB and `du` reports 4 KB. Engines use `FALLOC_FL_PUNCH_HOLE` to release space in the middle
+of a file that is still open. The trap is that a sparse file can fail to write later: the
+space was never reserved, so a write into a hole can return `ENOSPC` long after the file
+"existed" at full size. `fallocate` without `FALLOC_FL_KEEP_SIZE` is the fix.
+
+**Fragmentation.** Interleave appends to twenty files on one filesystem and each file's extents
+end up scattered. `filefrag -v` on a 1 GB SSTable that reports 3 000 extents is a real thing;
+on an HDD that is 3 000 seeks on a scan, and even on NVMe it inflates the extent tree past the
+inode's inline capacity, pushing extra metadata reads and journal writes into the I/O path.
+Preallocating in large chunks is also the fragmentation fix.
+
+:::caution[The page cache is in this picture too]
+`write()` returns when the bytes are in the kernel page cache — the device has not been touched.
+`O_DIRECT` bypasses that cache (InnoDB's `innodb_flush_method=O_DIRECT`), which is why engines
+with their own buffer pool use it and why a benchmark that never calls `fsync` measures memcpy
+speed. The next page takes this apart properly.
+:::
+
+## A raw block device removes the filesystem, not the physics
+
+Open `/dev/nvme0n1` (or an LVM logical volume) directly and you get an array of 512 B or 4 KB
+sectors and nothing else. Oracle ASM works this way, MySQL supported raw partitions for years,
+and Ceph's BlueStore manages raw devices with RocksDB holding its metadata.
+
+What you gain: no filesystem journal doubling your metadata writes, no double buffering, no
+surprise `fsync` on an inode, and exact control of alignment — you can put every page boundary
+on a 4 KB sector and size your write unit to the drive's indirection granularity.
+
+What you give up is mostly *naming*. There is no `rename()`, so "atomically publish version N+1"
+becomes a protocol you design yourself: write the new data somewhere unused, flush, then write
+one sector-sized superblock pointing at it, flush again. There is no `ls`, no `cp`, no file
+backup tool, no way for an operator to see what is there. Most engines decided that trade is
+not worth it once filesystems got good, which is why "put the data directory on XFS with
+`O_DIRECT`" is the mainstream answer today.
+
+One thing the raw device does *not* give you is atomicity beyond a sector. A 16 KB InnoDB page
+is four sectors; power loss mid-write can leave two old and two new. That is the torn page, and
+it is why InnoDB has a doublewrite buffer and PostgreSQL has `full_page_writes`.
+
+## Object stores change the algebra, not just the latency
+
+S3 is not a slow filesystem. It is a **key → immutable blob** map with a different set of legal
+operations:
+
+| Operation | POSIX file | Raw block device | S3 |
+|---|---|---|---|
+| Write bytes at an offset | `pwrite` | write an LBA | **impossible** — PUT replaces the whole object |
+| Append | `O_APPEND` write | — | **impossible** — new key, or rewrite |
+| Read a byte range | `pread` | read an LBA | `GET` with `Range:` — fully supported |
+| Publish atomically | `rename` + dir `fsync` | your own superblock CAS | PUT is atomic per key; `If-Match`/`If-None-Match` gives CAS |
+| Durability ack | `fsync` / `fdatasync` | `fsync` on the fd | the HTTP 200 on the PUT |
+| Enumerate | `readdir` | — | `LIST`, 1 000 keys per request, billed as a write |
+| Rename / move | O(1) | — | `COPY` (≤5 GB, else multipart) then `DELETE` |
+| Priced by | capacity | capacity | capacity **and every request** |
+
+The asymmetry in rows 1 and 3 is the load-bearing one: **you can read any byte range you like and
+you can never write one.** An engine that wants to change 4 KB inside a 64 MB object must GET
+128 MB of traffic through two requests and produce a new object. So engines stop updating in
+place. New data becomes new objects, deletes become tombstones, and a background compaction
+rewrites whole files — which is to say, an object store forces the LSM shape on you whether you
+wanted it or not.
+
+Pricing pushes the same way. In us-east-1, S3 Standard is about $0.023 per GB-month, while PUT,
+COPY, POST and LIST cost $0.005 per 1 000 requests and GET costs $0.0004 per 1 000. Write a GB
+as one million 1 KB objects and the requests cost $5.00 against $0.023/month of storage —
+**requests are 200× the storage bill**. The engineering rule falls straight out: batch until the
+object is at least a few MB, and never let a hot path issue a request per row. Multipart upload
+enforces its own version of this with a 5 MB minimum part size and a 10 000 part limit.
+
+`LIST` deserves its own warning. It returns 1 000 keys per request, is billed at the write rate,
+and its cost scales with the number of objects under a prefix, not with the number you want.
+A bucket with 5 million Parquet files costs 5 000 requests and tens of seconds just to find out
+what exists. This is precisely why table formats keep their own file list: Iceberg's
+`metadata.json` plus manifest lists, Delta Lake's `_delta_log`, Hudi's timeline. The engine reads
+one object to learn the file set instead of listing the bucket.
+
+:::tip[Two S3 changes that mattered]
+S3 became strongly read-after-write consistent for all operations, listings included, in
+December 2020 — before that, engines needed an external consistent store (the `s3guard`
+DynamoDB table) to know their own writes existed. And conditional writes arrived in 2024
+(`If-None-Match` for create-if-absent, `If-Match` for compare-and-swap on an ETag), which is
+what lets a commit protocol swap a manifest pointer atomically with no external lock service.
+Designs older than these dates solve problems you no longer have.
+:::
+
+## Network block storage: a file API with a network under it
+
+EBS keeps the POSIX interface and moves the device across a network. Nothing in your code
+changes; the numbers do.
+
+| | Local NVMe (instance store) | EBS gp3 | EBS io2 Block Express | S3 Standard |
+|---|---|---|---|---|
+| Random read latency | 50–100 µs | ~0.5–1 ms | ~0.3–0.6 ms | 20–60 ms |
+| Ceiling | millions of IOPS, GB/s | 3 000 IOPS / 125 MB/s baseline, up to 16 000 / 1 000 MB/s | up to 256 000 IOPS | ~3 500 PUT/s per prefix |
+| Survives host stop/start | no | yes | yes | yes |
+| Survives AZ loss | no | no | no | yes |
+| Priced by | bundled in the instance | GB-month + provisioned IOPS/throughput | GB-month + IOPS | GB-month + per request |
+
+The millisecond matters more than it looks, because it is paid on every flush. A single
+transaction stream that fsyncs at 0.7 ms per commit cannot exceed ~1 400 commits/s no matter how
+many cores the box has — the latency, not the IOPS number, is the limit. That is why group
+commit (`commit_delay`/`commit_siblings` in Postgres, `binlog_group_commit_sync_delay` in MySQL)
+goes from a micro-optimization on local NVMe to a necessity on EBS.
+
+Two capacity traps live here. First, the instance has its own EBS bandwidth limit independent of
+the volume's — an `m5.large` caps around 4 750 Mbps of EBS traffic regardless of how many IOPS
+you provisioned. Second, gp3 gives baseline performance immediately while gp2 earned burst
+credits, so a gp2 volume that benchmarked fine for ten minutes can fall to its 100 IOPS baseline
+in hour three.
+
+Local NVMe is the opposite trade: microsecond latency and hundreds of thousands of IOPS, and the
+data is gone the moment the instance stops. Not crashes — *stops*. A stop/start moves the
+instance to different hardware and the instance store is zeroed. Engines that use it treat it as
+a cache (ClickHouse's local disk cache, RocksDB's secondary cache, Aurora's local temp storage)
+or replicate at the application layer (Cassandra RF=3 on i3en, where losing a node is routine).
+
+## Redundancy is not durability, and durability is not correctness
+
+These three are independent, and conflating them is the single most common storage mistake in
+production systems.
+
+1. **Did the write reach non-volatile media?** Answered by `fsync`/`fdatasync` returning 0, or by
+   S3 returning a 200. Nothing else answers it.
+2. **How many independent failure domains hold it?** Answered by RAID (devices), EBS replication
+   (devices within one AZ), S3 (three or more AZs).
+3. **Are the stored bytes the right bytes?** Answered by checksums, backups with retention and
+   point-in-time recovery. Nothing in 1 or 2 helps here at all.
+
+A write that your process handed to `write()` and never flushed is lost in a power cut on RAID 10,
+on EBS, and on S3 alike — none of them ever saw it. Conversely, replication is perfectly faithful:
+a corrupted page, a bad `UPDATE` or a `DROP TABLE` is copied to every replica at machine speed.
+S3's eleven nines is an annual expectation for objects it has already accepted; it is not a claim
+about your bug, and it never was.
+
+The failure panel in the visual makes the shape of this concrete. RAID 10 buys you row one and
+nothing else. EBS buys rows one and two — the volume survives its host, and you can reattach it —
+but an EBS volume lives in exactly one AZ, and its snapshots (which do live in S3, regionally) are
+point-in-time and lag. S3 Standard buys all three physical rows, and S3 Express One Zone
+deliberately trades the AZ row back for single-digit-millisecond latency. None of them buys the
+last two rows.
+
+:::danger[fsync can fail, and the page may already be gone]
+Linux's historical behaviour on a write-back error was to mark the page clean and report `EIO`
+once, to whoever called `fsync` next — possibly a different process. A retried `fsync` then
+returned success with the data never written. PostgreSQL's "fsyncgate" in 2018 ended with the
+only safe response: `data_sync_retry = off`, which panics and recovers from the WAL rather than
+trusting a second `fsync`. Read the return value of every flush, and treat failure as a crash.
+:::
+
+## Where it bites
+
+- **Postgres on a default gp3 volume.** Checkpoint flushes saturate 3 000 IOPS, commit latency
+  jumps from 1 ms to tens of ms, and `pg_stat_activity` fills with `IO:WALSync` and
+  `IO:DataFileWrite` waits. The knobs are provisioned IOPS, `checkpoint_completion_target`, and
+  a bigger `max_wal_size` so checkpoints are rarer.
+- **A database on an S3 FUSE mount.** Every 4 KB buffer-pool miss becomes a GET, startup listing
+  takes minutes, and the bill is dominated by requests. FUSE makes the object store *look* like
+  a file, which hides exactly the differences that matter.
+- **Small-file sprawl in a lakehouse.** 50 000 new Parquet files a day makes query planning a
+  LIST-bound operation and the request line the biggest item on the invoice. Compaction into
+  128–512 MB files plus a manifest is the standard fix.
+- **Instance-store surprise.** Someone stops an i3en for cost savings, starts it again, and the
+  data directory is empty. There was no crash, no alarm, and no backup requirement violated —
+  the abstraction simply never promised that.
+
+Those constraints are also the seed of modern **disaggregated** designs: Aurora ships redo records
+to a six-way quorum across three AZs instead of pages, Neon splits safekeepers (durable WAL) from
+pageservers (materialized pages on S3), and Kafka-on-S3 systems trade milliseconds of latency for
+zero cross-AZ transfer cost. The architectures module builds those from the primitives here.
+
+:::note[What to take forward]
+The interface, not the device, decides the layout: files let you overwrite at an offset and
+publish with `rename`, object stores let you do neither, and that single difference is why
+engines on S3 are always log-structured with a manifest. Pricing per request, not per byte, is
+the second forcing function. And redundancy, durability and correctness are three separate
+properties — `fsync` answers only the second, and nothing but backups answers the third.
+:::

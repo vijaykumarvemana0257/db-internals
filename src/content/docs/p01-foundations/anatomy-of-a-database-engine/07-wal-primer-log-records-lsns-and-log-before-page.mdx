@@ -1,0 +1,245 @@
+---
+title: "WAL primer: log records, LSNs and log-before-page"
+description: Why every engine writes its log before its pages — log records, LSNs as byte offsets, the pageLSN stamp, the two rules, and a redo pass you can step one record at a time.
+depth: intermediate
+sidebar:
+  order: 7
+---
+
+import WalLogBeforePageLab from '../../../../components/viz/WalLogBeforePageLab';
+
+A committed transaction has to survive a crash that happens between any two instructions, and
+the pages it modified are scattered across a file in no useful order. Writing those pages
+synchronously would cost one random write per commit and still not be atomic — a crash halfway
+through leaves some pages new and some old with no record of which. Every durable engine
+solves this the same way: **the change is described in a sequential log, the log is made
+durable, and the pages follow later, at leisure.** Everything else in this page is the
+bookkeeping that makes "later" safe.
+
+<WalLogBeforePageLab client:visible />
+
+## What one log record contains
+
+A log record has to carry enough information to reconstruct a change after a restart, and
+there are three ways to say that.
+
+- **Physical** — "these bytes of this page became those bytes", or, at its bluntest, "here is
+  the whole new page". Trivially idempotent, verbose.
+- **Logical** — "insert this row into this table". Compact, and dangerous: replaying it means
+  re-running index maintenance, free-space choices and everything else the operation did, and
+  it must end at exactly the same physical state.
+- **Physiological** — "on *this page*, perform *this operation*". Logical within a page,
+  physical about which page. This is what real engines use, and the reason is precisely that
+  the recovery decision — apply or skip — can then be made per page.
+
+PostgreSQL's record is an `XLogRecord` header (24 bytes: `xl_tot_len`, `xl_xid`, `xl_prev`,
+`xl_info`, `xl_rmid`, `xl_crc`) followed by up to 32 **block references** and the
+resource-manager payload. `xl_rmid` names the resource manager that will redo it — `Heap`,
+`Btree`, `Transaction`, `XLOG` — and each block reference carries the relation, fork and block
+number. A line of `pg_waldump` output reads:
+
+```
+rmgr: Heap  len (rec/tot):  54/ 8250, tx: 754, lsn: 0/016A02F8, prev 0/016A02C0,
+  desc: UPDATE off 3 xmax 754, blkref #0: rel 1663/16384/16385 blk 0 FPW
+```
+
+Two lengths, `rec` and `tot`: 54 bytes of description and 8250 bytes total, because this record
+also carries a full page image (`FPW`) — more on that below.
+
+InnoDB builds redo inside a **mini-transaction** (`mtr`). An mtr latches the pages it will
+touch, accumulates `MLOG_*` records (`MLOG_REC_INSERT`, `MLOG_WRITE_STRING` and friends), and
+on commit appends the whole batch to the global log buffer as a unit. The unit matters: an
+index split spanning three pages is one mtr, so recovery never sees half of it.
+
+SQLite is the honest outlier. In rollback-journal mode it copies the **original** page images
+into a side file before touching the database; in WAL mode it appends the **new** page images
+as frames, each with a 24-byte frame header carrying the page number, a pair of salt values and
+a running checksum. No logical description, no per-record LSN — whole pages, in order.
+
+| Engine | Log record granularity | Log file(s) | Wraps? |
+|---|---|---|---|
+| PostgreSQL | Physiological, block-referenced; FPI after a checkpoint | `pg_wal/` — 16 MB segments, recycled | No — it advances forever |
+| InnoDB | Physiological `MLOG_*` records grouped into mtrs | `#innodb_redo` files, `innodb_redo_log_capacity` (100 MB default) | Yes — a circular buffer |
+| SQLite (WAL mode) | Whole 4 KB page images as frames | `<db>-wal` | Reset at checkpoint |
+| SQLite (journal) | Whole *old* page images (undo, not redo) | `<db>-journal` | Deleted at commit |
+| RocksDB | Logical key/value batches | `*.log` per memtable | Deleted when the memtable flushes |
+
+## The LSN is a byte offset
+
+A **log sequence number** is not a counter that happens to increase. In PostgreSQL and InnoDB
+it is the byte position of the record inside the logical, infinitely long log — which makes a
+great many things fall out for free.
+
+```sql
+SELECT pg_current_wal_lsn();                                -- 0/016A02F8
+SELECT pg_wal_lsn_diff('0/016A02F8', '0/016A02C0');         -- 56  (bytes, not records)
+```
+
+From the LSN you can compute the file it lives in: with 16 MB segments, segment number
+`floor(lsn / 0x1000000)`, and the 24-hex filename is timeline, high word, segment —
+`000000010000000000000002`. Replication lag is a *subtraction*: `pg_stat_replication` exposes
+`sent_lsn`, `write_lsn`, `flush_lsn` and `replay_lsn`, and the byte gap between any two of them
+is the real answer to "how far behind is the replica", in a unit that does not lie the way
+seconds do on an idle system. InnoDB shows you the same quantity by name in
+`SHOW ENGINE INNODB STATUS`: `Log sequence number` (bytes ever produced), `Log flushed up to`,
+`Pages flushed up to` and `Last checkpoint at`, all four in the same byte space.
+
+One wrinkle worth knowing before you subtract LSNs and expect record bytes: PostgreSQL's WAL is
+divided into 8 KB pages, each with its own 24-byte header (40 at the start of a segment), and
+those headers occupy LSN space too. The difference between two LSNs is the distance in the log,
+which is slightly more than the bytes of records between them.
+
+## pageLSN: the stamp that makes replay idempotent
+
+Every data page carries the LSN of the last log record applied to it.
+
+- PostgreSQL: `pd_lsn`, the **first 8 bytes** of every 8 KB page's `PageHeaderData`.
+- InnoDB: `FIL_PAGE_LSN` at byte offset 16 of every page, with the low 32 bits repeated in the
+  8-byte page trailer — the original torn-page detector, since a half-written page has a
+  trailer that disagrees with its header.
+
+The stamp is written when the change is made in the buffer pool, not when the page reaches
+disk, and it is set to the *end* LSN of the record — the position immediately after it. Play
+the lab: press UPDATE and watch the record's end LSN appear in the block's header while the
+on-disk copy keeps its old, smaller value. The two copies now disagree, and the pageLSN is the
+exact statement of how they disagree.
+
+## The two rules
+
+Everything in this mechanism reduces to two invariants. They are independent, they protect
+different things, and engines enforce them in different code paths.
+
+**The write-ahead rule (log-before-page).** *A dirty page may not be written to disk until the
+log is durable through that page's pageLSN.* PostgreSQL's `FlushBuffer()` calls
+`XLogFlush(BufferGetLSN(buf))` before it hands the block to the OS; InnoDB's page cleaner calls
+`log_write_up_to()` on the page's `newest_modification` before flushing it. In the lab, dirty a
+block and press **Write block** without flushing: it is refused, and the link between the
+in-memory and on-disk copies turns red. Violate the rule for real and a crash leaves a page on
+disk whose change has no log record behind it — redo cannot replay it because there is nothing
+to replay, undo cannot roll it back because there is no record saying it happened, and no
+consistency check will ever notice. This rule is what makes **steal** safe: the buffer pool may
+evict a page belonging to an in-flight transaction, because the log of what it did is already
+durable.
+
+**The commit rule.** *A transaction is durable when the log is flushed through its commit
+record* — not when its pages are written. That is **no-force**, and it is why a commit costs
+one sequential `fdatasync()` of a few hundred bytes instead of N random page writes. The
+`fdatasync()` is the expensive part; its cost and the group-commit trick that amortizes it are
+in [fsync, write barriers and the durability contract](/p01-foundations/hardware-os-durability/06-fsync-write-barriers-and-the-durability-contract/).
+
+:::note[These are the *only* two rules]
+Nothing requires a dirty page to be written at any particular time, or ever. A page can sit
+dirty in the buffer pool through a thousand commits. Checkpoints exist to bound how far back
+recovery must read, not because the pages are owed to the disk.
+:::
+
+## Moving the acknowledgment
+
+The commit rule fixes what durability *means*; it does not say when the client is told. Flip
+the lab's durability switch and the "client ack" cursor stops sitting on top of the flushed-LSN
+cursor and runs ahead of it — everything between the two is a transaction the application
+believes is committed and the disk has never seen. Crash there and the stat tile counts the lie.
+
+| Setting | Where the ack happens | What a crash loses |
+|---|---|---|
+| `synchronous_commit = on` (default) | after `fdatasync()` of the WAL through the commit record | nothing committed |
+| `synchronous_commit = off` | at commit-record insert; the WAL writer flushes behind you | up to 3 × `wal_writer_delay` (600 ms by default) of commits |
+| `innodb_flush_log_at_trx_commit = 1` (default) | after write + flush of the redo log | nothing committed |
+| `innodb_flush_log_at_trx_commit = 2` | after `write()` to the page cache; flush once per second | commits since the last flush, **only if the machine dies** — `mysqld` crashing alone loses nothing |
+| `innodb_flush_log_at_trx_commit = 0` | log buffer only, written and flushed once per second | a second of commits, including on a `mysqld` crash |
+| `PRAGMA synchronous = NORMAL` (WAL mode) | after the frame is written, no fsync until checkpoint | recent commits; the database itself stays consistent |
+
+The crucial property these share: they trade **durability**, never **atomicity**. Recovery
+replays a prefix of the log, so what you lose is a *tail* of transactions, not a half-applied
+one. Losing 200 ms of commits is a business decision you can reason about; losing half a
+transfer is not. The setting that reaches past durability is MySQL's `sync_binlog = 0`, where the
+binlog and the redo log are flushed on different schedules: the engine stays consistent with
+itself, but a replica built from that binlog can end up missing transactions the primary kept.
+
+## Why a small update writes 8 KB
+
+The lab's record chips are drawn with width proportional to the log of the record size, and the
+first update to each block after a checkpoint is visibly enormous. That is a **full-page
+image**: with `full_page_writes = on` (the default), PostgreSQL logs the entire 8 KB block, less
+its free-space hole, the first time it is modified after each checkpoint.
+
+The reason is that a physiological redo record is an *edit applied to a page*, and an edit
+applied to a half-written page produces garbage. If the kernel or the drive writes 4 KB of an
+8 KB page and then the power goes, replaying "set 12 bytes at offset 3 000" onto that wreckage
+is worse than useless. The FPI gives redo a known-good starting image; from there, every later
+record in the same checkpoint interval is small again. Turn `full_page_writes` off in the lab
+and watch the strip shrink — and note that you have just bet the database on your storage
+doing 8 KB atomically, which is only true on some hardware and some filesystems. InnoDB takes
+the other route and keeps its redo records small, writing every page twice instead: once into
+the **doublewrite buffer**, once into the tablespace.
+
+The operational consequence is a sawtooth: WAL volume spikes immediately after every
+checkpoint and decays until the next one. Shortening `checkpoint_timeout` to make recovery fast
+multiplies FPIs and can double or triple your WAL bytes; `wal_compression` (`off` by default,
+`pglz`/`lz4`/`zstd` available) attacks the FPI specifically, because that is where the
+compressible bulk is.
+
+## The replay sketch
+
+Crash the lab and step redo. The pass is short enough to state in full:
+
+1. Read the control file for the last checkpoint, and from it the **redo point** — the LSN at
+   which the checkpoint began, not where its record was written. (`pg_controldata` prints it as
+   *Latest checkpoint's REDO location*.) Everything before it is guaranteed to be on disk.
+2. Scan forward from there. For each record with a block reference, read the page and compare:
+   **if the record's LSN is greater than the page's pageLSN, apply it and stamp the page;
+   otherwise skip it.**
+3. Continue to the end of the valid log — the point where the CRC fails, the record's `xl_prev`
+   does not chain, or the next record was simply never written. That is the tail lost in the
+   crash.
+
+The comparison in step 2 is the entire idempotence argument. The heap file after a crash is a
+mixture of blocks from different moments — one was written a second ago, one an hour ago, one
+never — and each block's own header says exactly which records it already contains. Run
+recovery, kill the server mid-recovery, run it again: the same records get skipped the second
+time and the result is identical. That property is what lets an engine crash *during* recovery
+and survive, and it is the reason ARIES describes redo as "repeating history".
+
+Redo replays everything, including records from transactions that never committed. Cleaning
+those up is the undo pass, which needs compensation log records so that undo is itself
+restartable — that, along with checkpoint algorithms, group commit and the rest of the ARIES
+machinery, is [Write-Ahead Logging, Checkpoints and the Commit Path](/curriculum/) and
+[Crash Recovery](/curriculum/). The page-level write path that produces these records —
+which byte of which tuple, and who takes the latch — is
+[Pages, Tuples and Heap Files](/curriculum/).
+
+## Where it bites in production
+
+- **The log is a single sequential stream, and it is a bottleneck.** Every commit serializes
+  through one fsync on one file. PostgreSQL's `WALWrite` and `WALSync` wait events, and
+  `pg_stat_wal`'s `wal_sync_time`, name it directly; in InnoDB it shows up as waits on the log
+  writer threads. Putting `pg_wal` on its own device is the oldest tuning advice in the book
+  and still works.
+- **`pg_wal` fills the disk and the server PANICs.** Almost always a replication slot nobody
+  removed (`pg_replication_slots.active = false` with a stale `restart_lsn`) or a failing
+  `archive_command`, both of which forbid recycling segments. `max_slot_wal_keep_size` bounds
+  the first case; nothing bounds the second but monitoring.
+- **A WAL volume explosion with no traffic change.** Usually FPIs: someone shortened
+  `checkpoint_timeout` or lowered `max_wal_size`, so checkpoints run more often and every block
+  pays for a full image again. Confirm with `pg_waldump --stats`, which breaks bytes down by
+  resource manager and reports FPI bytes separately.
+- **InnoDB "async flush" stalls.** When `Log sequence number` minus `Last checkpoint at`
+  approaches `innodb_redo_log_capacity`, InnoDB cannot overwrite redo the checkpoint still
+  needs, and it throttles user threads until the page cleaners catch up. The symptom is
+  throughput that collapses periodically under a write-heavy load; the fix is a larger redo
+  capacity, not a faster disk.
+- **A restart that takes twenty minutes.** Recovery time is roughly the WAL between the redo
+  point and the crash, divided by a redo rate that is mostly random page reads. Long
+  checkpoint intervals buy write throughput and sell recovery time, and you only discover which
+  you chose during an incident.
+
+:::note[What to take forward]
+An LSN is a byte position in the log; the pageLSN in each page header is the LSN of the last
+record that page absorbed. Two rules follow: a dirty page may not be written until the log is
+durable through its pageLSN, and a transaction is durable when the log is flushed through its
+commit record — which is where `synchronous_commit = off` and
+`innodb_flush_log_at_trx_commit = 2` move the client's acknowledgment ahead of the fsync and
+buy latency with a bounded window of lost commits. Redo starts at the checkpoint's redo point
+and applies a record only when its LSN exceeds the page's pageLSN, which is why replaying the
+same log twice changes nothing.
+:::

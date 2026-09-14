@@ -1,0 +1,267 @@
+---
+title: Transactions at 10,000 feet
+description: ACID as four separate promises delivered by four different mechanisms, why autocommit is the root of most lost-update bugs, and what a bank transfer proves that a crash test does not.
+depth: basics
+sidebar:
+  order: 5
+---
+
+import BankTransferInterleaveLab from '../../../../components/viz/BankTransferInterleaveLab';
+
+A transaction is the window in which a database is allowed to be temporarily wrong. Between
+`BEGIN` and `COMMIT` the balances do not add up, the index disagrees with the heap, half the
+rows are new — and the engine's job is to make sure that no other session, and no future
+reboot, ever sees that state. ACID is the name for four promises about that window, and the
+reason to pull them apart on day one is that they are kept by four different mechanisms, and
+they fail in four different ways.
+
+<BankTransferInterleaveLab client:visible />
+
+Two transfers, both written the way most application code writes them: `SELECT` the balance,
+compute the new value in the client, `UPDATE` the literal back. Everything on that timeline is
+legal SQL issued by correct-looking code. Set **T₂ starts after 1 step**, **swap every 3**,
+locking off, and $30 appears out of nowhere — A + B reads $230, with no error anywhere. Turn
+locking on and that schedule deadlocks instead. Set **T₂ starts after 5 steps** so the two run
+one after the other and cut the power after step 2: the debit is durable and the credit never
+happened.
+
+## Four promises, four mechanisms
+
+The acronym comes from Härder and Reuter's 1983 paper formalizing Jim Gray's transaction
+concept, and it is a list of guarantees, not a description of anything the engine actually
+contains. These are the parts that implement it:
+
+| Promise | Guarantees | Delivered by | Failure you see |
+|---|---|---|---|
+| **Atomicity** | all of the transaction, or none of it | undo records, or never making the work visible | half a transfer, permanently |
+| **Consistency** | declared constraints hold at commit | the constraint checker — and nothing else | an invariant no `CHECK` could express |
+| **Isolation** | nobody observes a half-done transaction | row locks and/or row versions | lost updates, dirty reads |
+| **Durability** | once `COMMIT` returns, it survives a crash | the write-ahead log, flushed before the reply | the last seconds of "committed" work missing |
+
+### Atomicity: undo, or never expose
+
+Two engines implement "none of it" in opposite directions.
+
+**InnoDB updates rows in place** and writes the old column values into an *undo record* in a
+rollback segment before overwriting them. `ROLLBACK` walks that transaction's undo records
+backwards and puts the row back — real work, proportional to what the transaction did. That is
+why rolling back a 50-million-row `UPDATE` in MySQL can take longer than the `UPDATE` did, and
+why a `mysqld` that is killed mid-transaction can spend its startup rolling back before it will
+accept connections.
+
+**PostgreSQL never overwrites a row.** An `UPDATE` writes a *new* tuple version and stamps the
+old one's `xmax` with the transaction id; a `DELETE` only stamps `xmax`. Rollback therefore
+writes nothing to the table at all — it appends an abort record to the WAL and marks the xid
+aborted in `pg_xact`, and every reader that later encounters those tuples checks the xid, sees
+"aborted", and treats the new version as invisible. Abort is O(1) regardless of transaction
+size. The bill arrives later, as dead tuples that `VACUUM` has to collect, which is the subject
+of [versions, snapshots and the garbage horizon](/p01-foundations/anatomy-of-a-database-engine/06-versions-snapshots-and-the-garbage-horizon/).
+
+The lab models the InnoDB shape because it is easier to see: every write pushes a before-image
+onto an undo log, and a rollback or a crash walks it backwards. Both designs give you the same
+promise — the difference is who pays and when.
+
+Atomicity also applies below the transaction. A single `UPDATE` touching a million rows is
+itself atomic: it either applies to all of them or, if it hits a constraint on row 999,999,
+to none. A statement is just a transaction you did not name.
+
+### Consistency: the letter that is not a mechanism
+
+C is the odd one out. The engine enforces exactly what you declared — `NOT NULL`, `CHECK`,
+`UNIQUE`, `PRIMARY KEY`, `FOREIGN KEY`, and in PostgreSQL `EXCLUDE` — at the end of each
+statement, or at commit for constraints declared `DEFERRABLE INITIALLY DEFERRED`. That deferral
+is the interesting part: it exists precisely because invariants are allowed to break *inside*
+a transaction. Circular foreign keys between two rows cannot be satisfied by either `INSERT`
+alone, so the standard lets you postpone the check to the commit boundary. Consistency is
+defined at transaction boundaries, not at statement boundaries.
+
+Now look at the invariant in the lab: `sum(balance) = 200`. No `CHECK` can express it — a
+`CHECK` sees one row. SQL-92 specified `CREATE ASSERTION` for exactly this and essentially no
+production engine implements it. So the invariant that matters is not enforced by C at all; it
+is preserved by A (both legs land together) and I (nobody interleaves between them). In
+practice, **C is what A, I and your own constraints add up to**.
+
+### Isolation: nobody observes a half-done transaction
+
+This is the promise the lab spends most of its time breaking, and it fails in two distinct
+ways that are worth naming separately.
+
+A **dirty read** is reading a value some other transaction wrote and has not committed. A
+**lost update** is reading a value, computing from it, and writing the result after someone
+else has already changed the same row — your `UPDATE` carries a literal, so it silently erases
+their change. Notice the asymmetry: a dirty read needs an uncommitted write to be visible, and
+a lost update does not need one at all. It happens perfectly well between two transactions that
+each read only committed data.
+
+Real engines have already closed the first hole. PostgreSQL accepts `SET TRANSACTION ISOLATION
+LEVEL READ UNCOMMITTED` and gives you `READ COMMITTED` anyway; its MVCC design has no way to
+show you an uncommitted tuple. Oracle has never permitted dirty reads at any level. InnoDB is
+the outlier that really implements `READ UNCOMMITTED`. The defaults you will actually meet are
+`READ COMMITTED` in PostgreSQL, Oracle and SQL Server, `REPEATABLE READ` in InnoDB, and
+serializable in SQLite, which has one writer at a time. The SQL standard's default is
+`SERIALIZABLE`, which nobody ships.
+
+The second hole is wide open in every one of those defaults. Precise definitions, the anomaly
+catalogue and what each level does and does not buy you are the subject of Part 4; the point
+here is that **the level protects a transaction, and a read-modify-write split across two
+transactions has no transaction to protect.**
+
+### Durability: committed means committed
+
+`COMMIT` does not return until the commit record is in the log and the log is on stable
+storage. That ordering — log record durable before the reply, and before the modified page is
+allowed to reach disk — is the whole of the write-ahead logging rule, and it is what makes
+recovery a two-part sweep: redo every transaction whose commit record is in the log, undo every
+transaction whose is not. Watch the recovery column in the lab after a power cut; that is the
+entire algorithm. [The WAL primer](/p01-foundations/anatomy-of-a-database-engine/07-wal-primer-log-records-lsns-and-log-before-page/)
+takes it apart.
+
+Durability is also the promise you are most often given a knob to weaken:
+`synchronous_commit = off` in PostgreSQL and `innodb_flush_log_at_trx_commit = 2` in MySQL both
+return from `COMMIT` before the flush, trading a bounded window of lost commits for throughput.
+Both preserve atomicity: you lose whole transactions, never halves.
+
+## BEGIN, COMMIT, ROLLBACK, SAVEPOINT
+
+`BEGIN` is nearly free. PostgreSQL hands out a virtual transaction id and does not assign a
+real xid until the transaction's first write, so read-only transactions never consume one — which
+matters, because xids are a finite 32-bit resource. `COMMIT` flushes the commit record, marks
+the xid committed in `pg_xact`, releases locks and sends invalidation messages. `ROLLBACK` is
+the abort path above.
+
+`SAVEPOINT sp1` creates a named point inside an open transaction; `ROLLBACK TO SAVEPOINT sp1`
+discards the work after it and *leaves the transaction open*. InnoDB implements this by
+remembering a position in the undo log and applying undo records back to that mark. PostgreSQL
+implements each savepoint as a **subtransaction** with its own xid, which is why savepoints are
+not free there: each backend caches only 64 subtransaction ids (`PGPROC_MAX_CACHED_SUBXIDS`),
+and a transaction that exceeds that overflows into the `pg_subtrans` SLRU, forcing every other
+session's visibility checks to go and look things up on disk. An ORM that wraps every statement
+in a savepoint inside a long transaction can drive a whole cluster into that cliff.
+
+Savepoints are not an exotic feature you opt into — you are probably already using them.
+PostgreSQL aborts the *entire* transaction on any statement error:
+
+```
+ERROR:  duplicate key value violates unique constraint "accounts_pkey"
+ERROR:  current transaction is aborted, commands ignored until end of transaction block
+```
+
+That second message (SQLSTATE `25P02`) is what every subsequent statement gets until you
+`ROLLBACK`. To make "try the insert, handle the error, carry on" work at all, psql's
+`ON_ERROR_ROLLBACK` and Django's nested `transaction.atomic()` blocks both insert an implicit
+savepoint before each statement and roll back to it on failure. MySQL does not have this rule —
+a failed statement leaves the transaction usable — which is a genuine portability trap in both
+directions.
+
+## Autocommit, and the lost update it hands you
+
+Every statement you run outside an explicit transaction is still a transaction; the engine just
+opens and commits it for you. MySQL's `autocommit` is `ON` by default and a session variable
+you can turn off. PostgreSQL has no server-side setting at all: the wire protocol treats each
+statement as its own transaction unless you sent `BEGIN`. Drivers then layer their own
+defaults on top, and they disagree — JDBC connections start with `autoCommit` true, Go's
+`database/sql` autocommits anything not run on a `*sql.Tx`, and psycopg starts with
+`autocommit = False`, meaning it opens a transaction on your first statement and holds it open
+until you commit. The same application code has three different transaction shapes depending
+on the driver.
+
+Now the bug. This is the most common concurrency defect in production software:
+
+```sql
+SELECT balance FROM accounts WHERE id = 'A';   -- transaction 1 — returns 100
+-- application computes 100 - 30
+UPDATE accounts SET balance = 70 WHERE id = 'A';  -- transaction 2
+```
+
+Two transactions, not one. Between them, another session can do the same thing and the second
+`UPDATE` wins outright; the `UPDATE` carries the number `70`, so there is nothing for the engine
+to conflict with. No error, no log line, no metric — the only evidence is money that does not
+add up. Set the lab to **autocommit**, **T₂ starts after 1 step**, **swap every 3** and watch
+the meter go to $230.
+
+The critical detail: **raising the isolation level does not fix this.** Switch the lab's row
+locking on while staying in autocommit and the outcome is identical, because each statement's
+locks are taken and released inside that statement. Isolation levels isolate transactions, and
+you split the operation across two of them. The fixes, in order of preference:
+
+1. **Do the arithmetic in the database.** `UPDATE accounts SET balance = balance - 30 WHERE id = 'A' AND balance >= 30` is one statement, one transaction, one row lock taken by the engine itself. Check the affected-row count for the `balance >= 30` case.
+2. **Hold the row.** `BEGIN; SELECT balance FROM accounts WHERE id = 'A' FOR UPDATE; … UPDATE …; COMMIT;` — the `FOR UPDATE` takes the write lock at read time, which is exactly what the lab's strict-2PL mode does.
+3. **Detect and retry.** A `version` column with `WHERE version = $1`, checking the affected-row count; or run at `SERIALIZABLE` and retry on SQLSTATE `40001`. Optimistic control is right when conflicts are rare, and it *requires* a retry loop that the pessimistic versions do not.
+
+## The bank transfer is two different tests
+
+The transfer is the canonical example because it separates two promises that get conflated.
+Run it with only one transaction and no concurrency, and you are testing **atomicity**: crash
+between the debit and the credit and see whether the money reappears. Run two transfers at
+once with no crash, and you are testing **isolation**: two correct, atomic transactions can
+still produce a state neither of them would have produced alone.
+
+The lab's sharpest configuration is the one where both are involved. Explicit transactions,
+locking off, **swap every 2**, power cut after step 9: T₁ read a balance that T₂ had written
+but not committed, computed from it, and committed. The crash then rolled T₂ back correctly —
+its before-images went back, exactly as atomicity requires — and in doing so destroyed a
+*committed* transaction's work. Atomicity was perfect and the database is still wrong. This is
+why cascading aborts are unacceptable and why no production engine will let you read another
+transaction's uncommitted rows: not because dirty data is untidy, but because a rollback
+anywhere behind you can invalidate a commit you already acknowledged to a user.
+
+Isolation is not free either, and the lab shows the bill. Turn locking on with **swap every 2**:
+T₁ holds row A and wants B, T₂ holds B and wants A, and the wait-for graph has a cycle. The
+engine breaks it by killing someone. PostgreSQL's detector fires after `deadlock_timeout`
+(1 second by default) and aborts the backend whose request closed the cycle with
+`ERROR: deadlock detected`, SQLSTATE `40P01`; InnoDB detects immediately and rolls back the
+transaction that changed the fewest rows, returning
+`ERROR 1213 (40001): Deadlock found when trying to get lock; try restarting transaction`. Both
+are correct behaviour, both require your application to retry, and both are caused here by one
+thing: the two transactions touch A and B in opposite orders. Access rows in a consistent
+global order and the cycle cannot form.
+
+## What actually delivers this
+
+On a single node, the whole of ACID is three mechanisms and a checker: **the log** gives you
+atomicity and durability, **locks and versions** give you isolation, and the **constraint
+checker** gives you the part of consistency that can be declared. Everything else in this
+curriculum is an optimization of those three.
+
+The moment a transaction spans machines, the commit decision itself becomes distributed and
+none of these mechanisms is enough. Two-phase commit adds a prepare round so a coordinator can
+learn that every participant *can* commit before telling any of them to — PostgreSQL exposes it
+as `PREPARE TRANSACTION`, disabled by default (`max_prepared_transactions = 0`) because a
+prepared transaction holds its locks and its snapshot until someone resolves it, even across a
+restart. 2PC also blocks if the coordinator dies at the wrong moment, which is why replicated
+systems put the log itself under a consensus protocol (Raft, Paxos) and why Spanner needs
+TrueTime to order commits across datacentres. Parts 6 and 7 are that story.
+
+## Where it bites in production
+
+- **Idle in transaction.** A connection that ran `BEGIN`, did one `SELECT`, and went back to
+  the pool holds a snapshot. In PostgreSQL that pins the global xmin, so `VACUUM` cannot remove
+  any row version newer than it, anywhere in the database — bloat on tables the session never
+  touched. Watch `pg_stat_activity` for `state = 'idle in transaction'` and set
+  `idle_in_transaction_session_timeout`, which defaults to `0`, meaning never.
+- **Retry loops that are not there.** Deadlocks and serialization failures are not bugs, they
+  are the contract; at `SERIALIZABLE`, `40001` is a normal return code. Code that treats every
+  SQLException as fatal will page someone at 3am for a condition the database expected you to
+  handle in a loop with backoff.
+- **A framework that quietly changed the boundary.** Turning on Django's `ATOMIC_REQUESTS`
+  wraps each HTTP request in one transaction; a connection pool in transaction-pooling mode
+  cannot safely carry one. The `SELECT`-then-`UPDATE` pattern that was correct in one shape is
+  a lost update in the other.
+- **Lock waits that look like slow queries.** MySQL's `innodb_lock_wait_timeout` defaults to
+  50 seconds, so a blocked `UPDATE` shows up as a 50-second statement and then error 1205.
+  PostgreSQL's `lock_timeout` defaults to `0` — it waits forever. Neither is a query plan
+  problem, and no amount of indexing will help.
+- **"We'll just add a constraint."** The invariants that actually matter — a balance sum, a
+  schedule with no overlaps, a total that matches a sum of lines — are usually not expressible
+  as row-level constraints. They are preserved by the transaction boundary you drew, which
+  means they are only as good as your `BEGIN`.
+
+:::note[What to take forward]
+ACID is four promises with four different implementations: the log keeps A and D, locks and
+versions keep I, and C is whatever your declared constraints plus A and I add up to. Autocommit
+makes each statement its own transaction, so a `SELECT` then an `UPDATE` is two transactions
+and no isolation level can join them — do the arithmetic in SQL, or hold the row. And a
+transaction that reads another's uncommitted data can be destroyed by that transaction's
+rollback even when atomicity works flawlessly, which is the failure mode isolation exists to
+prevent.
+:::

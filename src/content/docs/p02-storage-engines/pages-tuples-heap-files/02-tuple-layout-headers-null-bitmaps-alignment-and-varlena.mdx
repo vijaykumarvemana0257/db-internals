@@ -1,0 +1,271 @@
+---
+title: "Tuple layout: headers, null bitmaps, alignment and varlena"
+description: The 23-byte PostgreSQL heap tuple header, the null bitmap, typalign padding that makes column order worth 12% of a page, and the 1-byte varlena header — against InnoDB's and SQLite's record formats.
+depth: intermediate
+sidebar:
+  order: 2
+---
+
+import TupleByteLayoutStudio from '../../../../components/viz/TupleByteLayoutStudio';
+
+A row on disk is not the tuple of values you wrote in the `INSERT`. It is a header the
+engine needs to decide whether you may see the row at all, a map of which columns are
+absent, and then the values — laid out under alignment rules borrowed from the C ABI. Those
+rules are why two tables with identical columns in a different order have different sizes,
+and why the size difference propagates into the page count, the buffer pool, the WAL and
+every backup you will ever take.
+
+<TupleByteLayoutStudio client:visible />
+
+## PostgreSQL: 23 bytes before the first value
+
+Every heap tuple starts with `HeapTupleHeaderData`, and `SizeofHeapTupleHeader` is 23 bytes:
+
+| Field | Bytes | What it is |
+|---|---|---|
+| `t_xmin` | 4 | The transaction that inserted this version |
+| `t_xmax` | 4 | The transaction that deleted or row-locked it; 0 while the row is live |
+| `t_cid` / `t_xvac` | 4 | Command id within the inserting transaction — a union, because there is no room for both |
+| `t_ctid` | 6 | `BlockIdData` (4) + `OffsetNumber` (2): this tuple's own address, or the next version's |
+| `t_infomask2` | 2 | Low 11 bits are `natts`; the rest are `HEAP_HOT_UPDATED`, `HEAP_ONLY_TUPLE`, `HEAP_KEYS_UPDATED` |
+| `t_infomask` | 2 | Hint bits: `HEAP_HASNULL`, `HEAP_HASVARWIDTH`, `HEAP_HASEXTERNAL`, `HEAP_XMIN_COMMITTED`, `HEAP_XMAX_INVALID`, the lock modes |
+| `t_hoff` | 1 | Offset from the start of the tuple to the first attribute |
+
+Three of these carry weight far beyond this page. `t_xmin`/`t_xmax` are why PostgreSQL's MVCC
+needs no undo log and why it needs `VACUUM` instead. `t_ctid` is the forward pointer that
+makes a HOT chain walkable. And the hint bits in `t_infomask` are a cache of answers already
+computed from the commit log: the first reader of a freshly committed row consults `pg_xact`,
+learns that `t_xmin` committed, and writes `HEAP_XMIN_COMMITTED` back into the page — which is
+why a `SELECT` can dirty pages and why the first scan after a big load is mysteriously slower
+and generates write I/O.
+
+`t_hoff` is the field this page is about. After the 23 bytes comes an optional null bitmap,
+and then `t_hoff` is rounded up by `MAXALIGN` — 8 bytes on any 64-bit build — so the first
+attribute starts 8-byte aligned. With no nulls, `t_hoff` is 24. The one wasted byte is not
+recoverable, and it is where the null bitmap lives for free.
+
+## NULLs cost bits, and sometimes nothing at all
+
+A null attribute occupies **zero bytes** in the data area. Its absence is recorded in `t_bits`,
+a bitmap of `ceil(natts/8)` bytes where a set bit means *not* null, present only when
+`HEAP_HASNULL` is set in `t_infomask`. A row with no nulls carries no bitmap at all.
+
+The arithmetic has a cliff in it. `t_hoff = MAXALIGN(23 + bitmap_bytes)`, so:
+
+- 1–8 columns: bitmap is 1 byte, `MAXALIGN(24)` = 24. **Free** — it fits in the byte the
+  header was already wasting.
+- 9–72 columns: bitmap is 2–9 bytes, `t_hoff` becomes 32. The ninth column costs every
+  null-containing row in the table 8 bytes.
+
+Set a column to `IS NULL` in the lab and push the spare-column slider to 3: `t_hoff` steps from
+24 to 32 in one click. Note also what happens when you null the `price` column in the default
+order — the tuple loses the 7 bytes of the value and the row's footprint on the page does not
+change at all, because the trailing `MAXALIGN` absorbs the saving. Nulls are cheap; they are
+not reliably free.
+
+## Alignment: the reason column order changes table size
+
+Each type carries `typalign` in `pg_type`: `c` = 1 byte, `s` = 2, `i` = 4, `d` = 8. When the
+tuple is formed, every fixed-width attribute is placed at the next offset divisible by its
+alignment, and the gap is filled with bytes that are written, cached, checksummed and shipped
+to every replica, and that no query can ever read.
+
+Take `active boolean, id bigint, views integer, created_at timestamptz, price numeric, title text`
+— a column order nobody would call wrong:
+
+```
+offset 0   active       1 byte
+offset 1   ░░░░░░░      7 bytes padding   (bigint needs an 8-byte boundary)
+offset 8   id           8 bytes
+offset 16  views        4 bytes
+offset 20  ░░░░         4 bytes padding   (timestamptz needs an 8-byte boundary)
+offset 24  created_at   8 bytes
+offset 32  price        7 bytes  (1-byte varlena header + 6)
+offset 39  title        9 bytes  (1-byte varlena header + 8)
+```
+
+48 bytes of data, `t_hoff` 24, tuple 72 bytes, plus a 4-byte line pointer: **107 rows** on an
+8 KB page. Reorder widest-alignment-first — `id, created_at, views, active, price, title` — and
+the padding vanishes: 37 bytes of data, a 61-byte tuple rounded to 64, and **120 rows** per
+page. Same columns, same values, 12% more rows in every page, every buffer and every backup.
+
+The rule that falls out is mechanical: **declare fixed-width columns in descending order of
+alignment (8, then 4, then 2, then 1), and put all variable-width columns last.** You can read
+the right order straight out of the catalog:
+
+```sql
+SELECT a.attname, t.typname, t.typlen, t.typalign
+FROM   pg_attribute a JOIN pg_type t ON t.oid = a.atttypid
+WHERE  a.attrelid = 'doc'::regclass AND a.attnum > 0 AND NOT a.attisdropped
+ORDER  BY t.typlen = -1,
+          CASE t.typalign WHEN 'd' THEN 8 WHEN 'i' THEN 4 WHEN 's' THEN 2 ELSE 1 END DESC,
+          t.typlen DESC;
+```
+
+:::caution[Do not chase this on a narrow table]
+The win is real but bounded by `MAXALIGN` at both ends: a tuple is rounded up to 8 bytes
+anyway, so saving 3 bytes often saves zero. It matters on wide tables, on tables with many
+`bool`/`smallint`/`int` columns mixed with `bigint` and `timestamptz`, and at scale — a
+billion-row table at 11 wasted bytes per row is 11 GB of padding. Measure with
+`SELECT pg_column_size(t.*) FROM doc t LIMIT 1` before and after, not with intuition.
+:::
+
+## varlena: the 1-byte header and the 126-byte cliff
+
+Variable-length types — `text`, `varchar`, `bytea`, `numeric`, `jsonb`, arrays — are *varlena*:
+`typlen = -1`, with the length stored in the value itself. Since 8.3 there are two in-line
+forms:
+
+- **Short header, 1 byte.** `(length << 1) | 0x01`, covering values up to 126 bytes.
+  Critically, a short-header varlena is stored **unaligned** — `heap_fill_tuple` skips the
+  `typalign` padding entirely for it. A 3-character `text` column costs 4 bytes and forces no
+  gap in front of it.
+- **Full header, 4 bytes.** An `int32` holding the total length, of which two bits are spent on
+  the compressed and external flags — which is where the 1 GB limit on any single field comes
+  from. This header is an `int32`, so it must be 4-byte aligned, and the padding comes back.
+
+Step the `title` value in the lab from 8 to 200 bytes and watch both costs land at once: the
+header grows from 1 byte to 4, and the value now needs an alignment gap in front of it that the
+short form did not. Crossing 126 bytes costs 3 bytes of header plus up to 3 bytes of padding.
+This is also why `numeric` is cheaper than it looks — `1234.56` is a 1-byte header, a 2-byte
+sign/scale/weight word and two base-10000 digits: 7 bytes, unaligned, regardless of the
+declared `numeric(10,2)` precision.
+
+Past `TOAST_TUPLE_THRESHOLD` — `MAXALIGN(BLCKSZ/4)`, so 2048 bytes — the tuple is too fat for a
+quarter page and TOAST fires: the widest attribute is compressed and, failing that, moved out of
+line, leaving an 18-byte `varatt_external` pointer (`va_rawsize`, `va_extsize`, `va_valueid`,
+`va_toastrelid` behind a 2-byte header). Select the 3000-byte `title` and the 3068-byte tuple
+collapses to 88 bytes. [Large values: TOAST and overflow pages](/p02-storage-engines/pages-tuples-heap-files/05-large-values-toast-and-overflow-pages/)
+takes the rest of that story.
+
+## Deforming: why the first null is more expensive than the null
+
+`heap_deform_tuple` walks the attributes in order, and it has a fast path. While every preceding
+attribute is fixed-width and non-null, an attribute's offset is a **constant for the whole
+table**, so it is cached in `pg_attribute.attcacheoff` and reading column 5 is a pointer add.
+The moment a preceding attribute is variable-width — or is null *in this row* — offsets stop
+being constant, `attcacheoff` is unusable from there on, and the deform loop must walk: read a
+varlena header, add its length, re-align, repeat.
+
+Two consequences that contradict each other, which is why this is a judgement call and not a
+rule:
+
+- **Alignment says put varlenas last.** They pad badly and they break the offset cache for
+  everything behind them.
+- **Access says put hot columns early.** The executor deforms only up to the highest attribute
+  number the plan actually needs (`slot_getsomeattrs`), so a query reading column 3 of a 60-column
+  table never touches columns 4–60. Putting a frequently-read column at position 55, behind
+  twenty varlenas, makes every read of it walk twenty length-prefixed values.
+
+On a wide table with a wide `jsonb` blob, putting the blob last is both rules agreeing.
+
+## InnoDB: no padding, but 13 bytes of MVCC in every record
+
+Switch the lab to InnoDB and the same row is a clustered-index leaf record — in InnoDB the row
+*is* the index leaf. The physical layout for `ROW_FORMAT=DYNAMIC` (the default since MySQL 5.7.9,
+controlled by `innodb_default_row_format`) runs *backwards* from the record origin and then
+forwards:
+
+1. **Variable-length field lengths**, in reverse column order, 1 byte per field while the value
+   is under 128 bytes and 2 bytes above it — the spare bits of the second byte are what flag a
+   column stored off-page. Fixed-width columns get no entry, and a NULL column is dropped from
+   the list entirely.
+2. **The null bit vector**, `ceil(nullable_columns / 8)` bytes — sized by how many columns are
+   *declared* nullable, not by how many are null in this row and not by the column count.
+   `NOT NULL` genuinely shrinks the record here, and a table with no nullable columns has no
+   vector at all.
+3. **A 5-byte record header**: delete-mark and min-rec flags, `n_owned` for the page directory, a
+   13-bit `heap_no`, a 3-bit record type, and a signed 16-bit offset to the next record in key
+   order. Records on an InnoDB page are a singly linked list in key order, which is why the page
+   directory only needs a sparse index into it.
+4. **The key columns**, then `DB_TRX_ID` (6 bytes) and `DB_ROLL_PTR` (7 bytes), then the rest. If
+   the table declares no `PRIMARY KEY` and no unique `NOT NULL` index, a hidden 6-byte `DB_ROW_ID`
+   goes in front.
+
+There is **no alignment padding anywhere** in an InnoDB record, so reordering the columns of a
+MySQL table changes its size by exactly zero bytes. What you pay instead is 13 bytes of version
+metadata on every clustered record — `DB_ROLL_PTR` points at the previous version in the undo
+log, which is how InnoDB updates in place where PostgreSQL must write a new tuple — plus the
+key repeated in every secondary index entry. For the lab's row the totals are 72 bytes for
+PostgreSQL against 50 for InnoDB; flip the columns into widest-first order and PostgreSQL's
+becomes 64.
+
+The row-format choice shows up on wide values: `COMPACT` keeps a 768-byte prefix of an off-page
+column in the record and adds a 20-byte pointer, so twenty long `VARCHAR`s can blow the
+~8126-byte row limit ("Row size too large"); `DYNAMIC` stores the 20-byte pointer alone and moves
+the whole value out. `CHAR(N)` in a multi-byte charset is also stored variable-length in both
+formats rather than as a padded `N × mbmaxlen` block.
+
+## SQLite: types in the header, nothing for transactions
+
+SQLite's record has no transaction id, no null bitmap and no padding. A table b-tree leaf cell is
+a varint payload length, a varint rowid, and then a record: a varint header size, one varint
+**serial type** per column, then the bodies back-to-back. The serial type *is* the type and the
+length:
+
+| Serial type | Meaning | Body bytes |
+|---|---|---|
+| 0 | NULL | 0 |
+| 1–6 | int8, int16, int24, int32, int48, int64 | 1, 2, 3, 4, 6, 8 |
+| 7 | IEEE-754 double | 8 |
+| 8, 9 | the integers 0 and 1 | **0** |
+| 12 + 2k | BLOB of length k | k |
+| 13 + 2k | TEXT of length k | k |
+
+So a NULL costs one byte, a boolean costs one byte, and an `INTEGER PRIMARY KEY` costs one byte —
+it is an alias for the rowid, so the column is written as serial type 0 and the real value lives
+in the cell's rowid varint. Integers are narrowed **per row**: the same `INTEGER` column stores
+one byte in one row and eight in the next. The same row that is 72 bytes in PostgreSQL is 48 here,
+and most of the difference is that SQLite does not have to answer "may this transaction see this
+row?" from the row itself.
+
+The catch is the payload threshold. For a table leaf, a payload up to `usable − 35` bytes
+(4061 on the default 4 KB page) stays entirely in the cell; past that SQLite keeps
+`M + ((P − M) mod (U − 4))` bytes local and links the rest through a chain of overflow pages, each
+spending 4 bytes on the pointer to the next — so reading one wide column can mean reading a dozen
+pages in sequence.
+
+## Dropped columns do not drop bytes
+
+`ALTER TABLE ... DROP COLUMN` in PostgreSQL is a catalog operation. The `pg_attribute` row stays,
+with `attisdropped = true`, the name rewritten to `........pg.dropped.N........`, and `atttypid`
+zeroed — but **`attlen` and `attalign` are deliberately preserved**, because existing tuples still
+contain the bytes and the deform loop still has to step over them. New tuples store NULL for the
+dropped attribute, which means the table now permanently has `HEAP_HASNULL` set on every new row
+and carries a null bitmap it would not otherwise need. The bytes in old rows come back only when
+those rows are rewritten: `VACUUM FULL`, `CLUSTER`, or a `pg_repack`.
+
+The mirror image is `ADD COLUMN ... DEFAULT`, which since PostgreSQL 11 writes nothing to the
+heap: the default is stashed in `pg_attribute.attmissingval` with `atthasmissing = true`, and any
+tuple whose `t_infomask2` `natts` is short of the catalog's column count has the missing value
+filled in at deform time. That is why adding a column with a constant default is instant and
+adding one with a volatile default still rewrites the table.
+
+## Where it bites in production
+
+- **A table that is mostly header and padding.** Six `bool`s and two `bigint`s declared
+  `bool, bigint, bool, bigint, bool, bool, bool, bool` is 22 bytes of actual data in a 64-byte
+  tuple — 14 of those bytes are padding, and the rest is the header. `SELECT pg_column_size(t.*)`
+  on a live row, and `pgstattuple` for the table-wide picture, tell you before you migrate.
+- **Reading the real bytes.** `CREATE EXTENSION pageinspect;` then
+  `SELECT lp, lp_len, t_hoff, t_infomask::bit(16), t_bits FROM heap_page_items(get_raw_page('doc', 0));`
+  shows the actual tuple length, the actual `t_hoff` (24 or 32) and the actual null bitmap for
+  every tuple on a page. This is the only way to settle an argument about layout.
+- **The 1600-column limit that arrives early.** PostgreSQL's hard limit is 1600 columns, but a
+  wide table hits `t_hoff` growth, a large null bitmap and the 8160-byte usable tuple size long
+  before that — and TOAST cannot save a row made of many medium-sized attributes.
+- **Migrations that re-add a column.** Drop and re-add a column on a hot table and you have
+  silently added a null bitmap to every row written afterwards and left the old bytes in place.
+  Every row is now bigger than the schema suggests until the table is rewritten.
+- **MySQL row-size failures under `COMPACT`.** "Row size too large (> 8126)" on a table full of
+  `VARCHAR`s is usually a `ROW_FORMAT` problem, not a data problem: `DYNAMIC` stores 20-byte
+  pointers where `COMPACT` insists on keeping 768-byte prefixes in the record.
+
+:::note[What to take forward]
+A PostgreSQL row costs 24 bytes before its first value, plus whatever `typalign` padding the
+column order forces — so ordering columns widest-alignment-first is a free 5–15% on wide tables,
+and NULLs cost bits in `t_bits` rather than bytes. A varlena under 127 bytes carries a 1-byte
+header and needs no alignment at all; over that it carries 4 bytes and drags padding back in.
+InnoDB pays no padding but 13 bytes of `DB_TRX_ID`/`DB_ROLL_PTR` per clustered record, and SQLite
+pays neither, encoding each value's type and width into a varint serial type instead.
+:::

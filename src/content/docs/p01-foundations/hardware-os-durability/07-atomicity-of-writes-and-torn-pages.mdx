@@ -1,0 +1,223 @@
+---
+title: Atomicity of writes and torn pages
+description: The device promises one sector, the engine writes 8 or 16 KB, and a power cut in between leaves a page that was never a valid state — why checksums find it and only full-page writes, doublewrite or copy-on-write fix it.
+depth: intermediate
+sidebar:
+  order: 7
+---
+
+import TornWriteSectorLab from '../../../../components/viz/TornWriteSectorLab';
+import ChecksumWidthEscapeLab from '../../../../components/viz/ChecksumWidthEscapeLab';
+
+`fsync` tells you the bytes reached durable media. It says nothing about *which* bytes, or
+how many. A storage device makes exactly one atomicity promise — a single sector is written
+whole or not at all — and every engine writes pages four to thirty-two times that size. Pull
+the power in the middle and the platter holds a page that is half the old image and half the
+new one: a state the database was never in, and one the write-ahead log cannot repair by
+itself.
+
+<TornWriteSectorLab client:visible />
+
+## The sector is the only atomic unit
+
+A drive's sector — 512 bytes on legacy media, 4096 on modern — is the unit its firmware
+writes as one indivisible operation. On a spinning disk the drive holds enough rotational
+energy, and on an enterprise SSD enough capacitance, to finish the sector in flight when
+power disappears. Nothing above that line is promised by anyone:
+
+- **The OS splits your `pwrite`.** A 16 KB buffered write becomes several 4 KB page-cache
+  pages, flushed by different `bio`s, possibly to different places in the I/O queue.
+- **The device splits it again.** A 16 KB command is a burst of sector programs; the NAND
+  FTL may place them in different erase blocks on different dies.
+- **RAID splits it a third time.** A page that straddles a RAID-5 stripe boundary is two
+  member writes plus a parity update — the classic *write hole*, where a crash leaves data
+  and parity disagreeing even if every sector was individually fine.
+- **512e media lies about the unit.** A "512-byte sector" drive built on 4 K media emulates
+  512 B logically and does read-modify-write underneath, so the true atomic unit is 4 KB
+  while the kernel reports 512. Check both:
+  `cat /sys/block/nvme0n1/queue/{logical,physical}_block_size`, or `lsblk -o NAME,LOG-SEC,PHY-SEC`.
+
+| Engine page | On 4Kn media | On 512e media | Can it tear? |
+|---|---|---|---|
+| SQLite 4 KB | 1 sector | 8 sectors | Not on 4Kn |
+| PostgreSQL 8 KB (`BLCKSZ`) | 2 sectors | 16 sectors | Yes |
+| InnoDB 16 KB (`innodb_page_size`) | 4 sectors | 32 sectors | Yes |
+| InnoDB 64 KB | 16 sectors | 128 sectors | Yes, badly |
+
+Drag the crash slider in the simulator and the page-size chooser together: the tear only
+disappears when the page collapses to a single sector. That equivalence is why SQLite's
+4 KB default page on 4Kn storage is unusually safe, and why "use `innodb_page_size=4k`" is
+a real (if bandwidth-hostile) torn-write mitigation.
+
+:::caution[NVMe does not make this go away]
+Flash has no moving parts, which tempts people into assuming atomicity. It has an FTL
+instead: a power cut mid-program can corrupt the NAND page being written, and on some
+controllers the *containing erase block*. Consumer drives usually have no power-loss
+protection capacitors at all — their write cache is volatile, and the only reason they look
+safe is that `fsync` forces a cache flush. Modern NVMe does expose a real guarantee, in the
+Identify Controller fields `AWUPF` (atomic write unit, power fail) and `NAWUPF`; Linux
+surfaces it as `RWF_ATOMIC` on `pwritev2` with XFS forced alignment. That is a promise you
+can query, not one you can assume.
+:::
+
+## Why the log cannot repair the page
+
+Redo records are not pictures of pages; they are **deltas against a specific prior state**.
+ARIES calls this physiological logging, and PostgreSQL, InnoDB and every descendant use it
+because it is compact: "on block 4711, insert this 62-byte tuple at line pointer 14, move
+`pd_upper` down by 64" is far smaller than 8 KB. Replay is made idempotent by stamping every
+page with the LSN of the last record applied to it — redo applies a record only when the
+record's LSN exceeds the page's `pageLSN`.
+
+Both halves of that scheme break on a torn page, and the simulator lets you produce each
+failure deliberately, because **the `pageLSN` lives in the header, which lives in sector 0**:
+
+- **Sector 0 landed.** The page now advertises the *new* LSN while later sectors still hold
+  old bytes. Redo compares LSNs, concludes the page is already current, and skips every
+  record that would have fixed it. Recovery completes, reports success, and the corruption is
+  permanent and silent.
+- **Sector 0 did not land.** The page advertises the old LSN, so redo does replay — onto a
+  base image that is already partly new. "Insert at the offset in `pd_upper`" now writes into
+  bytes that the half-applied update already moved. The result is not the old page, not the
+  new page, and not anything the log can describe.
+
+The invariant redo depends on is that the on-disk page is *some consistent past state of that
+page*. A torn page is not a past state; it is a state that never existed. No amount of log is
+a remedy, which is why the defenses in the last section all work by making sure recovery
+starts from an intact base image rather than by making redo smarter.
+
+:::note[The LSN is a torn-page detector too — sometimes]
+Old InnoDB formats wrote the log sequence number twice: `FIL_PAGE_LSN` at page offset 16 and
+its low four bytes again in the eight-byte page trailer, `FIL_PAGE_END_LSN_OLD_CHKSUM`. Head
+and tail land in different sectors, so a mismatch is proof of a tear. This catches a tear
+that straddles the two, and misses one entirely contained between them — which is precisely
+why it was a supplement to the checksum, never a replacement.
+:::
+
+## Checksums detect; they never repair
+
+A per-page checksum is computed over the page bytes just before the write and stored inside
+the page. On every read the engine recomputes and compares. The two shipping designs:
+
+| | PostgreSQL | InnoDB |
+|---|---|---|
+| Field | `pd_checksum`, 2 bytes in `PageHeaderData` | `FIL_PAGE_SPACE_OR_CHKSUM`, 4 bytes at offset 0 (+ trailer in old formats) |
+| Algorithm | FNV-1a-derived: 32 parallel lanes over the 8 KB block, xor-folded, xored with the block number, then `% 65535 + 1` | CRC-32C (Castagnoli), `innodb_checksum_algorithm=crc32`; `full_crc32` since 8.0.17 covers the whole page |
+| Width | **16 bits** | **32 bits** |
+| Turning it on | `initdb -k`, or `pg_checksums --enable` with the cluster down; default *on* from PG 18 | On by default since 5.7 |
+| On failure | `WARNING: page verification failed, calculated checksum 34177 but expected 8952` then `ERROR: invalid page in block 4711 of relation base/16384/16427` | `InnoDB: Database page corruption on disk or a failed file read of page`, then the server aborts |
+| Monitoring | `pg_stat_database.checksum_failures`, `checksum_last_failure` | error log, `innochecksum` offline |
+
+The checksum field is excluded from its own computation — PostgreSQL zeroes `pd_checksum`
+before hashing and writes the result back — which is why the verifier in the simulator
+recomputes over a page with word 0 blanked. Two consequences follow immediately. First, the
+stored value comes from whichever sector 0 landed, so a tear puts an old checksum next to new
+bytes or a new checksum next to old bytes; either way it mismatches. Second, and this is the
+whole point of the mechanism: **a mismatch aborts the read.** It does not tell you which
+sectors are wrong, and it cannot reconstruct them. The checksum is a smoke alarm.
+
+<ChecksumWidthEscapeLab client:visible />
+
+Width is what sets the miss rate. PostgreSQL's 16 bits let roughly 1 corrupt page in 65,535
+through; a 1 TB cluster is about 134 million 8 KB pages, so at that scale the field is a
+statistical filter, not a guarantee. CRC-32C's 1 in 4.29 billion is why InnoDB, ZFS and every
+format designed after 2005 spend the extra two bytes — and why CRC rather than a truncated
+hash: a degree-32 CRC provably detects *every* single-bit flip and every burst error up to 32
+bits, while a folded FNV sum only gets the average case. On modern CPUs this costs nothing
+extra; the `crc32` instruction from SSE 4.2 does a quadword per cycle.
+
+## Bit rot and misdirected writes: corruption with no crash
+
+Torn pages need a crash. The other two failure modes do not, and they are the reason a
+checksum earns its keep during normal operation:
+
+- **Bit rot / latent sector errors.** Charge leaks out of NAND cells, a platter sector degrades,
+  a cable or HBA flips a bit in flight. NetApp's study of 1.53 million drives (Bairavasundaram
+  et al., FAST '08) found checksum mismatches on 0.86% of nearline SATA drives and 0.06% of
+  enterprise drives over 17 months — rare per drive, routine per fleet.
+- **Misdirected writes.** The firmware writes the right bytes to the wrong LBA. The landing
+  page is internally perfect; it is just the wrong page. Set the simulator to *misdirected
+  write* and untick the block-number box to watch every single one sail through a
+  content-only checksum.
+
+The answer is to make the page **self-describing**. PostgreSQL xors the block number into the
+sum before folding, so a page that arrives at the wrong block number cannot verify — but
+`pd_checksum` contains no relfilenode, so relation A block 5 landing on relation B block 5 is
+still invisible. InnoDB stores `FIL_PAGE_OFFSET` and `FIL_PAGE_SPACE_ID` inside the page and
+checks both on read. ZFS goes furthest: the checksum of a block lives in its *parent* block
+pointer, never in the block itself, so a write that destroys the data cannot also rewrite the
+checksum that guards it — the end-to-end argument (Saltzer, Reed and Clark, 1984) applied to
+storage. That placement is what lets ZFS not merely detect but *repair*, by fetching a good
+copy from a mirror, RAID-Z parity, or a ditto block.
+
+Detection also has to be scheduled, because a page nobody reads is never verified:
+
+| Scrub | Scope | Runs online? |
+|---|---|---|
+| `zpool scrub` / `btrfs scrub` | Every block, repairs from redundancy | Yes |
+| `echo check > /sys/block/md0/md/sync_action` | MD RAID consistency | Yes |
+| `pg_checksums --check` | Every page of a PostgreSQL cluster | No — cluster must be down |
+| `pg_amcheck`, `amcheck` | Heap and B-tree *structure*, not just checksums | Yes |
+| `innochecksum` | One `.ibd` file | No — tablespace must be quiescent |
+| Backup verification (`pg_basebackup`) | Every page it copies, reports failures | Yes |
+
+:::danger[The checksum can certify garbage]
+A checksum is computed in RAM, over a buffer in RAM. If non-ECC memory flips a bit in the
+buffer *before* the checksum is computed, the engine faithfully stamps a valid checksum onto
+corrupt data and writes it down. Every layer below will agree the page is fine, forever. This
+is not a hypothetical — it is the standard argument for ECC memory on database servers, and
+it is why T10 DIF/DIX exists: 8 bytes of protection information (guard, application tag,
+reference tag) attached per sector and verified by the HBA and the drive, so the check travels
+with the data instead of being recomputed at each hop.
+:::
+
+## The defenses, in one table
+
+The internals of these belong to the write-ahead logging and recovery module; what matters
+here is that each one exists solely to give recovery an **intact base image**.
+
+| Defense | Engine | How it works | What it costs |
+|---|---|---|---|
+| `full_page_writes` | PostgreSQL (default `on`) | The first modification of a page after each checkpoint logs the entire 8 KB image into the WAL; replay overwrites the whole page, so the torn version on disk is irrelevant | WAL volume — frequently the dominant term. Mitigate with `wal_compression=lz4`/`zstd` and longer `checkpoint_timeout`, not by turning it off |
+| Doublewrite buffer | InnoDB (default `on`) | Every page is written first to a sequential doublewrite area (separate `*.dblwr` files since 8.0.20, tuned by `innodb_doublewrite_pages`/`_batch_size`), fsynced, then to its home; recovery restores any page failing its checksum from the copy | Double the data writes, though the extra one is sequential. `innodb_doublewrite=DETECT_ONLY` (8.0.30+) keeps detection and drops recovery |
+| Copy-on-write | ZFS, Btrfs, LMDB, LSM engines | Never overwrite a live block. The torn write lands where nothing points yet; the commit is a single-sector root/uberblock switch, which *is* atomic | Space amplification, fragmentation, and a rewritten storage layer |
+| Journal the original | SQLite rollback journal / WAL mode | Copy the pre-image out and fsync it before overwriting; `PSOW` (powersafe overwrite) lets it skip journaling when the filesystem promises only the touched sectors are damaged | Extra write per page per transaction |
+| Hardware atomicity | NVMe `AWUPF`, `RWF_ATOMIC` on XFS | Ask the device for a genuinely atomic 16 KB write | Requires a drive, filesystem and kernel that all agree — and then you can safely disable the layers above |
+
+:::caution[The two knobs people turn off and regret]
+`full_page_writes=off` and `innodb_doublewrite=0` both make write-heavy benchmarks visibly
+faster, and both are safe *only* if your storage stack provides page-granularity atomicity —
+ZFS with `recordsize` at or above the page size, or hardware atomic writes you have actually
+verified. Nothing warns you when the assumption is wrong: the cluster runs perfectly for
+months and then fails to recover from one unplanned power loss. If you cannot write down the
+sentence "our 8 KB writes are atomic because ___", leave them on.
+:::
+
+## Where it bites in production
+
+The symptom is a read that suddenly fails on a page the database has served for months:
+`ERROR: invalid page in block 1234 of relation base/16384/16427`, or an InnoDB start-up abort
+on page corruption, or `pg_stat_database.checksum_failures` ticking up while everything else
+looks healthy. The reflex to resist is "the disk is dying". The checksum only says *these
+bytes are not what was written* — the culprit is as often RAM, an HBA, a filesystem bug, or a
+storage driver as the media. Before touching anything: check EDAC/`mcelog` for ECC events,
+`smartctl -a`, and `dmesg` for I/O errors, and take a physical copy of the file.
+
+Then the recovery path depends entirely on what the page belongs to. Map it with
+`SELECT relname, relkind FROM pg_class WHERE relfilenode = 16427`. If it is an index, you are
+lucky — `REINDEX` rebuilds it from the heap and the data was never at risk. If it is a heap
+page, the honest options are restore-and-PITR, or accept data loss: `zero_damaged_pages=on`
+replaces the unreadable page with an empty one and lets the scan continue, silently dropping
+every row it held. `ignore_checksum_failure=on` is worse than it sounds — it downgrades the
+error to a warning and hands the corrupt page to the executor, where it can propagate into
+indexes, materialized views and your next backup.
+
+:::note[What to take forward]
+Only a sector is atomic, so any page larger than a sector can land half-written, and that
+half-written page is a state the database was never in — which is exactly why redo, whose
+records are deltas against a real prior state, cannot repair it. Per-page checksums
+(PostgreSQL's 16-bit `pd_checksum`, InnoDB's CRC-32C) turn silent corruption into a loud
+error, and scrubbing plus self-describing pages extend that to bit rot and misdirected writes,
+but detection is all you get. Repair requires an intact base image, which is what
+`full_page_writes`, the doublewrite buffer and copy-on-write each buy in their own currency.
+:::

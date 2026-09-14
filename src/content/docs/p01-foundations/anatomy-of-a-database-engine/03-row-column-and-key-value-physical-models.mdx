@@ -1,0 +1,229 @@
+---
+title: Row, column and key-value physical models
+description: How one orders table becomes bytes under NSM row storage, DSM column storage, PAX hybrids and a sorted key-value engine — and why the choice of byte order decides which queries are cheap.
+depth: basics
+sidebar:
+  order: 3
+---
+
+import RowColumnByteFootprint from '../../../../components/viz/RowColumnByteFootprint';
+import SortedKeySpaceEncoder from '../../../../components/viz/SortedKeySpaceEncoder';
+
+A row is a fiction the engine maintains. On storage there is only a sequence of bytes, and the
+engine has to pick an order to write them in: all of one row together, all of one column
+together, or one long byte key per row in a sorted map. That choice is made once, at the
+storage layer, and it decides which of your queries cost a single page read and which cost a
+scan of the entire table.
+
+<RowColumnByteFootprint client:visible />
+
+Both panels hold the identical 72 cells. Switch between the queries and watch the blue move:
+the point lookup wants every column of one row and the row-major picture puts them in one
+page; the aggregate wants one column of every row and only the column-major picture can
+fetch it without dragging the rest along. Neither layout is faster — each is faster at a
+different question, and the gap is two orders of magnitude in both directions.
+
+## Three ways to write one table
+
+The taxonomy is old and the names stuck:
+
+| Model | Contiguous unit | Real implementations |
+|---|---|---|
+| **NSM** (N-ary Storage Model) | one whole row | PostgreSQL heap, InnoDB clustered index, SQLite, Oracle blocks |
+| **DSM** (Decomposition Storage Model) | one whole column | ClickHouse `MergeTree` parts, Vertica, Apache Druid segments |
+| **PAX** | a column *inside* a row group | Parquet, ORC, DuckDB, SQL Server columnstore, Snowflake micro-partitions |
+
+### NSM: the row is the unit
+
+PostgreSQL writes an `orders` row into an 8 KB heap page as a single contiguous tuple: a
+23-byte `HeapTupleHeader` (holding `t_xmin`, `t_xmax`, `t_ctid` and the infomask bits), an
+optional null bitmap, then the attribute values laid out in declaration order with alignment
+padding between them. The page is *slotted* — an array of `ItemIdData` line pointers grows
+down from the header while tuples grow up from the end — so a tuple's address, its `ctid`, is
+the pair (block number, line-pointer index). Every column of that order is within a few
+hundred bytes of every other column of that order.
+
+InnoDB goes one step further: the table *is* a B+tree on the primary key, and the leaf pages
+of that tree hold the full rows. There is no separate heap. A consequence you have already
+met in query plans: an InnoDB secondary index stores the primary key, not a physical pointer,
+so a non-covering secondary index lookup costs one descent of the secondary index plus a
+second descent of the clustered index. PostgreSQL's index entries point at a `ctid` instead,
+which is one hop — but that `ctid` can be stale after an update, which is the whole reason
+heap-only tuples and index-only scans with the visibility map exist.
+
+The shared property is co-location. If the question is "give me this order", the engine pays
+one access penalty and gets the complete answer, because the row never left the page.
+
+### DSM: the column is the unit
+
+Decomposition storage — Copeland and Khoshafian, 1985 — stores each attribute separately and
+reconstructs rows by position. A ClickHouse `MergeTree` part is the clearest version: a part
+is a directory on disk, and in a **Wide** part each column gets its own `<column>.bin` data
+file and `<column>.mrk2` marks file, with `primary.idx` holding one sparse index entry per
+`index_granularity` rows (8192 by default). Small parts are written **Compact** instead, with
+all columns in a single `data.bin`, because opening 100 tiny files is worse than reading a few
+extra bytes; `min_bytes_for_wide_part` is the switch between them.
+
+Parquet is the same idea in a single file: the file is cut into **row groups** (commonly
+around 128 MB of source data), each row group is cut into one **column chunk** per column, and
+each chunk is a series of pages (typically 1 MB). The footer carries the schema plus per-chunk
+and per-page min/max statistics, which is what lets a reader skip a chunk it can prove is
+irrelevant before reading a byte of it.
+
+The cost of DSM is reassembly. Row *i* is the *i*-th value of every column, so the layout only
+works if every column can be positionally aligned — which is exactly why nulls and repeated
+fields need the definition- and repetition-level machinery from Dremel rather than a simple
+null bitmap.
+
+### PAX: both, at two different scales
+
+PAX — Ailamaki, DeWitt, Hill and Skounakis, *Weaving Relations for Cache Performance*, 2001 —
+observed that the two layouts optimize different levels of the hierarchy. Keep the page as the
+unit of I/O so a row is never split across pages, but *within* the page, group the values of
+each column together so a scan reads dense, cache-friendly runs of one type.
+
+Every modern analytical format is PAX at file scale: Parquet's row group, ORC's stripe,
+DuckDB's row group of 122 880 rows. A row never spans a row group, so reconstruction is local
+and a writer can produce one row group at a time; inside the row group the data is fully
+columnar, so a scan of two columns touches only two column chunks. This is why "row store
+versus column store" is really a question about *granule size* — how many rows are bundled
+together before the layout switches from row-major to column-major.
+
+## The arithmetic that decides the layout
+
+Nothing reads a byte. Every layer reads a granule, and the layouts differ in what a granule
+contains:
+
+- A row store's granule is a **page** — 8 KB in PostgreSQL, 16 KB in InnoDB — and it always
+  carries whole rows.
+- A column store's granule is a **block of one column** — a ClickHouse mark covering 8192
+  rows, a Parquet page — and it always carries many rows of one column.
+
+Run the two cases through the visual's model. A `SELECT sum(total_cents)` over a 100-column
+table has to read every column in the row store (the column is interleaved with the other 99,
+and you cannot read it without reading them) but only one column chunk in the column store:
+about **1% of the bytes**. Now invert it. `SELECT * WHERE order_id = 90210` in the row store is
+one 8 KB page. In the column store it is one granule *per column*, and each granule holds 8192
+rows of a column you wanted one value from — roughly 740 KB before compression, about 90× the
+row store, for a single row.
+
+:::caution[This is why ClickHouse is not a slow PostgreSQL]
+The right mental model is not "columnar is faster". It is that a columnar engine converts a
+point lookup into a scan of one granule per column. ClickHouse has no B+tree on a random
+column, no per-row locks, and mutations rewrite whole parts. If a workload does single-row
+reads and updates by primary key, a column store is the wrong shape and no amount of tuning
+fixes it — and a row store scanning 400 GB to sum one column is equally wrong in the other
+direction. Everything in the HTAP literature is an attempt to have both without paying twice.
+:::
+
+## The third model: the row becomes a byte key
+
+There is a third physical model that is neither, and it underpins most distributed SQL. The
+storage engine is a sorted key-value map — RocksDB, or Pebble in CockroachDB's case — that
+knows only `Put(key, value)`, `Get(key)` and "iterate from this key". Everything in SQL has to
+be projected onto a single byte string whose `memcmp` order is the logical order.
+
+<SortedKeySpaceEncoder client:visible />
+
+Drag `order_id` past 109 and watch the integer's encoding change shape: below that it fits in a
+single tag byte, above it the tag switches to "big-endian, *n* bytes follow" — and the map stays
+correctly ordered, because a shorter length tag always sorts before a longer one. Swap the key
+column order and the same row moves to a completely different neighbourhood. Switch engines and
+the prefixes change while the trick does not.
+
+### Order-preserving encoding is the whole game
+
+The rules are not arbitrary; each one exists because `memcmp` would otherwise disagree with SQL:
+
+- **Integers** cannot use LEB128-style continuation-bit varints, because those put the low
+  bytes first and sort wrong. CockroachDB uses a tag byte that encodes either the small value
+  itself or the byte length of a big-endian magnitude that follows. TiDB flips the sign bit of
+  a 64-bit big-endian integer, so `-1` sorts before `0` with plain byte comparison.
+- **Strings** need a terminator that cannot appear in the payload, so an embedded `0x00` is
+  escaped (CockroachDB writes `0x00 0xff`) and the value ends with a sequence that sorts below
+  every real byte. TiDB instead pads to 8-byte groups and writes a marker byte per group. Both
+  guarantee that `"us"` sorts before `"us-east"`.
+- **Descending columns** are encoded by complementing every byte of the ascending form. There
+  is no "sort descending" at the storage layer — there is only one direction of iteration.
+- **Collated text** must be encoded as its ICU sort key, not its UTF-8 bytes, or `ORDER BY name`
+  in a `en_US` collation will not match the index order. This is the same trap that turns an OS
+  upgrade into silent index corruption.
+- **NULL** gets its own leading byte, which is how `NULLS FIRST` becomes a byte-order fact.
+
+### Prefixes are the schema
+
+CockroachDB's key is `/<tenant>/<table>/<index>/<key columns…>/<column family>`, and the value
+holds the remaining columns of that family behind a 4-byte checksum. Three things fall out
+immediately, all visible in the lab's sorted listing:
+
+1. **A table is a contiguous range of keys.** So is one index. So is one value of the leading
+   key column. Range scans, range splits, rebalancing and backups all operate on the same
+   contiguous byte intervals, which is why a distributed SQL engine can shard without
+   understanding SQL.
+2. **A secondary index is just another prefix.** `CREATE INDEX ON orders (status)` writes keys
+   under index 2; for a non-unique index the primary key is appended to the *key* so entries
+   stay distinct, and the value is empty.
+3. **The primary key's column order is a physical decision.** `PRIMARY KEY (region, order_id)`
+   puts a region's orders next to each other; `PRIMARY KEY (order_id, region)` interleaves the
+   regions and makes "all orders in `us-east`" a full scan.
+
+TiDB spells the same idea differently — `t{tableID}_r{handle}` for row data and
+`t{tableID}_i{indexID}{values}` for index data, with fixed-width encoded ids so any key can be
+split without parsing — and MyRocks prefixes each key with a 4-byte big-endian index number
+followed by memcomparable key columns. Different constants, one invariant.
+
+### Documents and wide-column rows are the same trick
+
+MongoDB on WiredTiger splits the two jobs apart. A collection is a **record store** keyed by an
+int64 `RecordId` assigned at insert time and holding the BSON document as an opaque value —
+nothing about your data decides where the document lands, which is why an unindexed query on
+`order_id` is a collection scan. Every index is a *separate* WiredTiger table whose keys are
+**KeyString**, an order-preserving encoding of the indexed values with the `RecordId` appended,
+doing exactly what the SQL engines above do. (Clustered collections, added in MongoDB 5.3,
+close the gap by keying the record store on `_id` itself.) The visible tax of the document
+model is in the value: BSON repeats every field *name* in every document.
+
+Cassandra puts the same structure under different vocabulary. The partition key is hashed —
+Murmur3Partitioner by default — into a 64-bit token, and that token decides both which replicas
+hold the row and where the partition sits in the global order. Inside a partition, rows are
+sorted by the clustering columns. So `WHERE region = 'us-east' AND order_id > 5000` is a
+contiguous slice of one partition, and `WHERE order_id > 5000` across all regions has nothing
+to seek to — the tokens scattered those rows across the ring deliberately. Switching the
+partition key in the lab does not tune a query; it changes which queries exist.
+
+## Where it bites in production
+
+- **A monotonic primary key on a sorted-KV engine is a hotspot.** Every insert lands at the
+  end of the key space, so one range, one leaseholder and one node take the whole write load
+  while the cluster sits idle. The fixes are all "make the leading bytes not monotonic":
+  CockroachDB's `PRIMARY KEY (…) USING HASH`, TiDB's `AUTO_RANDOM` and `SHARD_ROW_ID_BITS`, or
+  putting a naturally-distributed column first. The symptom is a single hot range in the range
+  report, not a CPU or disk limit.
+- **Column order inside a composite key changes which scans are possible, not just their cost.**
+  An index on `(region, order_id)` cannot serve `WHERE order_id = ?` at all; the bytes for a
+  given `order_id` are scattered across every region prefix.
+- **Wide rows in a row store.** PostgreSQL cannot split a tuple across pages, so a row over
+  roughly 2 KB pushes its largest varlena attributes out of line into a TOAST table. That is
+  usually a *win* for narrow queries — the heap tuple shrinks, so more rows fit per page — but
+  it turns `SELECT description` into an extra index descent per row.
+- **Unbounded Cassandra partitions.** Because a partition is one contiguous, non-splittable
+  unit, a partition key with unbounded cardinality growth (one partition per customer, forever)
+  eventually produces partitions of gigabytes that cannot be compacted or repaired efficiently.
+  The standard guidance is to bucket the partition key by time so partitions stay bounded.
+- **Point lookups against an analytical store.** A dashboard that fetches one row by id from
+  ClickHouse or from Parquet on object storage reads a granule per column and, on S3, pays a
+  round trip per column chunk. The symptom is high latency at trivial result sizes, and the fix
+  is a row-shaped store in front, not a bigger cluster.
+
+:::note[What to take forward]
+The engine picks one byte order, and that order is the answer to "which query is one read?".
+NSM co-locates a row so a point lookup is one page; DSM co-locates a column so an aggregate
+over 1 of 100 columns reads about 1% of the bytes; PAX does both by choosing a row-group size.
+A sorted key-value engine is a fourth answer that is really the first one plus an encoding
+discipline: turn the key columns into bytes whose `memcmp` order is the logical order, prefix
+them with the table and index, and every SQL range becomes a contiguous byte range. Later
+modules take these apart — [pages and tuples](/p02-storage-engines/pages-tuples-heap-files/01-page-anatomy-and-the-slotted-page/)
+for the NSM write path, [columnar layouts](/p02-storage-engines/column-stores-analytical-storage/01-columnar-layouts-nsm-dsm-pax-and-row-groups/)
+for encodings and compression, and [key encoding](/p02-storage-engines/b-trees-and-variants/07-collation-unicode-and-byte-comparable-key-encoding/)
+for the byte-comparable rules in full.
+:::

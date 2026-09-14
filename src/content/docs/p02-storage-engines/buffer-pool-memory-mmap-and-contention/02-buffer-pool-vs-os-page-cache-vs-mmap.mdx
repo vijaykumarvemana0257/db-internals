@@ -1,0 +1,221 @@
+---
+title: Buffer pool vs OS page cache vs mmap
+description: Why a buffer pool over a buffered file holds every hot page twice, what O_DIRECT actually buys and bills you for, and the engine-design case against letting the kernel own your pages.
+depth: deep
+sidebar:
+  order: 2
+---
+
+import CachePathOwnershipLab from '../../../../components/viz/CachePathOwnershipLab';
+
+A page of your table can exist in RAM twice, in two caches with two eviction policies, neither of
+which knows the other exists. Whether that is a bug, a deliberate design, or an argument for
+deleting your buffer pool entirely is the question this page settles — and the answer turns on two
+things the kernel cannot do for you: it cannot be told which page matters, and it cannot be told
+*not yet*.
+
+<CachePathOwnershipLab client:visible />
+
+## The second copy
+
+Run the lab in **pool + buffered** mode and read a dozen pages. Every miss takes the same route:
+`pread()` finds no folio, the kernel allocates one, the drive DMAs 8 KiB into it, and
+`copy_folio_to_iter()` memcpys those bytes into the frame the engine already reserved. Now two
+frames of RAM hold one page of data, and nothing in either layer will notice. The engine's
+[page table](/p02-storage-engines/buffer-pool/01-buffer-pool-structure-frames-page-table-and-pins/)
+maps `(relfilenode, fork, blocknum)` to a frame it owns; the kernel's XArray maps `(inode, offset)`
+to a folio it owns. They agree on the bytes and on nothing else.
+
+Three costs come out of that, and they are not the same cost.
+
+**RAM.** The duplicated frames are visible in the lab's RAM budget bar. The upper bound is
+`min(pool, page cache)` — every page the pool holds was recently read through the page cache, so
+the kernel has a clean copy it has no pressure to drop. In practice the overlap is smaller, because
+pages that stay hot in the pool are never re-read through the syscall path and eventually age out
+of the kernel's LRU, and because a clean page-cache page is the cheapest thing reclaim can take.
+Which is exactly why the overlap is unpredictable: it is set by the *ratio of the two eviction
+clocks*, not by anything you configure.
+
+**One memcpy per miss, each way.** Roughly 700 ns for an 8 KiB page at realistic memory bandwidth.
+Against a 90 µs NVMe read that is noise; against a page-cache hit — no device involved at all —
+that copy plus the syscall *is* the entire cost of the operation. Drag the pool slider down in the
+lab and watch the memcpy counter climb while the device-read counter stays flat: those are hits,
+and you are paying full price for them.
+
+**A policy you cannot reach.** The kernel's reclaim does not know that block 0 of an index is a
+B+tree root and that this 2 GB sequential read is a one-shot. The engine has
+[midpoint insertion and ring buffers](/p02-storage-engines/buffer-pool/05-scan-resistance-sequential-flooding-ring-buffers-and-midpoin/)
+for exactly that; the page cache has `POSIX_FADV_DONTNEED` and hope.
+
+PostgreSQL accepts all of this on purpose. The familiar advice to set `shared_buffers` to about 25%
+of RAM — against InnoDB's 50–75% — is not timidity, it is the arithmetic of a design that treats
+the page cache as its second tier: a large victim cache, warmed by kernel readahead, that survives
+a `postmaster` restart and costs no double-write bookkeeping. The planner is told about it
+separately: `effective_cache_size` (default 4 GB) is a *planner* parameter that allocates no memory
+at all; it exists to tell the cost model how much of an index is likely resident in pool-plus-kernel
+when it prices an index scan against a sequential scan.
+
+:::caution[The 25% number is not a law, and it is getting less true]
+`shared_buffers` too small pushes work into the copy path and into a cache you cannot control.
+Too large, with a buffered I/O path, duplicates more and concentrates writeback into checkpoints.
+The two measurements that replace the folklore: `pg_buffercache` (extension) for what the pool
+holds, and `fincore`/`vmtouch`/`pgfincore` for what the kernel holds of the same relation. If
+the same blocks dominate both, you have bought the same cache twice.
+:::
+
+## O_DIRECT: buying ownership, and the bill
+
+Switch the lab to **O_DIRECT**. The page-cache lane empties and stays empty, the memcpy counter
+stops moving, and the RAM slider acquires a new meaning: every frame you did not give the pool is
+now *unused by this file*. That is the whole trade in one picture. `O_DIRECT` does not make I/O
+faster; it makes the engine solely responsible for it.
+
+What you get: one copy instead of two, so your pool size is your cache size; a pool whose
+eviction policy is the only eviction policy; no `balance_dirty_pages()` throttle; and, critically,
+the ability to hold a dirty page back until its log record is durable — the engine writes when the
+engine decides. What you must now supply yourself:
+
+- **Alignment.** Buffer address, file offset and length must all be aligned to the device's logical
+  block size, or `pwrite()` returns `EINVAL` with nothing written. That is why engines allocate
+  pool memory with `posix_memalign()` and why a partial page write is not expressible.
+  [Direct I/O and io_uring](/p01-foundations/hardware-os-durability/09-direct-i-o-and-io-uring-alignment-submission-and-completion/)
+  has the mechanics.
+- **Readahead.** The kernel does none for an `O_DIRECT` descriptor. InnoDB implements its own —
+  linear read-ahead fires once `innodb_read_ahead_threshold` (default 56) of the 64 pages in an
+  extent have been touched in order — and every direct-I/O engine needs
+  [an equivalent](/p02-storage-engines/buffer-pool/07-prefetching-and-asynchronous-reads/).
+- **Concurrency.** A synchronous direct read is one outstanding command on a device built for
+  dozens. Without async submission — libaio, io_uring, or a pool of I/O worker threads — direct I/O
+  is *slower* than buffered, and this is the single most common reason a naive switch regresses.
+- **A cold start with no safety net.** There is no kernel copy to fall back on, so a restarted
+  server reads everything from the device until the pool refills. Hence
+  [dump and reload of the pool contents](/p02-storage-engines/buffer-pool/02-cache-warm-up-cold-pools-dump-load-and-prewarming/).
+
+The knobs, by engine:
+
+| Engine | Switch | Notes |
+|---|---|---|
+| InnoDB | `innodb_flush_method = O_DIRECT` | Data files direct, redo log still buffered-plus-flush. `O_DIRECT_NO_FSYNC` additionally skips the `fsync()` after each data write. `innodb_dedicated_server = ON` picks a direct method and the pool size for you |
+| RocksDB | `use_direct_reads`, `use_direct_io_for_flush_and_compaction` | Independently settable: many deployments take direct reads but leave compaction buffered so the kernel absorbs the write stream |
+| PostgreSQL | `debug_io_direct = data, wal, wal_init` | Present since 16 and named `debug_` deliberately — it is a development switch, and without asynchronous I/O it removes the kernel's prefetching and gives nothing back |
+| PostgreSQL 18 | `io_method = worker \| io_uring \| sync` | The AIO subsystem that has to land *before* direct I/O is a production option. `io_combine_limit` (added in 17) merges adjacent block reads |
+| SQLite | — | No direct-I/O mode; the page cache is the second tier by design |
+
+Note what that PostgreSQL trajectory implies. Direct I/O is not a flag you flip; it is a
+commitment to owning prefetching, queue depth, alignment and cache sizing. PostgreSQL is adding
+the machinery in the order the machinery must arrive: streaming reads in 17, AIO in 18, direct I/O
+when it can be fast rather than merely correct.
+
+:::note[Direct I/O is not durability]
+`O_DIRECT` bypasses the page cache. It says nothing about the drive's volatile write cache, and
+`fsync()` is still required — see
+[the durability contract](/p01-foundations/hardware-os-durability/06-fsync-write-barriers-and-the-durability-contract/).
+Two independent decisions that people routinely collapse into one.
+:::
+
+## mmap: the layer that will not take instructions
+
+Switch to **mmap** and the pool lane disappears entirely. Now: press **Modify page**, then press
+**Kernel writeback** *before* **fsync(WAL)**, then **Power cut**.
+
+Recovery has a data file containing a change at an LSN the log never recorded. Redo cannot
+reproduce it — the log record describing that change died in the WAL buffer. Undo cannot remove it
+— there is no before-image. The page's checksum is perfectly valid, because the page is internally
+consistent and semantically wrong. This is the failure the
+[WAL-before-data rule](/p02-storage-engines/buffer-pool/06-dirty-pages-write-back-and-the-wal-before-data-rule/)
+exists to prevent, and in mmap mode there is no mechanism with which to prevent it. `msync()`
+flushes a range *now*; nothing anywhere says *not yet*. You do not even need the flusher thread to
+do it to you: in the lab, once the mapping has filled RAM, faulting in one more page evicts a dirty
+mapped one and writes it out as a side effect of a read you wanted.
+
+Crotty, Leis and Pavlo made the case in *Are You Sure You Want to Use MMAP in Your Database
+Management System?* (CIDR 2022), and the useful way to hold their four objections is as four things
+an engine normally owns and here cannot:
+
+1. **Ordering.** No way to pin a dirty page until its log record lands, no ordering between ranges,
+   no atomicity — a 16 KiB InnoDB page spans four folios that can reach the device separately.
+   Everything the engine does about torn pages (doublewrite, full-page writes) assumes the engine
+   chose the moment of the write.
+2. **Scheduling.** A miss is discovered by the MMU *inside a load instruction*, which is to say
+   inside whatever critical section the thread is in. There is no async page fault and no way to ask
+   "is this resident?" that is still true when it answers: `mincore()` is stale on return. A buffer
+   pool looks up residency in its own hash table, issues the read, and takes the page latch only
+   after the page is there.
+3. **Errors.** A failed read arrives as `SIGBUS`, not a return value. So does touching a mapped
+   region of a file someone truncated. Recovering means `longjmp`-ing out of a signal handler with
+   latches held, and since there is no "read" event there is no natural place to verify a page
+   checksum — you would have to validate on every access or not at all.
+4. **Eviction cost.** Unmapping a page means clearing PTEs in every process that mapped it and
+   sending a TLB-shootdown IPI to every core that might have cached the translation, with the
+   initiator spinning until they all acknowledge. Their measurements show the throughput of a
+   mapped store collapsing once the working set exceeds RAM, and page-cache eviction failing to
+   scale — the reclaim path they measured serialises on a single thread — while `pread()` with
+   `O_DIRECT` scales linearly and saturates the drives.
+
+Add the mundane one that bites first: `mmap` is capped by the address space and the file, so a
+"grow the database" operation becomes a remap, and `MAP_SHARED` writable mappings make every stray
+pointer in your process a potential on-disk corruption.
+
+Systems that map files anyway are not disagreeing; they are paying a different price. LMDB maps
+read-only by default and never overwrites a live page — its copy-on-write B+tree writes new pages,
+`fsync`s, then flips one of two meta pages and `fsync`s again, so there is no writeback ordering
+left for the kernel to get wrong, and one writer at a time means no latch to stall under. SQLite's
+`PRAGMA mmap_size` maps for *reads* while writes still go through `write()`, so the rollback
+journal or WAL keeps providing atomicity; the documentation states the risks — a stray pointer
+corrupts the file, an I/O error is a `SIGBUS` — rather than denying them. MongoDB's MMAPv1 tried it
+with an update-in-place store and a journal, was deprecated in 4.0 and removed in 4.2 in favour of
+WiredTiger and its own cache. The invariant underneath all three: **map what is immutable, or
+provide ordering somewhere the kernel cannot reach.**
+
+The research did not stop at "don't". Leis's group's VMCache (SIGMOD 2023) keeps virtual memory in
+the design but takes back the two things that made it unscalable: explicit control of page-table
+mappings, and an `exmap` kernel module that makes eviction and TLB invalidation batched and
+scalable. The lesson is not that virtual memory is useless to a buffer pool — it is that the
+*default* kernel policy, applied to an update-in-place store with a log, is a correctness problem
+before it is a performance one.
+
+## Three designs, one axis
+
+| | Pool over buffered I/O | Pool over `O_DIRECT` | `mmap` |
+|---|---|---|---|
+| Copies of a hot page in RAM | 2 (frame + folio) | 1 | 1 |
+| Cost of a cache hit in the *other* tier | syscall + 8 KiB memcpy | n/a — there is no other tier | minor fault, ~1 µs |
+| Who picks the eviction victim | both, independently | the engine | the kernel |
+| Who decides when a page reaches disk | the engine | the engine | the kernel |
+| Prefetching | kernel readahead, free | the engine's problem | kernel readahead, tuned for the wrong thing |
+| I/O error | return value from `pread`/`pwrite` | return value | `SIGBUS` |
+| Effective cache | `shared_buffers` + whatever the kernel kept | exactly the pool | all of RAM, policy not yours |
+| Sizing rule | ~25% of RAM | 50–75% of RAM | n/a |
+| Examples | PostgreSQL, SQLite | InnoDB, RocksDB (optionally) | LMDB, MMAPv1 (retired) |
+
+## Where it bites in production
+
+- **Buying the cache twice.** `pg_buffercache` and `vmtouch` show the same relation dominating
+  both. Symptom: adding RAM barely moves the hit rate. The fix is a decision, not a knob — either
+  push `shared_buffers` up and accept a smaller kernel tier, or keep the ratio and accept that some
+  of your RAM is a mirror.
+- **Containers make double caching worse.** Under cgroup v2 the page cache is charged to the
+  cgroup, so a Postgres pod with `memory.max` set sees its "free" second tier reclaimed under the
+  same limit as its heap — and page-cache reclaim under a tight limit shows up as stalled reads,
+  visible in `memory.pressure`. Sizing `shared_buffers` at 25% of a container limit is the worst of
+  both worlds: a small pool *and* a kernel cache that gets evicted first.
+- **`O_DIRECT` switched on without async I/O.** Queue depth 1, throughput falls, the drive is idle
+  and the CPU is in `io_schedule()`. Check `iostat -x` for `aqu-sz` near 1.
+- **`O_DIRECT` with a pool sized for a buffered world.** A 25%-of-RAM pool with no kernel tier
+  underneath it is a 4× cut in effective cache. This is the classic bad day after
+  `innodb_flush_method = O_DIRECT` is set without raising `innodb_buffer_pool_size`.
+- **`SIGBUS` in the logs of a mapped store.** Media error, or a file truncated under a live
+  mapping. There is no partial-failure story: the process dies.
+- **A checkpoint that meets a wall of dirty pages.** Buffered mode only:
+  `grep -e Dirty -e Writeback /proc/meminfo`, and the absolute `vm.dirty_background_bytes` /
+  `vm.dirty_bytes` forms rather than the percentage ratios on a large host.
+
+:::note[What to take forward]
+A buffer pool over a buffered file holds hot pages twice and pays a memcpy on every miss, and
+PostgreSQL takes that deal knowingly: the page cache is its second tier, which is what the 25%
+`shared_buffers` rule and the planner-only `effective_cache_size` are both about. `O_DIRECT` buys
+a single copy and total ownership, and immediately bills you for readahead, alignment, queue depth
+and cache sizing. `mmap` looks like it removes a layer, but what it actually removes is the
+engine's ability to say *not yet* — and an engine that cannot delay a page write cannot implement
+write-ahead logging, no matter how carefully it flushes its log.
+:::

@@ -1,0 +1,212 @@
+---
+title: Versions, snapshots and the garbage horizon
+description: Why an UPDATE writes a new row version instead of overwriting one, how a snapshot picks which version a reader sees, and why one idle transaction stops the collector from reclaiming any of them.
+depth: basics
+sidebar:
+  order: 6
+---
+
+import GarbageHorizonTimeline from '../../../../components/viz/GarbageHorizonTimeline';
+
+`UPDATE accounts SET balance = 90 WHERE id = 42` does not change the bytes that held `100`.
+It writes a *new* version of the row and marks the old one as ending, because a transaction
+that started before you did is still entitled to read the old value, and because you might
+still roll back. That single decision — never overwrite, always append and stamp — buys
+readers that never block writers, and hands the engine a new problem it must solve forever:
+deciding when an old version is finally unreachable, and getting someone to sweep it up.
+
+<GarbageHorizonTimeline client:visible />
+
+## An UPDATE is an append plus an end stamp
+
+In PostgreSQL every heap tuple carries a header before its user data. Four fields in it do
+the whole job:
+
+- **`t_xmin`** — the transaction id that created this version.
+- **`t_xmax`** — the transaction id that deleted or superseded it; zero while the version is
+  current.
+- **`t_ctid`** — a `(page, offset)` pointer, normally to itself, but on an update it points
+  *forward* to the new version, forming a chain.
+- **`t_infomask`** — bits caching whether `xmin`/`xmax` committed or aborted, so that
+  readers don't have to consult the commit log for the same tuple twice.
+
+An `UPDATE` therefore does three things: write a complete new tuple (the whole row, even if
+you changed one `int`), set `t_xmax` on the old tuple to your xid, and point the old tuple's
+`t_ctid` at the new one. A `DELETE` does only the second. Nothing is erased, and neither
+operation is undone by a rollback — an aborted transaction leaves its new version on the
+page, marked with an xid that never committed, and that version is garbage from birth.
+
+The cost of the "write a complete new tuple" part is what makes Postgres updates expensive:
+unless the update qualifies for **HOT** (heap-only tuple — no indexed column changed *and*
+the new version fits on the same 8 KB page), every index on the table also gets a new entry
+pointing at the new tuple. That is why a table with eight indexes can have its update
+throughput ruined by touching a single indexed column, and why `fillfactor` below 100 is a
+real tuning knob for update-heavy tables: it leaves free space on each page so HOT can apply.
+
+## A snapshot is a rule for choosing among versions
+
+A reader does not ask "what is the current value". It takes a **snapshot** at a point in
+time and then applies the same test to every version it meets. In Postgres a snapshot is
+literally three things: `xmin` (the oldest transaction still running), `xmax` (the first xid
+not yet assigned), and `xip[]`, the list of in-progress xids in between. A version is
+visible to that snapshot when its creating xid committed before the snapshot was taken, and
+its ending xid either does not exist, aborted, or had not committed yet when the snapshot was
+taken.
+
+That rule has two consequences worth holding on to. First, **the version a reader sees is
+fixed by when its snapshot was taken, not by when it reads the row** — a query that scans a
+200 GB table for an hour sees the table as it was an hour ago, consistently, all the way
+through. Second, the isolation level is just a policy on *how often you take a new snapshot*:
+`READ COMMITTED` (the Postgres default) takes a fresh one at the start of every statement, so
+two `SELECT`s in one transaction can see different data; `REPEATABLE READ` and `SERIALIZABLE`
+take one at the first statement and keep it for the whole transaction. InnoDB's default
+`REPEATABLE READ` does the same with its "read view".
+
+In the visual, the reader's snapshot is the vertical dashed line, and the version it reads is
+simply the box the line crosses. Open a second reader after a few updates and the two lines
+land on different boxes — that is multiversion concurrency control in one picture, and it is
+why neither reader took a lock and neither blocked the writer.
+
+## The same shape, five storage layouts
+
+Every engine that offers snapshot reads has to keep old versions somewhere. Where it keeps
+them is the single biggest architectural difference between them, and it decides what goes
+wrong when the collector falls behind.
+
+| Engine | Old versions live in | Reached by | Reclaimed by | What "behind" looks like |
+|---|---|---|---|---|
+| PostgreSQL | the heap, next to the live tuple | scanning the page; `t_ctid` chains | `VACUUM` / autovacuum | table and index **bloat**; `n_dead_tup` climbs |
+| InnoDB | undo logs in the undo tablespaces | `DB_ROLL_PTR` in the row, applied backwards | purge threads (`innodb_purge_threads`, default 4) | **history list length** grows; reads get slower as they walk longer undo chains |
+| Oracle | undo segments | the rollback pointer in the block | automatic undo management | `ORA-01555: snapshot too old` when undo is overwritten |
+| SQL Server (RCSI) | the version store in `tempdb` | a 14-byte pointer appended to the row | the version store cleanup task | `tempdb` grows without bound |
+| RocksDB / LSM | *are* separate entries: `(key, seqnum)` | merge-reading the newest seqnum ≤ snapshot | compaction | SSTables that cannot shrink; deletes that never actually delete |
+
+The LSM row is the one that looks different and is not. A key updated three times is three
+entries with three sequence numbers, sorted together; a read for snapshot `S` takes the
+newest entry whose seqnum is ≤ `S`. Compaction merges files and would love to drop the two
+older entries — but it may only drop an entry if **no live snapshot's sequence number falls
+between it and the newer entry for the same key**. Hold a RocksDB snapshot or a long-lived
+iterator open and compaction keeps rewriting versions it is not allowed to discard, exactly
+as `VACUUM` rewrites pages full of dead tuples it is not allowed to remove. Switch the engine
+control in the visual: the boxes, the line and the rule do not move. Only the nouns do.
+
+## The horizon is one number
+
+Now the part that surprises people. The collector does not ask "is there any reader that
+could see this version". Asking that per version, per reader, would be too expensive and
+would have to be re-asked constantly. Instead every engine reduces the whole question to a
+single scalar:
+
+> **The horizon is the oldest snapshot held by anyone**, and a version is removable only if
+> the transaction that *ended* it committed before the horizon.
+
+Postgres calls it `OldestXmin` and prints it in the autovacuum log line. InnoDB calls it the
+oldest read view. RocksDB uses the oldest snapshot's sequence number. Geometrically it is the
+solid red line in the visual, and the rule is exactly as simple as it looks: **a dead version
+is collectable if and only if its box ends to the left of that line.**
+
+Reducing it to one number makes the check O(1), and it makes the collector deliberately
+conservative. Press UPDATE five times with one reader open and watch the middle versions turn
+orange: no snapshot falls inside them, nobody will ever read them again, and they are still
+uncollectable, because their end ids are not below the horizon and the horizon is the only
+thing being compared against. A single stuck reader does not pin *the version it is reading*.
+It pins **everything that has died since it started**, on every table in the database.
+
+:::caution[The horizon is database-wide, not table-scoped]
+A three-hour analytics query against `events` holds the horizon for `accounts` too. So does
+a session left `idle in transaction` after a failed `COMMIT`, a forgotten `BEGIN` in a psql
+window, a `PREPARE TRANSACTION` that was never committed (`pg_prepared_xacts`), and — with
+no long query anywhere on the primary — a replication slot for a consumer that stopped
+reading (`pg_replication_slots.xmin`), or a standby with `hot_standby_feedback = on` running
+a long query of its own. Postgres exposes every one of these: `pg_stat_activity.backend_xmin`,
+`pg_replication_slots.xmin` / `catalog_xmin`, `pg_prepared_xacts`. When bloat grows and no
+query is slow, that list is where to look.
+:::
+
+Drag the "oldest reader's snapshot" slider forward and the backlog drains in one step — no
+data was rewritten, no lock was released, a single number moved. That is exactly what happens
+when a long query finally commits, and it is why bloat problems so often resolve themselves
+the instant someone kills the right session.
+
+## Somebody has to run the sweeper
+
+Marking versions collectable is free; removing them is not, and it is always a separate,
+asynchronous job. In Postgres, **autovacuum** wakes up on a schedule and vacuums a table once
+its dead-tuple count passes `autovacuum_vacuum_threshold + autovacuum_vacuum_scale_factor ×
+reltuples` — 50 plus 20% of the table by default, which on a 500 M-row table means waiting for
+100 M dead rows before the first pass. It scans the heap, collects removable tuple ids,
+removes their index entries, then frees the tuples and marks free space in the free space map.
+
+The line it writes to the log is the one worth learning to read:
+
+```
+tuples: 12043 removed, 8801423 remain, 4192 are dead but not yet removable, oldest xmin: 74219
+```
+
+Three numbers, three different diagnoses. `removed` is work done. `remain` is live rows.
+**`dead but not yet removable` plus `oldest xmin` is the horizon report**: if that number is
+large and stays large across runs, vacuum is not slow and not misconfigured — it is being
+forbidden, and `oldest xmin` names the transaction doing the forbidding. Press "Run VACUUM"
+in the visual with a reader open and you get precisely this: the collector runs to
+completion and still leaves a pile behind.
+
+Space that vacuum frees is returned to the *table*, not to the filesystem; the file only
+shrinks with `VACUUM FULL` (which rewrites the table under an `ACCESS EXCLUSIVE` lock) or a
+tool like `pg_repack`. InnoDB's equivalent asymmetry is that purge frees undo pages but the
+tablespace stays the size it grew to.
+
+:::note[Readers don't block writers — but they do pin garbage]
+The usual summary of MVCC is "readers never block writers and writers never block readers".
+It is true about *locks* and false about *resources*. A reader's cost is deferred, not
+eliminated: it is paid later, by the collector it prevented from running, and by every
+subsequent scan that walks pages full of tuples nobody can see.
+:::
+
+## Why an online index build has to wait
+
+`CREATE INDEX CONCURRENTLY` is the clearest consequence of the horizon outside the collector.
+It builds the index in phases, and between them it must wait for **every transaction that
+holds a snapshot older than the current phase's point** — otherwise a transaction using an
+older snapshot could insert a row the build has already passed, and the finished index would
+be missing entries. There is no way to hurry this: a `CREATE INDEX CONCURRENTLY` behind one
+`idle in transaction` session sits there indefinitely, holding no interesting lock and making
+no progress. Worse, if it is cancelled or fails, it leaves behind an invalid index
+(`pg_index.indisvalid = false`) that costs maintenance on every write and is used by no query
+until you `DROP` and rebuild it. `REINDEX CONCURRENTLY` and MySQL's online DDL have the same
+dependency for the same reason.
+
+## Where it bites in production
+
+- **Table grows, row count doesn't.** `pg_stat_user_tables.n_dead_tup` climbing while
+  `n_live_tup` is flat, `last_autovacuum` recent, and the vacuum log saying "dead but not yet
+  removable". Find the holder via `backend_xmin`, not via the vacuum settings.
+- **An idle transaction, not a slow query.** `SELECT pid, state, xact_start, backend_xmin
+  FROM pg_stat_activity WHERE backend_xmin IS NOT NULL ORDER BY age(backend_xmin) DESC` names
+  it in one line. `idle_in_transaction_session_timeout` (default `0`, disabled) is the blunt
+  instrument that prevents the whole class of incident. Postgres also shipped
+  `old_snapshot_threshold`, which turned old snapshots into errors so vacuum could proceed; it
+  was removed in PostgreSQL 17 after repeated correctness bugs, so the timeout is the tool you
+  have.
+- **InnoDB reads that get slower with no plan change.** `SHOW ENGINE INNODB STATUS` reporting a
+  history list length in the millions means every read of a hot row is reconstructing an old
+  version by walking a long undo chain. The fix is the open transaction
+  (`information_schema.innodb_trx`), not the buffer pool.
+- **Deletes that free nothing in an LSM store.** Disk usage flat or rising after a large
+  delete, because tombstones and superseded versions can only be dropped when no snapshot
+  falls between them — a leaked iterator or a snapshot held by an application thread is enough.
+- **The wraparound cliff.** The same horizon that blocks reclamation blocks *freezing*, and
+  Postgres xids are 32-bit. Left long enough you get warnings that the database "must be
+  vacuumed within N transactions", and at the end of that road the server refuses writes:
+  `ERROR: database is not accepting commands to avoid wraparound data loss`. That mechanism —
+  freezing, `autovacuum_freeze_max_age`, and the emergency vacuum — belongs to the garbage
+  collection module; what belongs here is knowing that a long-open transaction is what starts
+  the clock.
+
+:::note[What to take forward]
+An update writes a new version and stamps the old one with the id that ended it; a snapshot
+is a rule that picks exactly one version per row; a version becomes garbage only when its
+ending transaction precedes the **horizon**, the oldest snapshot anyone holds. Because the
+horizon is one database-wide number, one long-running or idle-in-transaction reader keeps
+every dead version in the whole database alive, and the collector — vacuum, purge or
+compaction — runs, does its job, and correctly leaves the pile behind.
+:::

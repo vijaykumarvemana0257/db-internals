@@ -1,0 +1,254 @@
+---
+title: Heap file organization and free space management
+description: How a PostgreSQL relation becomes 1GB segments plus a Free Space Map and a Visibility Map, how the FSM decides where your next INSERT lands, why only the tail of a heap can ever be truncated, and how InnoDB solves the same problem with extents and file segments.
+depth: intermediate
+sidebar:
+  order: 3
+---
+
+import HeapGrowthFreeSpaceLab from '../../../../components/viz/HeapGrowthFreeSpaceLab';
+
+A heap is an unordered bag of pages, which sounds like it needs no bookkeeping at all — until you
+ask the only two questions that matter: *which page does this row go on*, and *can I give any of
+this file back to the filesystem*. The first answer is a side file that approximates free space
+one byte per page; the second is almost always "no", and understanding exactly why is the
+difference between a table that stays 40 GB forever and one you can actually shrink.
+
+<HeapGrowthFreeSpaceLab client:visible />
+
+Run a few batches of sequential inserts, then switch to **Delete a prefix** and run a couple
+more, then press VACUUM. The dead bytes vanish, the FSM bytes at the low-numbered pages jump to
+255, the next insert is placed *there* rather than at the end — and the file size does not move.
+Now reset, fill it again, and delete a *suffix* instead. Same number of rows deleted, same
+VACUUM, and this time the file shrinks. That asymmetry is the whole subject.
+
+## A relation is a small directory of files
+
+PostgreSQL stores a table under a numeric name, not its table name: `pg_class.relfilenode`,
+living at `base/<database oid>/<relfilenode>` inside `PGDATA` (or under `pg_tblspc/...` for a
+non-default tablespace). `SELECT pg_relation_filepath('orders')` prints it. The name is not
+stable: `VACUUM FULL`, `CLUSTER`, `TRUNCATE` and most rewriting `ALTER TABLE`s allocate a *new*
+relfilenode and drop the old file, which is exactly what makes them crash-safe and exactly why
+you cannot cache the path. A handful of bootstrap catalogs can't use `pg_class` to find
+themselves at all, so their mapping lives in a flat `pg_filenode.map` file — the bootstrap
+problem is the last page of this module.
+
+That file is capped at 1 GB (`RELSEG_SIZE`, a build-time `--with-segsize` option). Page 131072 of
+a table is the first page of `<relfilenode>.1`, and so on. The limit is a historical artefact of
+filesystems that could not carry files above 2 GB, but it still buys something: `md.c` can open
+and fsync one segment at a time. Addressing tops out elsewhere — `BlockNumber` is a `uint32`, so a
+fork maxes out at 2³² pages, 32 TB at the default 8 KB.
+
+Alongside the main fork sit the side files, distinguished by suffix:
+
+| Fork | File | Contents | WAL-logged? |
+|---|---|---|---|
+| main | `16384` | the heap pages themselves | yes |
+| fsm | `16384_fsm` | one byte per heap page: free space, quantised | **no** |
+| vm | `16384_vm` | two bits per heap page: all-visible, all-frozen | yes |
+| init | `16384_init` | the empty image an unlogged relation is reset to after a crash | yes |
+
+The FSM and VM are *derived*: you could delete both and regenerate them by scanning the heap. That
+is why the FSM can afford to skip WAL entirely, and it is the reason the two forks behave so
+differently after a crash.
+
+## The Free Space Map: one byte, 32-byte resolution
+
+Each heap page gets one byte in the FSM fork holding its free space divided by `BLCKSZ / 256` —
+32 bytes at the default page size. A byte value of 200 means "at least 6400 bytes free". Values
+round *down*, so the map never promises space that isn't there; it can only be pessimistic, which
+is the safe direction.
+
+Those bytes are not a flat array. Each FSM page holds a binary tree whose leaves are the
+per-heap-page categories and whose internal nodes hold the **maximum of their children**, so a
+single comparison at the root answers "does any page under here have room for a 300-byte tuple?".
+One 8 KB FSM page carries roughly four thousand leaves — about 32 MB of heap — and the maximum of
+each FSM page is itself stored as a leaf one level up. Three levels of that address more pages
+than any relation will ever have, and `FSM_TREE_DEPTH` is fixed at 3 for the default block size.
+The figure above collapses the binary tree into groups of eight so you can see the invariant that
+matters: **every internal node is the max of what it covers**, and the search is a descent, not a
+scan.
+
+The cost is small and worth knowing: the FSM is about 1/8192 of the heap plus change (a 100 GB
+table carries roughly a 13 MB FSM), and PostgreSQL 12 stopped creating one at all for relations
+under four pages — `HEAP_FSM_CREATION_THRESHOLD` — because for a three-page table it is cheaper to
+just look at the three pages. `CREATE EXTENSION pg_freespacemap` lets you read it directly:
+`SELECT * FROM pg_freespace('orders')` returns a row per block with the category decoded to bytes.
+
+:::caution[The FSM is allowed to be wrong]
+It is not WAL-logged, it is updated lazily, and after a crash it can be stale in both directions.
+A backend that follows the FSM to a page and finds no room does not error — it records the page's
+*actual* free space and searches again. In the other direction, free space the FSM has forgotten
+about is simply invisible until the next VACUUM rewrites those bytes and propagates the new
+maxima upward. Bloat that "VACUUM didn't fix" is sometimes just an FSM that hadn't caught up.
+:::
+
+## Where an INSERT actually lands
+
+`RelationGetBufferForTuple` is the function, and it tries three things in order.
+
+1. **`rd_targblock`** — the block this backend last inserted into, cached on the relation
+   descriptor. If the new tuple still fits there, no FSM lookup happens at all. This is why a
+   `COPY` of a million rows performs roughly one FSM lookup per page, not per row; watch the
+   "FSM descents / skipped" tile in the lab diverge as you run sequential inserts.
+2. **An FSM descent** for `tuple size + line pointer + the fillfactor reserve`. `fillfactor`
+   (100 by default for heaps, and the entire reason page 4 of this module exists) is subtracted
+   up front, so a table at `fillfactor = 85` stops packing pages at 85% and keeps the rest for
+   HOT updates.
+3. **Extend the relation.** If the root of the FSM says no page qualifies, the file grows.
+
+Step 2 has one detail that changes the physical layout of your table: the descent does not start
+at page 0. Each FSM page carries `fp_next_slot`, a round-robin pointer advanced after every
+successful search, so two backends inserting concurrently are steered to *different* pages rather
+than colliding on the same buffer's exclusive lock. The consequence is that a heap under
+concurrent insert is not ordered by insertion time, and a heap that has ever had rows deleted is
+not ordered by anything at all — new rows drop into whatever holes the FSM surfaces first. That
+is what `pg_stats.correlation` measures, and why a table with good correlation degrades into
+random I/O for range scans after a few months of churn (and why BRIN indexes, which assume
+correlation, quietly stop pruning).
+
+## Extension, and the lock everybody eventually meets
+
+Adding a page to a heap means agreeing with every other backend about which page number is next,
+so PostgreSQL takes a heavyweight **relation extension lock** to do it. In `pg_stat_activity` it
+shows up as `wait_event_type = 'Lock'`, `wait_event = 'extend'`, and on a table being loaded by
+dozens of parallel writers it can pin every one of them behind a single page-at-a-time file
+growth.
+
+The fix is to amortize the lock. Since 9.6 a backend that finds other backends queued behind the
+extension lock adds several pages at once and publishes them through the FSM, so the next N
+inserters find space without touching the lock; through PostgreSQL 15 the formula was literally
+`Min(512, lockWaiters * 20)` pages. PostgreSQL 16 reworked the path again to extend with a single
+`smgrzeroextend()` call instead of a loop of 8 KB writes, and to hold the lock across less work.
+Drag **Concurrent inserters** in the lab from 1 to 8 and re-run: the number of extensions
+collapses while the pages added per extension jumps. (The simulator scales the batch down so a
+64-page relation stays legible; the mechanism, not the constant, is the point.)
+
+If you see `extend` waits in production, the answers are ordered: fewer, larger statements (one
+multi-row `INSERT` or `COPY` rather than a million single-row inserts), then partitioning the
+table so writers spread across several relations, then a newer major version. More `shared_buffers`
+does nothing for it.
+
+## The Visibility Map: two bits that pay for themselves
+
+Each heap page also gets two bits in the `_vm` fork.
+
+- **all-visible** — every tuple on this page is visible to every possible snapshot. Set only by
+  VACUUM; cleared by any insert, update or delete on the page. It gates **index-only scans**: if
+  the bit is set, an index scan can answer from the index tuple alone and never touch the heap.
+  `EXPLAIN (ANALYZE)` reports the failures as `Heap Fetches: N` — a large number there on an
+  "index-only" scan means the VM bit is not set, not that the index is wrong.
+- **all-frozen** — every tuple is frozen, so anti-wraparound VACUUM can skip the page entirely
+  instead of re-reading it to prove there is nothing to freeze. This is what stops freezing cost
+  from scaling with table size forever.
+
+Two bits per 8 KB page is a 1:32768 ratio: the entire VM for a 1 GB segment is 32 KB, four pages.
+Each heap page also carries a redundant `PD_ALL_VISIBLE` flag in its own header so a scan holding
+the page doesn't need to consult the map; the `pg_visibility` extension's `pg_check_visible()` and
+`pg_check_frozen()` exist to catch the two disagreeing, which is a corruption signal.
+
+In the lab, press VACUUM twice with no workload in between and watch the all-frozen bits appear on
+the second pass — the simulation stands in "untouched across a VACUUM cycle" for the real rule,
+which is transaction-id age crossing `vacuum_freeze_min_age` (50 million by default).
+
+:::tip[Insert-only tables used to never get these bits]
+Before PostgreSQL 13, autovacuum triggered on dead tuples. An append-only table generates none, so
+it was never vacuumed, so its VM bits were never set, so index-only scans on it silently did full
+heap fetches forever. `autovacuum_vacuum_insert_threshold` (default 1000) fixed that by counting
+inserts too. On an older major version, a periodic manual `VACUUM` on append-only tables is not
+optional.
+:::
+
+## Why only the tail ever shrinks
+
+At the end of a vacuum, `lazy_truncate_heap` counts the run of **completely empty pages at the end
+of the file** and lops them off. It will not do it for a trivial win — the tail has to be at least
+`REL_TRUNCATE_MINIMUM` (1000) pages or 1/16 of the relation — and it needs an `ACCESS EXCLUSIVE`
+lock, which it takes *conditionally* and drops the moment another backend queues behind it. On a
+busy table, truncation frequently just doesn't happen; the `vacuum_truncate` storage parameter
+turns it off deliberately, which you want on a hot standby, where the AccessExclusive lock
+replays and stalls read queries.
+
+Everything else stays. An empty page in the middle of a heap is perfectly reusable — the FSM will
+hand it to the next insert — but the file keeps its size, because a file has no way to express "I
+no longer own block 4000". That is the mechanism behind the single most common PostgreSQL
+operational complaint: you deleted 90% of a table, VACUUM ran, `pg_relation_size` did not budge.
+
+To actually reclaim it you must rewrite the relation into a fresh relfilenode: `VACUUM FULL` or
+`CLUSTER` (both take `ACCESS EXCLUSIVE` for the duration and need room for a second copy), or
+`pg_repack`, which builds the copy online and only takes the exclusive lock for the final swap.
+`pgstattuple('orders')` tells you whether it is worth it — `tuple_percent` versus `free_percent`
+and `dead_tuple_percent`, measured rather than estimated.
+
+## InnoDB: the same problem, solved with extents
+
+InnoDB has no heap. Rows live in the leaf pages of the clustered index, so "where does this row
+go" is answered by the primary key, not by a free space map — but the tablespace underneath still
+has to hand out pages, and its bookkeeping is more elaborate than PostgreSQL's.
+
+With `innodb_file_per_table` on (the default), each table gets an `.ibd` file laid out like this:
+
+- **Page 0** is `FSP_HDR`: the file space header plus the **XDES** (extent descriptor) entries for
+  the first extents. Each XDES entry is 40 bytes — an 8-byte owning-segment id, a 12-byte list
+  node, a 4-byte state, and a 16-byte bitmap giving 2 bits per page in the extent. A fresh XDES
+  page recurs every 16 384 pages (256 MB at the default 16 KB page size), as does the change-buffer
+  bitmap on page 1. Page 2 is the **inode** page, holding the `FSEG` entries.
+- An **extent** is 64 pages: 1 MB at a 16 KB page size, and 2 MB or 4 MB if the instance was
+  initialized with `innodb_page_size=32k` or `64k`. Below 16 KB the extent stays 1 MB and simply
+  holds more pages (128 at 8 KB, 256 at 4 KB).
+- The file space header keeps extent free lists by state: **`FSP_FREE`** (no pages used, not owned
+  by anyone), **`FSP_FREE_FRAG`** (partly used, pages handed out individually to different
+  segments), and **`FSP_FULL_FRAG`**.
+- Every index owns two **file segments** — one for leaf pages, one for internal pages — described
+  by an `FSEG` inode with its own `FSEG_FREE` / `FSEG_NOT_FULL` / `FSEG_FULL` extent lists, plus an
+  array of **32 individually allocated fragment pages**.
+
+That last number is why a small InnoDB table does not cost a megabyte per index: a young segment
+takes single pages out of fragment extents, and only after it has burned all 32 fragment slots
+does it start claiming whole extents. Switch the lab to **InnoDB tablespace** and run sequential
+inserts: the first four allocations (scaled down from 32) come out of the fragment extent one page
+at a time, and then the file starts growing an extent at a time.
+
+The contrast that matters is at the other end. When rows are deleted, InnoDB's purge threads
+reclaim the record bytes inside the page, and when a page's fill drops below `MERGE_THRESHOLD`
+(50% by default, settable per index through a table comment) it merges with a sibling and the
+emptied page goes back to **the segment's free list** — not to the filesystem. A file-per-table
+`.ibd` never shrinks on its own. `OPTIMIZE TABLE` reports
+`Table does not support optimize, doing recreate + analyze instead`, because for InnoDB it is
+mapped to `ALTER TABLE ... FORCE`: a full rebuild into a new tablespace followed by a rename,
+which needs room for a second copy exactly like `VACUUM FULL`. Press **OPTIMIZE TABLE** in the lab
+after a delete-heavy run and watch the file drop to the number of pages the rows actually need.
+
+Growth on the other side is also chunked: a file-per-table tablespace extends in increments that
+ramp up to 4 MB, `innodb_autoextend_increment` (64 MB by default) governs the system and general
+tablespaces, and MySQL 8.0.23 added an explicit `AUTOEXTEND_SIZE` clause so you can ask for larger,
+more contiguous extensions on a table you know is about to grow.
+
+## Where it bites in production
+
+- **"I deleted half the table and nothing happened."** Correct behaviour. Check
+  `pgstattuple`/`pg_freespace` to confirm the space is reusable, and only reach for `pg_repack`
+  if the table will not organically refill.
+- **Index-only scans that aren't.** `Heap Fetches` climbing in `EXPLAIN (ANALYZE)` on a table with
+  a heavy write rate: the VM bits are being cleared faster than autovacuum sets them. Tune
+  `autovacuum_vacuum_scale_factor` down on that table rather than globally.
+- **`Lock` / `extend` waits during bulk load.** Many concurrent writers into one table. Batch the
+  inserts, partition the table, or upgrade — and know that a single `COPY` stream will not show it.
+- **A standby that freezes during vacuum.** VACUUM truncating a heap replays as an
+  `ACCESS EXCLUSIVE` lock on the standby and cancels or stalls readers. `vacuum_truncate = off` on
+  the offending table is the targeted fix; `max_standby_streaming_delay` is the blunt one.
+- **Random inserts into a UUID-keyed InnoDB table.** Every insert lands on a random leaf and
+  splits it 50/50, so pages settle well short of full and the tablespace carries noticeably more
+  pages than the same rows loaded in key order. Switch the lab to InnoDB and run **Random update**
+  to watch the split count climb. This is the real
+  argument for a monotonic primary key, and it has nothing to do with index depth.
+
+:::note[What to take forward]
+A relation is a main fork of 1 GB segments plus two derived side forks: an FSM that stores each
+page's free space in one lossy byte and is searched as a max-tree, and a VM whose two bits per page
+gate index-only scans and freeze-skipping. Inserts go to the backend's cached target block first,
+an FSM descent second, and a relation extension — under a lock that serializes every writer — last.
+And a heap file can only ever give back its trailing empty pages, so interior holes are reusable
+space, not recoverable space; getting them back means rewriting the relation, in PostgreSQL and in
+InnoDB alike.
+:::

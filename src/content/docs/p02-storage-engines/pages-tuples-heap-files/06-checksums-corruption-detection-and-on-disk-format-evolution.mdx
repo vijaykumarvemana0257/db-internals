@@ -1,0 +1,265 @@
+---
+title: Checksums, corruption detection and on-disk format evolution
+description: The header fields that let a page prove it is intact, current and itself — pd_checksum and pd_lsn, InnoDB's FIL header and trailer, SQLite's deliberate absence — and why those few bytes are the hardest part of the format to ever change.
+depth: intermediate
+sidebar:
+  order: 6
+---
+
+import PageIntegrityInspector from '../../../../components/viz/PageIntegrityInspector';
+
+A page arriving from the storage layer is 8192 bytes of nothing in particular. Before the
+buffer manager may hand it to anyone, those bytes have to answer three questions on their
+own: **are these the bytes that were written, is this the page that was asked for, and which
+version of it is this?** Every field that answers one of them was carved out of the header
+years ago and can never be moved, which is why the integrity bytes and the format-evolution
+story are the same story.
+
+<PageIntegrityInspector client:visible />
+
+## Three questions, and the field that answers each
+
+| Question | PostgreSQL | InnoDB | SQLite |
+|---|---|---|---|
+| Are these the bytes that were written? | `pd_checksum`, 2 bytes at offset 8 | `FIL_PAGE_SPACE_OR_CHKSUM` at offset 0, repeated in the trailer | nothing |
+| Is this the page that was asked for? | the block number is mixed into the checksum | `FIL_PAGE_OFFSET` + `FIL_PAGE_SPACE_ID`, compared explicitly | nothing — a b-tree page does not record its own page number |
+| Which version is this? | `pd_lsn`, 8 bytes at offset 0 | `FIL_PAGE_LSN` at offset 16, low half repeated at the end | the file-header change counter, not per page |
+| Is the layout one I understand? | `pd_pagesize_version` | tablespace flags on page 0 + the row-format bit in `PAGE_N_HEAP` | read/write format bytes 18 and 19 |
+
+The first row is the one everyone thinks about and the fourth is the one that constrains
+every future release. Work down the table in the inspector: the fields that answer these
+questions sit in the first few dozen bytes of every page in the file, and each one costs
+the same bytes forever.
+
+## PostgreSQL: sixteen bits, computed on the way out
+
+`pd_checksum` is the output of `pg_checksum_block()` in `checksum_impl.h`: 32 FNV-1a-style
+lanes run in parallel over the whole 8 KB block, are xor-folded to one 32-bit value, mixed
+with the block number, and squeezed into 16 bits as `(sum % 65535) + 1`. The `+ 1` matters —
+it means a stored zero can never be a legitimate checksum, so zero is reserved for *no
+checksum here*, which is how a cluster with checksums off and a cluster with checksums on
+can share a page layout.
+
+Two details about *when* it happens explain most of its production behaviour:
+
+- **It is computed into a copy.** `FlushBuffer` calls `PageSetChecksumCopy`, which memcpys the
+  shared buffer into a scratch page and stamps the checksum there. The shared buffer itself
+  is never modified, because other backends are reading it without a lock strong enough to
+  see a mutation.
+- **It is verified exactly once per trip through the buffer pool.** `PageIsVerified` runs when
+  a page is read off disk into shared buffers, not when it is pinned. A hot page that stays
+  resident for a week is checked once, a week ago. Nothing re-verifies memory.
+
+`PageIsVerified` does more than compare the checksum, and this is the part people miss when
+they leave `data_checksums` off. Its `header_sane` test, which runs regardless, rejects a page
+whose `pd_flags` has a bit outside `PD_VALID_FLAG_BITS` (0x0007) set, or where
+`pd_lower ≤ pd_upper ≤ pd_special ≤ BLCKSZ` does not hold, or where `pd_special` is not
+`MAXALIGN`ed. That is the whole list — it does not compare `pd_pagesize_version`, and the
+bounds test is loose enough that a plausible wrong `pd_upper` sails through. An all-zero page
+is explicitly *valid* — that is `PageIsNew`, a page extended but never filled. Turn checksums
+off in the inspector and flip any bit of the *high* byte of `pd_flags`: the read still fails,
+because every one of those bits is undefined. Flip one in a tuple body and nothing notices.
+That is precisely the shape of the protection you get for free: structure, and only the
+coarsest part of it.
+
+When verification fails you get two lines, in this order:
+
+```
+WARNING:  page verification failed, calculated checksum 34177 but expected 8952
+ERROR:  invalid page in block 4711 of relation base/16384/16427
+```
+
+The `WARNING` is the checksum; the `ERROR` is the read being refused. Two superuser GUCs
+change the second line and both are worse than they look. `ignore_checksum_failure = on`
+downgrades the failure to a warning and hands the corrupt page to the executor, so whatever
+that page contained is now flowing into query results and, if you update it, back onto disk
+with a fresh valid checksum. `zero_damaged_pages = on` replaces the page in memory with
+zeros — every row it held is gone, silently, and `VACUUM` will happily write the zeroed page
+back. Both exist for one purpose: getting as much data as possible out of a damaged cluster
+into a `pg_dump`, on a copy of the data directory, once. Counters live in
+`pg_stat_database.checksum_failures` and `checksum_last_failure`; alert on the first, because
+nothing else will tell you.
+
+:::caution[Checksums make hint bits expensive, not hashing]
+The FNV fold is a handful of instructions per 32 bytes and does not show up in a profile.
+The real cost of `data_checksums` is that it forces `wal_log_hints` behaviour: setting a hint
+bit now dirties a page that must be full-page-written to the WAL, because a torn write of a
+page whose only change was a hint bit would otherwise leave a stale checksum beside new
+bytes. On a read-heavy workload that first touches a lot of freshly committed tuples, that is
+a real jump in WAL volume — and it is why you measure after enabling, not before.
+:::
+
+## The field that was stolen, and why the layout has not moved since 8.3
+
+`PG_PAGE_LAYOUT_VERSION` has been **4** since PostgreSQL 8.3, which added `pd_prune_xid` and
+HOT. Drag the format slider in the inspector all the way back to layout 3 and that field
+disappears; the header shrinks from 24 bytes to 20 and every offset behind it moves.
+
+Now drag it forward. Checksums arrived in 9.3 and the layout version did **not** change,
+because the two bytes at offset 8 were already there: they were `pd_tli`, the timeline the
+page was last written on, a field nothing depended on any more. The checksum was put in its
+place, and whether those bytes mean anything is recorded once per cluster in `pg_control`,
+not per page.
+
+That was not thrift, it was a hard constraint. `pg_upgrade` does not read or rewrite a single
+data page — it dumps the schema, rebuilds the catalogs in the new cluster, and then hard-links,
+copies or reflinks the relation files across untouched. **Any change to the page header or the
+tuple header therefore breaks in-place upgrade for everyone**, turning a ten-minute link-mode
+upgrade of a 4 TB cluster into a dump and restore. Since `pg_upgrade` first shipped with 9.0 the
+community has repeatedly weighed proposals that want header space — 64-bit transaction ids
+being the perennial one — against exactly that cost. Ten-plus major versions of frozen byte
+offsets is the price of link-mode upgrades, and it was a deliberate trade.
+
+The same constraint appears in miniature everywhere else:
+
+- **`BLCKSZ` is compile-time.** Changing it is a dump and restore. `pd_pagesize_version` records
+  the size and layout version in every page, but the read path does not consult it — a server
+  built for a different block size is stopped at startup by the `blcksz` recorded in
+  `pg_control`, before it ever opens a relation file.
+- **Checksums cannot be turned on while the cluster is running.** `pg_checksums --enable`
+  needs the cluster cleanly shut down and rewrites every page in the cluster — a full read
+  and write pass over your entire data directory, offline.
+- **`pg_upgrade` refuses a checksum mismatch.** The old and new clusters must agree, so
+  "upgrade and enable checksums" is two outages, not one. From PostgreSQL 18 `initdb`
+  defaults to checksums on, which mostly ends the problem for new clusters and does nothing
+  for the ones you already have.
+
+## InnoDB: a checksum at each end, and the bytes in between that nobody hashes
+
+InnoDB's 16 KB page opens with a 38-byte `FIL` header and closes with an 8-byte trailer, and
+the interesting part is what the checksum *skips*. `buf_calc_page_new_checksum` covers bytes
+4–25 and bytes 38 to `page_size − 8`. Three regions are excluded by construction: the checksum
+field itself, `FIL_PAGE_FILE_FLUSH_LSN` and the space id at bytes 26–37, and the trailer. The
+inspector's stat tile reports 16,360 of 16,384 bytes covered; flip a bit in the flush-LSN slot
+and read the page, and CRC-32C waves it through — InnoDB catches a wrong space id by comparing
+the field, not by hashing it.
+
+The trailer is the other half of the design. Its last four bytes repeat **the low 32 bits of
+`FIL_PAGE_LSN`** from byte 16. Head and tail are 16 KB apart and therefore land in different
+sectors, so a write that only partly reaches the media leaves two different LSN halves in the
+same page. That check needs no checksum at all and predates the good ones: under the legacy
+`innodb` algorithm the trailer's first four bytes held `buf_calc_page_old_checksum`, a fold
+over only the **first 26 bytes** of the page, which detects almost nothing. Its neighbour was
+always doing the real work.
+
+| `innodb_checksum_algorithm` | Header field | Trailer | Coverage |
+|---|---|---|---|
+| `innodb` (the default through 5.6) | folded sum over 4–25 and 38…end−8 | fold over the first 26 bytes, then LSN low half | weak, and half of it decorative |
+| `crc32` (default since 5.7) | CRC-32C over the same two ranges | the same CRC repeated, then LSN low half | 16,360 of 16,384 bytes |
+| `full_crc32` (MariaDB 10.4.3+) | ordinary page content | one CRC-32C over everything before it, 4 bytes | 16,380 of 16,384 bytes |
+
+`full_crc32` is what the format looks like when you get to redesign it: one checksum, no
+exclusions, no duplicated LSN, a 4-byte trailer instead of 8. MariaDB could ship it because
+a tablespace records its format in `FSP_SPACE_FLAGS` on page 0, so old and new files coexist.
+MySQL's route is gentler still: the non-strict algorithm settings **accept any known
+algorithm on read** and write only the configured one, so a tablespace migrates from `innodb`
+to `crc32` lazily, page by page, as pages happen to be rewritten. That is the general trick
+for evolving an on-disk format with no downtime — make the reader permissive and the writer
+strict — and it is exactly what PostgreSQL cannot do with a page layout that has no version
+negotiation beyond a single number.
+
+A failed check is not a warning here. The server logs
+
+```
+InnoDB: Database page corruption on disk or a failed file read of page [page id: space=4, page number=40].
+InnoDB: You may have to recover from a backup.
+```
+
+and aborts. `innodb_force_recovery` (start at 1) exists to get the server up far enough to
+`mysqldump` what is left; `innochecksum` verifies a quiesced `.ibd` file offline. Row format —
+`REDUNDANT`, `COMPACT`, `DYNAMIC`, `COMPRESSED` — is likewise stamped into the page: the top
+bit of `PAGE_N_HEAP` says which family the records on this page use, so changing it means
+`ALTER TABLE … ROW_FORMAT=DYNAMIC` rebuilding every page rather than flipping a flag.
+
+## SQLite: no checksum, on purpose
+
+SQLite's database file has no per-page checksum and never has. Given that its stated design
+goal is to survive power loss and to be readable by every version since 2004, that looks like
+an omission until you see what it does instead:
+
+- **The rollback journal or WAL already holds a verified copy.** WAL frames each carry a
+  24-byte header with the page number, the two salt values from the WAL header, and a pair of
+  32-bit checksums computed *cumulatively* over every frame so far. Recovery replays frames
+  until one fails its checksum and stops there; a frame whose salts do not match the current
+  WAL header is not part of this WAL at all. So the bytes in flight are protected, even though
+  the bytes at rest are not.
+- **Structure is validated, content is not.** The b-tree layer rejects an unknown page type,
+  a cell pointer outside the usable area, or a cell count that overruns the page — that is
+  `SQLITE_CORRUPT`, "database disk image is malformed". `PRAGMA integrity_check` walks the
+  whole file doing this deliberately. Flip a byte in cell content in the inspector: nothing,
+  ever, notices. Flip the cell count: malformed.
+- **The format left room.** Byte 20 of the file header is *bytes reserved at the end of every
+  page*, normally 0. The checksum VFS (`cksumvfs`) sets it to 8 and stores an 8-byte checksum
+  of the preceding `pagesize − 8` bytes there, failing a mismatched read with
+  `SQLITE_IOERR_DATA`. A build without the shim still opens the file perfectly; it just
+  ignores those eight bytes.
+
+That last point is the whole philosophy. The 100-byte header has fixed the magic string, the
+page-size field, the payload fractions and the reserved-bytes count since 3.0.0, and the only
+forward-compatibility lever is **bytes 18 and 19**, the write and read format numbers. When
+WAL mode arrived in 3.7.0 they went from 1 to 2, and an older binary reacts by refusing the
+file rather than misreading it. One byte each way, used once in two decades.
+
+## What a checksum cannot tell you
+
+Set the inspector to any engine, any format, press **Lose the write**, then read. Everything
+passes. The page is internally perfect, at the right address, with a valid checksum — it is
+simply the *previous* version of itself, because the newest write never reached the media
+(a thin-provisioned volume out of space, a cache that acknowledged and forgot, a reverted
+snapshot, a replica restored from a stale image).
+
+No content checksum can catch this, because a checksum only ever says *these bytes are the
+bytes that were hashed*. Catching a stale page needs an external record of what the page
+should be:
+
+- **ZFS** puts a block's checksum and its birth transaction group in the **parent** block
+  pointer, never in the block. A write that loses the data cannot also rewrite the thing that
+  guards it, and a stale block is detected because the parent says it should be newer.
+- **Oracle's `DB_LOST_WRITE_PROTECT`** records the SCN of blocks as they are *read* into the
+  redo stream, so a standby applying that redo notices when its copy of the block is older
+  than the primary's was.
+- **PostgreSQL has nothing systematic.** Recovery applies a WAL record when `pd_lsn` is older
+  than the record — but a page whose update was silently lost long before the last checkpoint
+  needs redo that has already been recycled, and a page that simply was not modified looks
+  identical. `wal_consistency_checking` compares replayed pages against full-page images
+  written for that purpose, but it is a debugging GUC that inflates WAL volume enormously, not
+  a production defense.
+
+Two more limits worth holding on to. A checksum computed in RAM certifies whatever was in RAM,
+so a flip in a non-ECC buffer *before* hashing is stamped valid forever — the standard argument
+for ECC on database servers. And a page that nobody reads is never verified, which is why
+detection has to be scheduled: `pg_checksums --check` offline, `pg_amcheck` online for
+structure, `innochecksum` per file, `zpool scrub` under everything, and — the one most people
+actually rely on — a backup tool that verifies every page as it copies it, which is what
+`pg_basebackup` and pgBackRest do.
+
+## Where it bites in production
+
+- **`checksum_failures` climbing on one replica and nowhere else.** The corruption is that
+  machine's storage, not your data. Rebuild the replica from a fresh base backup; do not fail
+  over to it.
+- **A corrupt page found by `pg_dump` at 3 a.m.**, months after the flip, because nothing else
+  had read that block since. The dump is the scrub you did not schedule.
+- **An upgrade blocked by a setting, not a version.** `pg_upgrade` refuses when the old and new
+  clusters disagree about checksums, and enabling them afterwards is a second full-cluster
+  offline pass with `pg_checksums --enable`. Plan both, or inherit a cluster that never gets
+  them.
+- **MySQL stopping dead on one page.** InnoDB aborts the server rather than serve a page that
+  failed verification; recovery is `innodb_force_recovery`, a dump, and a restore — the
+  doublewrite buffer only helps when the page was torn by a crash, not when the media rotted.
+- **A "fix" that writes the corruption back.** `ignore_checksum_failure` or
+  `zero_damaged_pages` left on in production converts a loud failure into a silent one, and
+  the next `VACUUM` rewrites the damaged page with a perfectly valid checksum. Use them on a
+  copy, once, to extract data.
+
+:::note[What to take forward]
+A page carries a few bytes that let it prove it is intact (`pd_checksum`, the FIL header and
+trailer CRCs), that it is the page you asked for (the mixed-in block number,
+`FIL_PAGE_OFFSET`), and which write it came from (`pd_lsn`, `FIL_PAGE_LSN`) — and verification
+happens once, on the way into the buffer pool, over a specific byte range that is smaller than
+the page. None of it detects a page that is valid but stale; only an external record of the
+expected version does that. And because those bytes sit at fixed offsets that `pg_upgrade`
+copies without rewriting, the header is the most expensive part of the format to change: the
+lesson of `pd_tli` becoming `pd_checksum`, and of MySQL migrating checksum algorithms by
+making readers permissive and writers strict.
+:::

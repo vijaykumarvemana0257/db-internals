@@ -1,0 +1,238 @@
+---
+title: Document, key-value, wide-column and graph models
+description: The storage unit and native query shape of each non-relational model, why "schemaless" is a claim about timing rather than structure, and what a join costs once you leave the relational engine.
+depth: basics
+sidebar:
+  order: 7
+---
+
+import PolyglotDataModelLab from '../../../../components/viz/PolyglotDataModelLab';
+
+Every data model is a bet about which question you will ask most often. The model names one
+**storage unit** and gives you exactly one cheap way to find it; every other question is paid
+for somewhere else — an extra round trip, a scatter across partitions, a scan, or a copy of
+the fact written at insert time that you now have to keep correct forever. The five models
+below differ far less in what they can store than in where they send that bill.
+
+<PolyglotDataModelLab client:visible />
+
+Run the same blog dataset through all four queries. Notice what changes and what does not:
+with embedding on, "fetch a post with its comments" collapses to a single read in the
+document, key–value and wide-column lanes and to one index lookup plus pointer hops in the
+graph, while the relational engine pays two extra index descents and joins them itself;
+"all posts tagged storage" is only cheap where somebody built a second access path; two hops
+separates the graph from everything else; and the **Denormalize on write** switch never
+removes work — it only moves it from the read path to the write path.
+
+## The storage unit is the whole argument
+
+| Model | Storage unit | The one cheap access path | Everything else |
+|---|---|---|---|
+| Relational | Row in a table | Any indexed predicate; the planner picks | Joins and aggregates run in the engine |
+| Key–value | Opaque value behind a key | `GET key` (and prefix iteration, if keys are sorted) | Scan, or an index you maintain by hand |
+| Document | Nested document (an aggregate) | Document id, plus secondary indexes over fields inside it | Cross-document joins in the app or in `$lookup` |
+| Wide-column | Partition of sparse, timestamped cells | Partition key + a prefix of the clustering columns | A second table, written by you, per query |
+| Property graph | Node and relationship records | Index lookup for a start node, then pointer hops | Set-oriented aggregation over everything |
+
+Two structural facts follow immediately. First, the relational model is the only one whose
+access paths are *declared separately from the data* — you add an index and old queries get
+faster without rewriting storage. Second, every other model makes the physical layout part of
+the data model, which is why "how do I model this in Cassandra?" is a question with a
+different answer per query, and "how do I model this in SQL?" is not.
+
+## Key–value: an opaque value behind a key
+
+The purest model: a dictionary. `put(key, value)`, `get(key)`, `delete(key)`, and the store
+has no idea what is inside the value. That opacity is the feature — it is what lets the store
+be a hash table with no query engine at all.
+
+The one dimension that actually varies is **whether keys are sorted**:
+
+- **Redis** hashes keys into one dictionary. There is no key ordering, so `SCAN` is a
+  cursor walk over the hash table: it returns every element that was present for the whole
+  scan, may return duplicates, and gives you no snapshot. Values are typed — strings, lists,
+  hashes, sets, sorted sets — which lets you build *ad hoc* secondary indexes yourself, and a
+  sorted set is how most people fake an ordered index. Commands execute on a single thread, so
+  an `O(N)` command on a million-element set stalls every other client on the instance.
+- **RocksDB / LevelDB** keep keys sorted as byte strings, which adds exactly one access path:
+  iterate from a key, or seek to a prefix. Everything built on RocksDB exploits this by
+  encoding composite keys — `u#42#post#2026-03-01#p7` — so that a range scan over a prefix
+  *is* the one-to-many lookup. This is the same trick a clustered index plays, hand-rolled.
+- **DynamoDB** splits the key in two: a hashed **partition key** picks the storage node, and an
+  optional **sort key** orders items inside that partition. `GetItem` needs both; `Query` needs
+  the full partition key and can range over sort keys; `Scan` reads everything. Global
+  secondary indexes give you another access path, but the service maintains them by copying
+  items asynchronously — so a GSI is eventually consistent, and if a GSI's capacity is
+  exhausted the throttling propagates back to writes on the base table.
+
+What you give up is uniform: no server-side predicate that is not a scan, no join, no
+planner, and no atomicity beyond what the engine explicitly offers (Redis `MULTI` or a Lua
+script on one shard; DynamoDB `TransactWriteItems`, capped at 100 items in one region). And
+you give up the ability to ask a question you did not design a key for — the lab's keyspace
+`SCAN` for "posts tagged storage" is fine over three posts and fatal over three million.
+
+## Document: one-to-many locality in a single value
+
+A document store keeps a whole aggregate — the post, its comments, its tags, denormalized
+author names — in one nested value, so the common read is one seek and zero joins. MongoDB
+stores these as BSON in WiredTiger; the same physical idea lives inside PostgreSQL as `jsonb`.
+
+The consequences of "the aggregate is the unit" are sharp:
+
+- **The aggregate is also the unit of atomicity.** A single-document update is atomic in
+  MongoDB, always. Spanning documents needs a multi-document transaction (replica sets since
+  4.0, sharded clusters since 4.2), which works but is not what the model is for.
+- **Aggregates must be bounded.** An embedded array that grows without limit is the classic
+  production failure: the write fails once the document crosses the 16 MB BSON limit, and long
+  before that, every update rewrites the whole document because the storage engine replaces
+  values rather than patching them. Comments on a viral post are unbounded; a user's mailing
+  address is not. That is the modeling rule, and it is the only one that matters.
+- **Secondary indexes still exist.** An index over an array field is a *multikey* index — one
+  index entry per element — which is why "all posts tagged storage" is one index lookup in the
+  lab's document lane. Turn embedding on and watch the same query drag every comment along
+  with the post unless you project: locality is symmetric, and it costs you on the queries that
+  did not want the children.
+
+`jsonb` is the honest middle. It is a parsed binary tree stored in the row (TOASTed out of
+line past roughly 2 KB), queried with containment (`@>`) and path operators, and indexed with
+GIN — `jsonb_path_ops` builds a smaller index that supports only containment, the default
+opclass supports key-existence too. Updating one field rewrites the entire `jsonb` datum and
+produces a new row version, so it is not a cheap mutable map. But constraints, joins, and
+transactions still apply to the row that holds it, which makes "documents" a column type
+rather than an architecture.
+
+## Wide-column: partition key, clustering columns, sparse timestamped cells
+
+This family is misnamed. A wide-column store is not a column store (nothing here is about
+scanning one column of a billion rows); it is a **sorted, sparse, multi-dimensional map**.
+Bigtable's original formulation is exact: a map from `(row key, column family:qualifier,
+timestamp)` to an uninterpreted byte string, sorted by row key.
+
+Cassandra's CQL dresses this in table syntax but the primary key tells you the physical
+layout: `PRIMARY KEY ((post_id), created_at, comment_id)` means `post_id` is hashed
+(Murmur3Partitioner by default) into a token that selects the replicas, and inside that
+partition rows are stored sorted by `created_at, comment_id`. That ordering is not an
+optimization, it is the only ordering you get — `ORDER BY` can reverse it and nothing else.
+Each cell carries its own write timestamp, conflicts resolve last-write-wins per cell, and an
+absent column costs nothing, so "wide" means a partition can carry a million distinct
+qualifiers without reserving space for any of them.
+
+The query rule follows mechanically: **you must supply the full partition key, plus a prefix
+of the clustering columns.** Anything else requires `ALLOW FILTERING`, which asks the
+coordinator to scatter to every token range and filter after reading — the `S` marks in the
+lab's wide-column lane. The intended answer is a **table per query**, populated by the
+writer. Bigtable has no partition hash, just lexicographic row keys split into tablets, so its
+version of this rule is about key design: monotonically increasing prefixes (a timestamp, a
+sequence) concentrate all writes on one tablet, which is why the standard advice is to salt or
+field-promote the row key. HBase is the open-source restatement of the same design — regions
+instead of tablets, the same sorted byte-string row keys — with one schema-on-write element:
+column families are declared in DDL and are the unit of storage and compression, while the
+qualifiers inside them stay dynamic and free.
+
+## Property graphs: adjacency as a pointer, not a join
+
+A property graph stores nodes with labels and properties, and typed, directed relationships
+that also carry properties. The mechanism that makes it a different thing from three tables is
+**index-free adjacency**. Neo4j's store files are arrays of fixed-size records — 15 bytes for a
+node, 34 bytes for a relationship — so a record id multiplied by the record size is a file
+offset. A node record points at the first relationship in its chain, and each relationship
+record is a doubly linked list node in the chains of both endpoints. Following an edge is
+therefore a pointer dereference, and the cost of a traversal is proportional to the
+neighbourhood you touch, not to the size of the graph.
+
+Do the same two-hop query relationally, or in a document store, and each edge costs an index
+lookup: a B-tree descent per hop per node. Run the **friends-of-friends** query in the lab and
+compare the `idx` counters — the graph lane does exactly one index lookup, to find the start
+node, and zero afterwards. That is the whole value proposition, and it is also the limit: for
+a query that touches most of the graph, index-free adjacency buys nothing and set-oriented
+engines win.
+
+**Triple stores** (RDF) take the opposite position. Everything is a `(subject, predicate,
+object)` triple, there is no node record and no schema; the store keeps several sorted indexes
+over permutations of the triple (SPO, POS, OSP…) and SPARQL evaluates a pattern as a chain of
+joins over them. That buys self-describing, federatable, vocabulary-evolving data — the reason
+RDF dominates biomedical and provenance work — and pays for it by making every hop an index
+lookup again.
+
+Neither requires leaving your relational engine outright: SQL:2023 added SQL/PGQ for property
+graph pattern matching, Postgres has recursive CTEs and the Apache AGE extension, and for two
+or three hops over a modest graph a self-join is usually fine. The supernode is what breaks
+this equivalence in both directions: a node with millions of relationships turns the adjacency
+chain into a long list (Neo4j switches to grouped relationship records past a threshold, 50 by
+default) and turns the relational self-join into a scan of a huge index range.
+
+## "Schemaless" is a claim about *when*, not *whether*
+
+There is no such thing as data without a schema. There is only a choice about who enforces it
+and at what moment.
+
+- **Schema-on-write** — the engine rejects a bad row at `INSERT`. Relational tables, Cassandra
+  (CQL has real DDL and typed columns), DynamoDB's key attributes, MongoDB when you attach a
+  `$jsonSchema` validator.
+- **Schema-on-read** — the writer stores whatever it has and every reader is the schema. The
+  effective schema is the *union of every shape ever written*, which nothing in the database
+  records, and which grows monotonically until someone backfills.
+
+The usual argument for schema-on-read is migration cost, and it is weaker than it used to be:
+`ALTER TABLE ... ADD COLUMN` with a non-volatile default has been a metadata-only operation
+since PostgreSQL 11, and MySQL 8.0 has `ALGORITHM=INSTANT` for the same. Adding a field to a
+document store is genuinely free at write time; the bill arrives on every read, forever, as
+branches in application code that must tolerate three-year-old shapes. One model presents the
+cost at once and lets you schedule it; the other spreads it into small pieces you can never
+finish paying. Neither is "no schema".
+
+One smaller trap: in a document store a missing field and a field set to `null` are distinct
+states, and every reader must decide which means what. SQL forces that decision once, at the
+column, with `NULL` and `NOT NULL`.
+
+## The bill for leaving relational
+
+Whatever the store, a join you no longer have goes exactly one of two places.
+
+**Into application code.** You issue the second query yourself. You lose the planner, so join
+order and method are whatever your loop does; you lose statistics, so nothing notices when the
+comment count per post changes by 100×; you filter after transferring; and the result is no
+longer a consistent snapshot, because your reads happened at different times. The N+1 problem
+is not an ORM defect here, it is the model.
+
+**Into write fan-out.** You precompute the join at insert time, and one logical fact becomes
+*k* physical copies. Run the lab's rename query with denormalization on: the display name lives
+in the profile, in embedded comment subdocuments, in prebuilt blobs, in comment cells, and in
+the query table, and nothing in the store knows they are the same fact. There is no
+transaction spanning them — Cassandra's logged batch buys atomicity across partitions, never
+isolation; a DynamoDB GSI updates asynchronously — so every copy is a place to diverge, and a
+rename is a backfill job rather than a statement.
+
+Pick deliberately, and pick per access pattern rather than per company. Detailed per-store
+modeling — Cassandra table design, DynamoDB single-table patterns, Mongo aggregate boundaries —
+is Part 5's subject; what matters here is the shape of the trade.
+
+## Where it bites in production
+
+- **Hot partition / celebrity key.** One partition key takes a disproportionate share of
+  traffic; in Cassandra and DynamoDB the partition is the unit of placement, so one node
+  saturates while the cluster looks idle. The fix is a composite or salted key, decided at
+  design time.
+- **Unbounded aggregates.** Comments embedded in a post, events appended to a document, a
+  Cassandra partition that grows per user forever. Symptoms: rising p99 on a single key, then
+  a hard failure at 16 MB in MongoDB, or a compaction warning and eventual read timeouts on a
+  large Cassandra partition.
+- **Tombstones in queue-shaped tables.** Deleting rows in Cassandra writes tombstones that
+  reads must still traverse until compaction removes them; past `tombstone_warn_threshold`
+  (1000) you get a log line, and past `tombstone_failure_threshold` (100000) the read fails
+  with `TombstoneOverwhelmingException`. A table used as a work queue hits this reliably.
+- **`ALLOW FILTERING` in a code path.** It works in staging with 10 000 rows and scatters
+  across every replica in production. Grep for it.
+- **Big-key latency in Redis.** One `SMEMBERS` on a set with a million members blocks the
+  single command thread; every unrelated client sees the spike.
+- **Denormalized copies drifting.** The write that updated four of five copies and failed on
+  the fifth leaves no trace. Reconciliation jobs are not optional once you denormalize.
+
+:::note[What to take forward]
+Each model gives you one cheap access path to one storage unit — key, document, partition,
+node — and charges for every other question in round trips, scatters, scans or duplicated
+writes. "Schemaless" means the schema is enforced by readers instead of the engine, not that
+it is absent. And when you leave the relational model, the join does not disappear: it moves
+into your application code or into write fan-out, and both of those are consistency problems
+before they are performance problems.
+:::

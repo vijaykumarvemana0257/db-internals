@@ -1,0 +1,233 @@
+---
+title: Append-only logs and Bitcask hash indexes
+description: The simplest storage engine that works — append every write to one open file, keep a hash directory from key to (file_id, offset, size) in RAM — and the two limits that force the rest of the LSM design.
+depth: basics
+sidebar:
+  order: 1
+---
+
+import BitcaskAppendLogLab from '../../../../components/viz/BitcaskAppendLogLab';
+
+A B-tree pays for its sorted order on every write: find the leaf, maybe split it, write the page
+back where it came from. The cheapest possible alternative is to give that up entirely — never
+update anything in place, append every write to the end of one file, and keep a hash table in RAM
+that says where the newest copy of each key landed. That design is Bitcask, the default backend of
+Riak, described by Justin Sheehy and David Smith in *Bitcask: A Log-Structured Hash Table for Fast
+Key/Value Data* (2010), and it is worth an hour of your attention because everything an LSM tree
+does is this design plus the two fixes it needs.
+
+<BitcaskAppendLogLab client:visible />
+
+## One open file, and a pointer that moves
+
+The on-disk state is a directory of files named `1.bitcask.data`, `2.bitcask.data`, and so on.
+Exactly one of them is open for writing — the *active* file. Every `put`, `delete` and overwrite
+appends a record at its tail and nothing else ever happens to a file's bytes. When the active file
+passes `bitcask.max_file_size` it is closed and a new one opened, and from that instant it is
+immutable: no writer will ever touch it again, which is the property that makes background
+maintenance safe without a single lock on the read path.
+
+A record is framed like this, and the framing is the whole file format:
+
+| Field | Width | Purpose |
+|---|---|---|
+| `crc32` | 4 B | Checksum over the rest of the record — the only integrity check there is |
+| `tstamp` | 4 B | Write timestamp; decides which of two records for a key is newer |
+| `ksz` | 2 B | Key length |
+| `valsz` | 4 B | Value length |
+| `key` | `ksz` | |
+| `value` | `valsz` | |
+
+Fourteen bytes of header, then the bytes you asked to store. There is no page, no slot array, no
+free-space map, no fragmentation to manage — the concerns that
+[heap file organization](/p02-storage-engines/pages-tuples-heap-files/03-heap-file-organization-and-free-space-management/)
+spends its whole existence on simply do not arise, because space is never reused.
+
+In RAM sits the **keydir**: a hash table from key to a fixed-size entry.
+
+```
+keydir[key] = { file_id, value_pos, value_sz, tstamp }
+```
+
+Writing key `u:101` appends a record and then overwrites that one entry — a pointer move. The
+record the entry used to point at is still on disk, byte for byte, and is now unreachable. Push
+**put** in the lab a few times on the same key and watch the arrow re-point while grey boxes pile
+up behind it. That is the entire update mechanism: *overwrite by append*, with a garbage trail.
+
+Two consequences fall straight out of the ratio from the
+[latency ladder](/p01-foundations/hardware-os-durability/01-memory-hierarchy-and-latency-numbers/):
+
+- **A write is one sequential append.** No read-modify-write of a page, no seek to a location the
+  key determines, no split. The cost does not depend on how much data you already have, which is
+  exactly what a B-tree cannot promise once the index no longer fits in the buffer pool and each
+  insert dirties a random page.
+- **A read is one hash probe plus at most one `pread`.** The keydir hands you `(file_id,
+  value_pos, value_sz)`, so you read precisely the bytes of the value and nothing around them. A
+  B-tree read costs a root-to-leaf descent — cheap when the upper levels are cached, but still more
+  than one access, and the number grows with the data. Here it is one, forever. A *miss* costs
+  zero I/O: the keydir holds every live key, so absence is decided in RAM.
+
+That flat read path is why Bitcask shows up in latency-sensitive systems with a bounded keyspace,
+and it is the property that LSM trees give up — a get in RocksDB may have to consult the memtable
+and several sorted files, which is why the next pages are largely about making those extra lookups
+cheap.
+
+## Durability is the log's, not the index's
+
+The keydir is never written to disk. It is a pure derivative of the data files, which means a crash
+destroys the entire index and loses no data at all. Press **Crash** in the lab: every record greys
+out, not because the bytes are gone but because nothing can find them.
+
+The durability contract is the ordinary one from
+[fsync and write barriers](/p01-foundations/hardware-os-durability/06-fsync-write-barriers-and-the-durability-contract/):
+an append that has only reached the page cache survives a process crash and not a power cut. Riak
+exposes this directly as a sync strategy — never sync and let the OS write back on its own schedule,
+open the active file `O_SYNC` and pay a barrier per write, or sync on a timer and accept a bounded
+loss window. The knob is the same trade every engine offers; what is unusual here is how little
+machinery sits behind it, because there is no separate log to keep ordered against a heap. The log
+*is* the database. The [WAL primer](/p01-foundations/anatomy-of-a-database-engine/07-wal-primer-log-records-lsns-and-log-before-page/)
+described a redo log that exists to protect pages written elsewhere; Bitcask deletes the
+"elsewhere".
+
+Crash recovery of the file tail is the `crc32` field's job. A power cut mid-append leaves a partial
+record; on startup the checksum over that record fails, the file is truncated at the last complete
+record, and nothing downstream ever sees the fragment. This is why the checksum is *per record*
+rather than per page: the recovery unit and the write unit are the same thing.
+
+## Delete is an append too
+
+There is no way to erase a record — files are immutable and the active file only grows. So a delete
+appends a record whose value is a **tombstone**: in early Bitcask, the literal sentinel
+`bitcask_tombstone`; later versions a versioned tombstone that also records the file id and offset
+of the record it supersedes, so a merge can tell whether the value it shadows is inside the set of
+files being merged. The keydir entry is then marked deleted (or removed, once nothing older can
+resurface), and a `get` answers `not_found` without touching disk.
+
+Press **delete** in the lab and read the disk stats: the "dead bytes" number goes *up*. A delete
+consumes space. This is counter-intuitive enough that it causes real incidents — a bulk cleanup job
+issued against a log-structured store makes the data directory grow, sometimes sharply, until
+maintenance catches up.
+
+:::caution[Dropping a tombstone too early resurrects the key]
+A tombstone may only be discarded when every file that could still hold an older record for that
+key is part of the same rewrite. Drop it while an older value survives in an unmerged file, and the
+next index rebuild replays that older record and the deleted key comes back. Every log-structured
+store has a version of this rule and a knob that governs it — Cassandra's `gc_grace_seconds` is the
+famous one, where the danger is a deleted row reappearing via a replica that missed the tombstone.
+The lab only drops a tombstone when the merge covers every closed file, which is the safe case.
+:::
+
+## Merge, and the hint files that make restart survivable
+
+Garbage accumulates in proportion to overwrites and deletes, so a background **merge** process
+reads the closed files, writes out only the record each live key currently points at, and deletes
+the originals. It never touches the active file — that file is still being appended to, so it is
+not safe to rewrite, and anything it contains is newer than everything merge is looking at anyway.
+Merge is a read-write pass over the data, not an in-place edit, and the keydir is re-pointed at the
+new offsets as records land.
+
+In Riak this is policy-driven rather than continuous: `bitcask.merge.policy` decides *when* merging
+is allowed to run at all (including a window of hours, so it can be kept away from peak traffic),
+the `bitcask.merge.triggers.*` settings decide whether a merge is worth starting for a partition —
+based on how fragmented its files are and how many dead bytes they hold — and the
+`bitcask.merge.thresholds.*` settings decide which individual files get included once it does. The
+split matters operationally: a trigger that never fires means dead bytes accumulate forever, and the
+first symptom is a disk-usage graph that climbs while the logical dataset is flat.
+
+The second output of a merge is the reason this design survives restarts at all. Rebuilding the
+keydir means learning every key's newest offset, and the only way to learn that from a data file is
+to read it — every header *and* every value, discarding the values as you go, because you have to
+walk the values to reach the next header. So merge also writes a **hint file** next to each file it
+produces, `N.bitcask.hint`, containing one entry per record:
+
+```
+tstamp (4) | ksz (2) | total_sz (4) | value_pos (8) | key
+```
+
+Eighteen bytes plus the key — everything the keydir needs and none of the payload. On startup, a
+file with a hint file is rebuilt by reading the hint file; a file without one (the active file,
+plus any closed file not yet merged) must be scanned in full.
+
+Flip the lab's **Restart reads** control between *hint files* and *full scan* and watch the bytes
+read and the rebuild time. The speedup is simply the ratio of average record size to average hint
+entry size: with 20-byte keys and 1 KB values it is roughly 30×, and with 100 KB values it is
+thousands. That ratio is the difference between a node rejoining a cluster in seconds and a node
+that is unavailable for an hour after a reboot.
+
+:::note[Startup cost is proportional to bytes on disk]
+Even with hint files everywhere, rebuild time scales with the number of keys and the size of the
+unmerged tail, not with how busy the node is. This is the practical ceiling most Bitcask operators
+hit first — not a throughput limit but a *restart* limit, and it is felt precisely when you least
+want it, during a rolling upgrade or a recovery.
+:::
+
+## The two limits that force the rest of this module
+
+### Every key must be in RAM, on every node, always
+
+The keydir holds an entry for every live key: the key itself plus `file_id` (4) + `value_sz` (4) +
+`value_pos` (8) + `tstamp` (4), plus the hash table's own per-entry overhead — pointers, bucket
+slack, allocator rounding. Riak's capacity-planning guidance budgets roughly 40–50 bytes of
+overhead per key on top of the key bytes.
+
+Drag the lab's **Projected keyspace** slider. At 10 million keys with short keys you are looking at
+a few hundred megabytes — comfortable. At a billion keys you are looking at tens of gigabytes of
+resident memory *per node*, before a single byte of value is cached, and it cannot be paged out
+without turning every read into two disk accesses. Values may be arbitrarily large and live happily
+on disk; keys may not. So the design has a hard, quantifiable ceiling that has nothing to do with
+disk size, and you can compute exactly where it is: `keys × (avg_key_len + ~45 B)`.
+
+This is why capacity planning for a Bitcask cluster is a *key-count* exercise, and why a workload
+with many tiny values — the classic case where key overhead dominates payload — is the worst
+possible fit.
+
+### There is no order, so there are no range scans
+
+A hash table has no notion of "the next key after `u:101`". Press **`scan u:*`** in the lab: the only
+implementation available is to enumerate every entry in the keydir, filter in the application, and
+then issue one random read per hit. The cost is O(total keys) regardless of how few match, and there
+is no way to stream results in key order without sorting the whole keyspace first.
+
+This is not a tuning problem, it is the data structure. It shows up in Riak as a hard product
+boundary: the Bitcask backend cannot serve secondary-index queries at all — Riak's 2i requires the
+LevelDB backend instead, which is to say a backend built on *sorted* files. Anything that needs
+ordered access — a range predicate, a prefix scan, an ordered iterator, a merge join, a time-series
+slice — is off the table.
+
+And the two limits are entangled: the reason the index must be in RAM is that an on-disk hash index
+would need a random read per lookup and could not be scanned in order either. Making the on-disk
+files **sorted** fixes both at once. A sorted file can carry a sparse index — one entry per block
+rather than per key — so the in-memory footprint drops by the block size divided by the record size,
+and it can be scanned in key order and merged with other sorted files in a single pass. That file is
+the SSTable, and it is the next page.
+
+## Where it bites in production
+
+- **Deletes grow the disk.** A cleanup that removes 30% of the keys adds tombstone records and
+  leaves every deleted value intact until a merge runs. If merging is windowed or throttled, disk
+  usage rises for hours after the delete. Alert on the ratio of dead to live bytes, not on raw disk.
+- **Restart takes as long as it takes.** A node with hundreds of gigabytes and no hint files —
+  because merges have not been running — can take many minutes to rebuild its keydir, during which
+  it serves nothing. The fix is to keep merges current, which means treating merge health as an
+  availability metric.
+- **The RAM ceiling arrives suddenly.** Key count grows, resident memory grows with it, and the
+  node is fine until it is OOM-killed. There is no graceful degradation, because paging the keydir
+  out is not a survivable state. Track live key count as a first-class capacity metric with a
+  threshold computed from the formula above.
+- **Merge competes with the write path for I/O.** Rewriting closed files reads and writes the whole
+  live dataset periodically, on the same device serving foreground traffic. The knobs that exist —
+  the merge window, the trigger thresholds — are all about *when* to pay that, never whether. How
+  much you pay, and how differently you can schedule it, is the subject of the compaction module.
+- **A single huge value skews everything.** Records are variable-length and never split, so one
+  multi-megabyte value sits in the middle of a file that merge must read end-to-end. Log-structured
+  stores handle this by separating keys from values; that too is a later page.
+
+:::note[What to take forward]
+Append-only plus an in-memory hash index is the smallest storage engine that is both fast and
+crash-safe: writes are sequential appends, reads are one probe and one seek, updates and deletes are
+just more appends, and the index is disposable because the log is the truth. Merge reclaims the
+garbage that overwrite-by-append leaves behind, and hint files exist purely so restart does not have
+to read every value byte to rebuild the index. What kills it is that the index must fit in RAM and
+that a hash table has no order — and both fall away the moment the files on disk are written in
+sorted key order.
+:::

@@ -1,0 +1,268 @@
+---
+title: Mapping an ER model to tables
+description: The mechanical rules that turn entities, relationships and cardinalities into DDL — and the sharp line between the cardinalities the engine enforces and the ones that survive only as a drawing.
+depth: basics
+sidebar:
+  order: 4
+---
+
+import ErMappingStudio from '../../../../components/viz/ErMappingStudio';
+
+Turning an ER diagram into tables is one of the few genuinely mechanical steps in database
+work: five rules cover almost every model you will ever draw, and two engineers applying them
+to the same diagram should produce the same DDL. The interesting part is not the translation.
+It is the gap it leaves — a diagram states constraints in every direction, and SQL's
+declarative constraints can only express a strict subset of them. Everything else becomes a
+convention your application is quietly responsible for.
+
+<ErMappingStudio client:visible />
+
+## Rule 1 — a 1:N relationship is a foreign key on the many side
+
+A project has many employees; an employee works on one project. The reference goes on
+`employee`, never on `project`, and the reason is the first normal form: a column holds
+exactly one value, so `employee.project_id` can name one project and `project.employee_id`
+could not name six.
+
+That asymmetry pays a dividend. The "at most one" half of the cardinality is enforced by the
+shape of the row, for free — there is nowhere to put a second project id, so no constraint is
+needed and none can be violated. Set the visual to 1:N and press *Violate it*: the `UPDATE`
+that tries to add a second project simply replaces the first.
+
+The other half — **participation** — is the one word of DDL that changes everything
+downstream:
+
+```sql
+-- total participation: every employee is on a project
+project_id bigint NOT NULL REFERENCES project(id)
+
+-- partial participation: an employee may be on none
+project_id bigint          REFERENCES project(id)
+```
+
+A nullable foreign key is not a stylistic choice; it is the statement "this row may have no
+parent", and it propagates straight into every query. `JOIN project` drops those employees
+silently. `LEFT JOIN project` keeps them with NULLs in the project columns. Flip participation
+to *partial* in the visual and watch the *Dropped by INNER JOIN* tile move off zero — that
+number is the count of rows a headcount report would lose without anyone noticing. **Nullable
+FK and outer join are the same fact stated twice**, once in the schema and once in the query.
+
+Participation also constrains the referential action. `ON DELETE SET NULL` is only *usable* on
+a nullable column — Postgres accepts the DDL on a `NOT NULL` column and then fails every parent
+delete with `23502` — so declaring total participation commits you in practice to `CASCADE`,
+`RESTRICT` or the SQL-standard default of `NO ACTION` when a parent disappears.
+
+:::caution[Nobody indexes your foreign keys for you]
+PostgreSQL creates an index behind `PRIMARY KEY` and `UNIQUE` and *no index at all* behind
+`REFERENCES`. Every delete or key-update on the parent then makes the referential-integrity
+trigger search the child table for referencing rows, and without an index that is a
+sequential scan per parent row, taking `FOR KEY SHARE` locks as it goes. The symptom is a
+`DELETE` of a single row that takes seconds while `pg_stat_user_tables.seq_scan` climbs on a
+table nobody queried. InnoDB is the opposite: it *requires* an index on the referencing
+columns and silently creates one if you did not. The visual's *Indexes you must create* tile
+counts exactly the ones Postgres leaves to you.
+:::
+
+## Rule 2 — an M:N relationship becomes a junction table
+
+Neither side has room for a list, so the relationship gets a table of its own, whose primary
+key is the pair of foreign keys:
+
+```sql
+CREATE TABLE employee_project (
+  employee_id bigint REFERENCES employee(id) ON DELETE CASCADE,
+  project_id  bigint REFERENCES project(id)  ON DELETE CASCADE,
+  since       date,
+  PRIMARY KEY (employee_id, project_id)
+);
+CREATE INDEX ON employee_project (project_id);
+```
+
+Two things in that snippet are load-bearing.
+
+**The composite primary key is the only cardinality the junction enforces.** It says "this
+link exists at most once" and nothing else. It does not say an employee must be on a project,
+and it does not cap how many they may be on. Switch the visual to M:N and cycle through the
+violations: the duplicate link is rejected with `23505 unique_violation` on
+`employee_project_pkey`, while "hire an employee with no project at all" and "put one employee
+on three projects" are both accepted, whatever you drew.
+
+**The second index is not optional.** A B-tree on `(employee_id, project_id)` answers "which
+projects is this employee on?" with a seek, and cannot seek at all for "who is on this
+project?", because the leading column is unconstrained — the planner is left with a full scan
+of the index or of the table. You need the reverse direction indexed as well. On InnoDB
+the secondary index implicitly carries the clustered key, so a plain `KEY (project_id)` is
+already covering; on Postgres, add the column you want returned if you want an index-only
+scan. A junction table with one index is a junction table that scans in one direction.
+
+The moment the junction grows an attribute of its own — `since`, `role`, `qty`, `allocation`
+— it was never a pure relationship; it is an **associative entity**, and it deserves a name
+from the domain rather than two table names glued together. That is also the point at which
+people reach for a surrogate key, and the classic bug follows: `id bigserial PRIMARY KEY`
+replaces the composite key, nobody adds `UNIQUE (employee_id, project_id)`, and duplicate
+links accumulate until every `COUNT(*)` over the join is wrong. Untick *Declare the implied
+keys* in the visual to watch that exact failure: the same insert now succeeds and the result
+set grows a row that should not exist. (Django's `ManyToManyField` builds the junction with a
+uniqueness constraint on the pair; Rails' `has_and_belongs_to_many` does not add one unless
+you write the index yourself.)
+
+## Rule 3 — a 1:1 relationship merges or splits
+
+One employee per project and one project per employee gives you a real choice, and the visual
+shows the row counts each answer produces.
+
+**Merge** — one table holding both entities. The join disappears, and so does the absorbed
+entity's independent existence: every column it contributed becomes nullable, and a project
+cannot be stored before the employee who holds it. Try *create a project nobody works on*
+after merging and the insert dies on `23502 not_null_violation` against `employee.name`,
+because there is no such thing as half a row. Merge when both sides are genuinely mandatory
+and share a lifecycle.
+
+**Split** — two tables and a `UNIQUE` foreign key. The `UNIQUE` is the entire difference
+between 1:1 and 1:N; drop it and the schema quietly permits two projects to share a lead while
+the diagram still claims otherwise. It also earns its keep twice, since the unique index is
+the FK index you needed anyway.
+
+There is a better variant of split that the reverse-mode puzzle *account / subscription* makes
+explicit: make the child's **primary key also its foreign key**.
+
+```sql
+CREATE TABLE subscription (
+  account_id bigint PRIMARY KEY REFERENCES account(id) ON DELETE CASCADE,
+  plan       text NOT NULL
+);
+```
+
+One column, one index, and "at most one child per parent" is structural rather than an
+add-on constraint. Split (rather than merge) when the two halves have different access
+patterns, different write rates, different privileges, or when one of them is wide and rarely
+read — in Postgres a tuple approaching 2 KB, about a quarter of the 8 KB page, starts getting
+compressed and pushed out of line into TOAST, which is a real cost paid by every query that
+touches the row.
+
+One asymmetry catches people: **whichever side carries the FK is the side whose participation
+you can make mandatory.** With `project.lead_employee_id NOT NULL`, every project has a lead;
+nothing whatsoever says every employee leads a project. Set the visual to 1:1 / split / total
+and try *hire an employee who leads nothing* — accepted. Making both sides mandatory means
+mutual NOT NULL foreign keys, which cannot both be satisfied by the first insert; the fix is
+`DEFERRABLE INITIALLY DEFERRED` on at least one of them so the check happens at `COMMIT`.
+Postgres and Oracle support that; SQL Server has no deferrable constraints at all.
+
+## Rule 4 — a weak entity becomes a composite key
+
+A weak entity has no key of its own. A dependent is identified as "Mira, *of employee 101*",
+and the mapping says so literally: the owner's key becomes part of the child's key.
+
+```sql
+CREATE TABLE dependent (
+  employee_id bigint REFERENCES employee(id) ON DELETE CASCADE,
+  dep_name    text,
+  born        int,
+  PRIMARY KEY (employee_id, dep_name)
+);
+```
+
+This is what an **identifying relationship** looks like physically, and it buys three things
+at once. Uniqueness is scoped to the owner — another employee's Mira is perfectly legal.
+`ON DELETE CASCADE` is the existence dependency made executable; delete the owner in the
+visual and the dependents vanish with it. And because the primary key is owner-first, "all
+dependents of this employee" is a range scan over contiguous index entries, which on InnoDB
+means contiguous *rows*, since the primary key is the clustered index.
+
+## Rule 5 — a multi-valued attribute becomes a child table
+
+"Skills" on the employee box is not a column. First normal form forbids `skills text` holding
+`'sql,rust,go'`, and the mapping is the same shape as a weak entity: a table keyed on
+`(employee_id, skill)`. Tick *Skills (multi-valued)* in the visual and the child table appears
+with its own composite key, which both dedupes the set and indexes the owner side.
+
+The modern alternative is real: Postgres `text[]` and `jsonb`, MySQL `JSON`. What you give up
+is specific and worth knowing before you choose it — you cannot declare a foreign key from an
+array element or a JSON member, you cannot put `NOT NULL` or a `CHECK` on an individual
+element, the general-purpose index is a GIN index over the whole value rather than a B-tree on
+the element (you can still B-tree an expression such as `(doc->>'sku')`, but only for the paths
+you name in advance), and updating one element rewrites the entire value and its TOAST chunks. Use a
+child table when the values are shared vocabulary that other rows reference; use an array or
+`jsonb` when the values are opaque to the database, never joined, and always read whole.
+
+## What the DDL enforces, and what stays a drawing
+
+This is the table to internalise. The left column is something an ER diagram can state; the
+right column is whether your engine will actually stop a violation.
+
+| Drawn constraint | Maps to | Enforced? |
+|---|---|---|
+| Max 1 on the FK side (1:N, 1:1) | the column itself | Yes, structurally — free |
+| Max 1 on the other side of a split 1:1 | `UNIQUE` on the FK | Yes |
+| Min 1 on the FK side (total participation) | `NOT NULL` | Yes |
+| Min 1 on the *parent* side ("every project has at least one employee") | nothing | **No** — needs a trigger |
+| Any max above one ("at most 3 projects") | nothing | **No** — trigger, or a counter column plus `CHECK` |
+| Either min or max across an M:N junction | nothing | **No** |
+| "This exact pair appears once" | composite PK or `UNIQUE` | Yes |
+| Existence dependency (weak entity) | `ON DELETE CASCADE` | Yes |
+| Referential validity | `REFERENCES` | Yes — if the engine is enforcing them |
+| No cycles in a self-referencing hierarchy | nothing | **No** — no declarative constraint sees two rows |
+
+The pattern behind the "No" rows: SQL's declarative constraints evaluate **one row at a
+time**. Anything requiring a count of related rows is outside them. And you cannot work around
+it with a deferred `CHECK` in Postgres, which allows `DEFERRABLE` only on `UNIQUE`,
+`PRIMARY KEY`, `REFERENCES` and `EXCLUDE` — a minimum-cardinality rule needs a deferred
+*constraint trigger*, or an honest decision to leave it to the application.
+
+:::caution[Two ways an FK stops being enforced at all]
+SQLite parses foreign keys and ignores them: enforcement is off unless each connection runs
+`PRAGMA foreign_keys = ON`. And distributed engines generally cannot enforce a reference that
+crosses a shard boundary — Vitess does not support foreign keys across shards, and Citus
+supports them only between colocated distributed tables (matched on the distribution column) or
+from a distributed table to a reference table. In both cases the FK graph
+degrades into a naming convention, which is exactly the situation the reverse-reading skill
+below exists for.
+:::
+
+## Reading a schema backwards
+
+You will inherit far more schemas than you design, and the foreign-key graph *is* the diagram
+— you just have to read it. Switch the visual to **Tables → model** and work the four puzzles;
+the decisive evidence is always one of three questions about each FK column.
+
+| What you see | What it means |
+|---|---|
+| Plain FK, nullable | 1:N, optional participation on the child side |
+| Plain FK, `NOT NULL` | 1:N, mandatory parent |
+| FK with `UNIQUE` | 1:1 |
+| FK that *is* the primary key | 1:1, and the child cannot exist without the parent |
+| Composite PK made of exactly two FKs | a junction — the relationship is M:N |
+| ...the same, plus non-key columns | an associative entity: the relationship carries data |
+| Composite PK of one FK plus a local column | a weak entity, identifying relationship |
+| FK pointing at its own table | a self-referencing hierarchy; NULL marks the roots |
+
+Get the raw material from the catalog rather than from memory: `\d+ tablename` in psql prints
+both the outgoing constraints and the "Referenced by" list, and
+`SELECT conname, conrelid::regclass, confrelid::regclass FROM pg_constraint WHERE contype = 'f'`
+dumps the whole graph at once. On MySQL it is `SHOW CREATE TABLE` or
+`information_schema.KEY_COLUMN_USAGE` filtered on a non-null `REFERENCED_TABLE_NAME`; on
+SQLite, `PRAGMA foreign_key_list(t)`. When the answer comes back empty — a MyISAM-era schema,
+a sharded cluster, an ORM that never declared them — reconstruct the edges from column naming
+and from the joins that actually appear in the query log, and treat every one of them as
+unverified until you have counted the orphans.
+
+## Where this lands next
+
+A faithful mapping usually arrives at third normal form without anyone aiming for it, because
+the ER step already separated the entities: each table describes one kind of thing, and its
+non-key columns depend on its whole key. Where it does *not* land there is predictable, and
+worth carrying into the normalization module: a merged 1:1 that absorbed an entity with a key
+of its own introduces a partial dependency; a junction table whose extra attribute depends on
+only one of its two keys does the same; and a "repeated group" flattened into `phone1`,
+`phone2`, `phone3` fails first normal form outright, which is Rule 5 ignored. Normalization is
+the audit that catches a mapping you did by hand; it is not a substitute for doing the mapping.
+
+:::note[What to take forward]
+Five rules do the work: FK on the many side, junction table with a composite key for M:N,
+merge-or-UNIQUE-FK for 1:1, owner key inside the child's key for a weak entity, child table
+for a multi-valued attribute. What the DDL then enforces is narrow — "at most one", "at most
+one *pair*", "not null", "must reference something" — because constraints see one row at a
+time. Every minimum-across-children and every count above one is a convention until you write
+a trigger. And read the FK graph in reverse whenever you inherit a schema: nullable, unique,
+part-of-the-primary-key are the three questions that recover the diagram.
+:::

@@ -1,0 +1,238 @@
+---
+title: Key layout, prefix compression and suffix truncation
+description: Why an index cell is not a key, how PostgreSQL truncates separators so internal pages route more children, how prefix compression and posting-list deduplication shrink leaves, and what a wide clustered primary key costs every secondary index.
+depth: intermediate
+sidebar:
+  order: 6
+---
+
+import IndexKeyCellLayoutLab from '../../../../components/viz/IndexKeyCellLayoutLab';
+
+Fanout is not a property of a B+tree. It is a property of the bytes you put in one, and the
+engine is allowed to be creative about which bytes those are. An internal page does not need
+to store your keys — it needs to store just enough of them to decide which child to descend
+into — and a leaf page does not need to store the same 40-byte tenant name eight hundred
+times. Every byte removed from a cell multiplies the number of children a page can route,
+which shrinks the internal levels until they fit in memory and stay there.
+
+<IndexKeyCellLayoutLab client:visible />
+
+## A cell is not a key
+
+An index page is a slotted page, laid out exactly as
+[Page anatomy and the slotted page](/p02-storage-engines/pages-tuples-heap-files/01-page-anatomy-and-the-slotted-page/)
+describes: a fixed header at the low end, an array of fixed-width line pointers growing up
+from it, and variable-length cells growing down from the high end. What changes for an index
+is what goes in the cell and what the slot array means.
+
+In PostgreSQL's nbtree the page has a 24-byte `PageHeaderData`, a 16-byte `BTPageOpaqueData`
+special area at the very end (left and right sibling links, level, flags), and between them
+4-byte `ItemIdData` line pointers and the tuples themselves. A tuple is an 8-byte
+`IndexTupleData` header — a 6-byte `t_tid` plus a 2-byte `t_info` — followed by the key
+data, `MAXALIGN`ed to 8. The row pointer is not extra: in a leaf tuple `t_tid` *is* the heap
+TID. So a leaf entry for a 36-character UUID stored as `text` costs
+`MAXALIGN(8 + 1 + 36) + 4` = 52 bytes, not 36 — the 1 is the short varlena length byte, the
+other 15 are alignment padding, the tuple header and the line pointer.
+
+Two details matter later. First, unlike the heap, **the line pointer array is in key order** —
+nbtree keeps items sorted by offset number precisely so that an intra-page lookup is a binary
+search over a contiguous 4-byte array rather than a walk. Second, in an internal page the
+downlink is not stored separately: the child block number lives in `t_tid`, the same six
+bytes that hold a heap TID in a leaf. An internal cell therefore costs
+`MAXALIGN(8 + separator bytes) + 4` and nothing more — which makes the separator's width the
+single number that sets fanout.
+
+## Separators only have to separate
+
+The B+tree invariant for an internal entry is weak on purpose: a separator `S` between two
+children must satisfy `last key of the left child ≤ S ≤ first key of the right child` (the
+exact inequality depends on whether the engine treats the separator as inclusive). Nothing
+requires `S` to be a key that exists, or to be a complete key at all. Anything that lands in
+the gap routes correctly.
+
+PostgreSQL 12 turned that into **suffix truncation**. When a leaf splits, `_bt_truncate`
+compares the last key on the left page with the first key on the right, finds the first
+attribute where they differ, keeps attributes up to and including that one, and throws the
+rest away; the count of surviving attributes is stamped into the tuple header, so the
+resulting *pivot tuple* is a legal, self-describing, shorter key. On an index over
+`(tenant, event_type, occurred_at, id)` where the boundary falls inside a tenant's event
+stream, the separator keeps `tenant`, `event_type` and `occurred_at` and drops a 36-byte
+UUID and the 6-byte heap TID — a third of the cell, gone, on every internal page.
+
+Three consequences are worth internalising:
+
+- **Non-key `INCLUDE` columns are always truncated away.** A covering index's payload exists
+  only in leaves, so adding `INCLUDE (amount, status)` widens leaf cells and leaves internal
+  fanout untouched.
+- **The split point is chosen to make truncation pay.** `_bt_findsplitloc` evaluates many
+  candidate split points rather than just the midpoint, and among those that satisfy the
+  fillfactor it prefers the one that yields the smallest separator. A split that lands on a
+  tenant boundary produces a one-attribute separator; the engine will go looking for it.
+- **Heap TID is the implicit last column.** Since PostgreSQL 12 the heap TID participates in
+  the key ordering, which gives every entry a unique position — and truncation removes it
+  from separators. When the two boundary keys are equal in every real column, truncation has
+  nothing to drop and the separator keeps the whole key plus a TID; toggle the low-cardinality
+  key shape in the lab and watch the separator stop shrinking for exactly that reason.
+
+Not every engine does this. InnoDB internal records carry the complete key, and because a
+secondary index's key *is* `(indexed columns, primary key columns)`, that includes the whole
+PK. SQLite's index interior cells carry the full index record. WiredTiger does truncate, at
+byte rather than attribute granularity, under the table config `internal_key_truncate`.
+
+:::note[Fanout buys residency more often than it buys height]
+Height is `ceil(log_F N)` and F sits inside a logarithm, so raising fanout from 60 to 90
+rarely removes a level. What it removes is *internal pages*: at fanout F the internal levels
+are about `1/(F−1)` of the index, so a 1.5 GB index has ~25 MB of internal pages at F=60 and
+~17 MB at F=90. That is the difference between the routing structure living permanently in
+the buffer pool and competing with leaves for frames.
+:::
+
+## The high key on every page
+
+Every nbtree page except the rightmost of its level stores, at offset 1, a **high key**: an
+upper bound on every key the page may contain. It is the same truncated pivot tuple that was
+copied up to the parent at split time, kept in two places on purpose. A descent that arrives
+at a page and finds its search key greater than the high key knows it is at a stale page and
+must follow `btpo_next` to the right — the Lehman-Yao rule that lets readers proceed without
+holding a lock on the parent, and the reason an
+[incomplete split](/p02-storage-engines/b-trees-and-variants/03-crash-safety-of-structure-modifications-atomic-splits-and-in/)
+is still searchable. (The locking protocol built on it belongs to the concurrency module.)
+
+For this page, the high key is a cost: one extra cell per page, which is why the lab subtracts
+a separator-sized tuple from every page's usable space before packing it. It is also the
+clearest argument for truncation — the narrower the separator, the cheaper it is to carry one
+on every page in the index.
+
+## Prefix compression: pay once for the shared bytes
+
+Sorted keys share leading bytes with their neighbours almost by definition. **Front coding**
+(the classic name; "prefix compression" in storage engines) stores, per cell, the number of
+bytes shared with the preceding cell plus only the bytes that differ. On a page of
+`acme-logistics-eu-west-1|checkout.session.completed|2026-03-14T…|<uuid>` keys, the first cell
+stores all 110 bytes; its neighbours share the tenant, the event type and most of the
+timestamp, so they store barely half that.
+
+The cost is that a cell is no longer independently readable. A binary search needs to compare
+against an arbitrary item, and an item that begins "…share 47 bytes with whatever came before
+me" cannot be compared without reconstructing it. Engines resolve this in one of two ways:
+
+- **Restart points.** Every *k*-th cell stores its key in full and front coding restarts
+  there; the binary search runs over restart points and the final few comparisons are a linear
+  walk. RocksDB does exactly this inside data blocks, with `block_restart_interval` defaulting
+  to 16.
+- **Instantiation.** WiredTiger keeps pages prefix-compressed in its on-disk image and
+  materialises individual keys in memory on demand by walking back to a preceding complete
+  key, gated by `prefix_compression` and a `prefix_compression_min` threshold so it does not
+  spend a length byte to save three.
+
+MyISAM's `PACK_KEYS` table option is the same idea, shipped decades earlier — packed
+(front-coded) index blocks, cheap to store, more expensive to search. PostgreSQL's nbtree has never shipped
+prefix compression; its page-at-a-time binary search assumes every item is directly
+comparable, and the community has repeatedly judged the reconstruction cost and the
+complication of every page-modification path to outweigh the space.
+
+Notice in the lab what the technique does *not* do: switch to the UUIDv4 key shape and prefix
+compression saves nothing at all, because adjacent random keys share nothing. Prefix
+compression is a bet on correlated keys — timestamps, paths, tenant-scoped identifiers, sorted
+text — and against random ones, and it is the reason a synthetic benchmark over random strings
+can conclude it is worthless.
+
+## Deduplication: one key, many TIDs
+
+PostgreSQL 13 added the other half of the leaf-side story. A secondary index on
+`(status)` over ten million rows stores the string `'delivered'` a few million times, each in
+its own 24-byte tuple, purely so that each can carry a different 6-byte TID. **Deduplication**
+folds a run of equal keys into a single *posting list tuple*: the key once, followed by a
+sorted array of `ItemPointerData`s. The per-duplicate cost falls from a whole aligned tuple
+plus a line pointer to six bytes.
+
+The mechanics are worth knowing because they explain when it does and does not fire:
+
+- It is **lazy**. A deduplication pass runs when a leaf page is about to split — the engine
+  would rather compact than split — not on every insert. So the physical layout of a freshly
+  built index and one that has been written into for a month differ.
+- It is bounded by the ordinary item limit. A single index tuple cannot exceed roughly a third
+  of a page (PostgreSQL will tell you so with `index row size 3096 exceeds btree version 4
+  maximum 2704 for index "…"`), and a posting list is an index tuple, so a long duplicate run
+  becomes several posting tuples of a few hundred TIDs each rather than one giant one.
+- It requires **`equalimage`**. The opclass must provide a support function asserting that
+  equal values have identical binary images. `numeric` does not qualify — `1.0` and `1.00` are
+  equal and store differently — nor does `float`, nor `text` under a nondeterministic
+  collation. Those indexes silently get no deduplication. The per-index escape hatch is the
+  storage parameter `deduplicate_items = off`.
+- It applies to **unique indexes too**, where the duplicates are not user data but dead row
+  versions from repeated updates. Together with bottom-up index deletion in PostgreSQL 14, it
+  is why a table updated in place no longer grows its indexes without bound.
+
+Drag the lab to the low-cardinality key shape and turn deduplication on: leaf pages stop being
+mostly tuple headers, and the index collapses by roughly the duplicate-run factor. Turn on the
+UUID shape and the toggle does nothing, because there is nothing to fold.
+
+## Wide keys are a tax on every level
+
+InnoDB's secondary indexes do not store a row pointer; they store the **primary key** of the
+row, because the table *is* the clustered B+tree and the PK is how you get back to it. That
+makes the PK width a multiplier on every other index. A `BIGINT` PK adds 8 bytes to every
+secondary entry; a `CHAR(36)` UUID adds 36 in a single-byte charset (and counts as 144 against
+the key-length limit under `utf8mb4`, which reserves the maximum bytes per character), and because the PK columns are part of the
+secondary key, they also appear in every internal record — InnoDB does no suffix truncation,
+so the wide PK shrinks fanout at every level, not just at the leaves. Choose the
+InnoDB-style key shape in the lab and turn suffix truncation *off* — InnoDB's behaviour — to
+see both effects at once.
+
+That is the concrete cost behind the "use a narrow, monotonic primary key" advice, and it
+compounds with the split behaviour of random keys covered in
+[Fill factor, fragmentation and splits under load](/p02-storage-engines/b-trees-and-variants/04-fill-factor-fragmentation-and-splits-under-load/).
+InnoDB also enforces a hard ceiling: 3072 bytes of index key with the `DYNAMIC` or
+`COMPRESSED` row format at the default 16 KB page, 767 with `COMPACT` or `REDUNDANT`, which is
+why long `VARCHAR` columns end up indexed by a prefix (`KEY (url(191))`).
+
+## Normalized keys, and the bridge to the next page
+
+Every technique on this page is easier when a key is a **byte string that compares correctly
+under `memcmp`**. Truncation at byte granularity, front coding, and the SIMD-friendly
+comparison loops inside a page all become trivial byte operations, and impossible or
+approximate otherwise — nbtree truncates at *attribute* granularity precisely because its keys
+are typed datums compared by per-type functions, not bytes.
+
+Systems that control their own encoding go the other way and normalize first. MyRocks, TiKV,
+CockroachDB and FoundationDB's tuple layer all encode composite keys into a single
+memcomparable byte string: integers sign-flipped and stored big-endian, NULLs given a reserved
+leading tag byte, embedded zero bytes escaped so no key is a prefix of another, descending
+columns bitwise complemented. PostgreSQL uses a partial version of the same idea in sorting —
+`SortSupport` abbreviated keys pack a lossy 8-byte normalized prefix into the sort tuple so
+most comparisons are a single integer compare, with the full comparator as a tiebreak.
+
+That encoding is also where the ordering guarantees of the whole tree come from, and where
+they can be silently lost. The next page takes it apart:
+[Collation, Unicode and byte-comparable key encoding](/p02-storage-engines/b-trees-and-variants/07-collation-unicode-and-byte-comparable-key-encoding/).
+
+## Where it bites in production
+
+- **The index is bigger than the table.** Usually a wide composite key, a `text` PK, or
+  duplicates that cannot deduplicate. Check `pg_relation_size` per index, then
+  `pgstatindex(...)` from `pgstattuple` for `avg_leaf_density` and `leaf_fragmentation`, and
+  `index_size / (tuples × key width)` for how much of it is overhead.
+- **A major-version upgrade changes index sizes.** Rebuilding indexes after moving to
+  PostgreSQL 12 or 13 (via `REINDEX`, or `pg_upgrade` plus a reindex) is what actually
+  materialises suffix truncation and deduplication — the on-disk pages you carried over keep
+  their old layout. An index that shrinks by half on `REINDEX` is not a bug report.
+- **Deduplication that never fires.** An index on a `numeric` column, or on `text` in a
+  nondeterministic (`ICU`, case-insensitive) collation, gets none of it and nothing says so.
+  If a low-cardinality index is unexpectedly large, check the column's type and collation
+  before blaming vacuum.
+- **`Specified key was too long; max key length is 3072 bytes`** on MySQL, or
+  `index row size … exceeds btree version 4 maximum 2704` on PostgreSQL: the key you are
+  indexing is not an identifier, it is a document. Index a hash, a prefix, or an expression.
+- **Prefix compression on random keys** costs CPU on every page search and saves nothing.
+  It is a per-table decision in WiredTiger for a reason.
+
+:::note[What to take forward]
+An index's real currency is bytes per cell, and each level of the tree can spend them
+differently: leaves must hold the whole key plus a row pointer, internal pages only need
+enough bytes to route. Suffix truncation exploits that asymmetry to raise fanout and keep the
+routing levels resident; prefix compression and deduplication attack the leaves instead, and
+both are bets on the shape of your data — correlated neighbours, or repeated values. A wide
+clustered primary key is the opposite of all three: it inflates every cell of every secondary
+index, at every level.
+:::

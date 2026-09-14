@@ -1,0 +1,243 @@
+---
+title: "Numeric types: exact money vs float drift"
+description: Why binary floats give a different total depending on row order and worker count, what NUMERIC costs to get the exact answer, and how integer minor units and overflow behaviour differ across PostgreSQL, MySQL and SQLite.
+depth: intermediate
+sidebar:
+  order: 3
+---
+
+import NumericDriftLedger from '../../../../components/viz/NumericDriftLedger';
+import IntegerWidthOverflowLab from '../../../../components/viz/IntegerWidthOverflowLab';
+
+A `double precision` column holding money almost never loses a dollar on a single `SUM`. What
+it loses is **the guarantee that the same query returns the same number twice**, and the
+guarantee that a total which ought to be zero *is* zero. Those two losses are what turn up as
+a reconciliation job that fails on healthy accounts, a nightly report that disagrees with
+itself by 3 × 10⁻¹⁰, and an invoice that is off by a cent that nobody can reproduce.
+
+<NumericDriftLedger client:visible />
+
+## What a binary float actually stores
+
+`float8` / `double precision` is IEEE-754 binary64: one sign bit, an 11-bit exponent, and a
+52-bit stored significand (53 effective, because the leading bit is implicit). Every
+representable value is an integer times a power of **two**. `0.1` is not one of them. The
+double nearest to 0.1 is
+
+```
+0.1000000000000000055511151231257827021181583404541015625
+```
+
+which is why `0.1 + 0.2 = 0.30000000000000004` and why adding `0.1` ten times gives
+`0.9999999999999999`. The relative error of a single rounding is at most 2⁻⁵³ ≈ 1.1 × 10⁻¹⁶,
+so one price is wrong in the 17th digit and you will never see it. The errors accumulate.
+
+`float4` / `real` is binary32: a 24-bit significand, ~6 decimal digits, and exact integers only
+up to 2²⁴ = 16 777 216. Pick the lab's "every row exactly $0.10" shape, set 300 000 rows, and
+switch the float column to `float4`: the exact answer is $30 000.00 and the accumulator lands
+on **$29 920.43**. That is not a rounding artifact, it is 0.27% of the money, and the
+mechanism is *absorption* — once the
+running total is large enough that the next addend falls below half an ulp of it, the addition
+is a no-op. PostgreSQL's `sum(real)` keeps its transition state in `real` (the transition
+function is `float4pl` over a `real` state), so the accumulator is exactly as narrow as the
+column.
+
+:::caution[Postgres 12 did not add the drift, it stopped hiding it]
+`extra_float_digits` defaults to `1` from PostgreSQL 12 on, and float output uses the
+shortest representation that round-trips exactly. Before that, the default printed 15
+significant digits and rounded the evidence away. Reports that "started" disagreeing after a
+major-version upgrade had been disagreeing all along.
+:::
+
+## Why the order of the rows changes the answer
+
+Floating-point addition is commutative but **not associative**: `(a + b) + c` and
+`a + (b + c)` round at different points and can differ in the last bits. Exact decimal
+addition *is* associative, which is the entire reason the `numeric` line in the lab sits flat
+on zero no matter what you do to the row order.
+
+Three ordinary things reorder your rows, and none of them are under your control:
+
+- **The plan changed.** A sequential scan, an index-only scan, a bitmap heap scan and a
+  parallel scan visit the same rows in four different orders. So does a table that was
+  `VACUUM FULL`ed, or a partition that was repacked.
+- **Parallel aggregation.** PostgreSQL implements it as a *partial* aggregate per worker plus
+  a *combine* function in the leader — for `sum(double precision)` both are `float8pl`. Each
+  worker rounds inside its own accumulator; the leader rounds again as it folds the partials
+  together. Push the worker slider in the lab and watch a third total appear. Worse, the
+  worker count is not stable: it is derived from the table size against
+  `min_parallel_table_scan_size` (8 MB), capped by `max_parallel_workers_per_gather`, and then
+  limited by whatever workers `max_parallel_workers` actually has free *at execution time*. A
+  busy server gets fewer workers and a different total.
+- **Vectorized execution.** DuckDB, ClickHouse, Snowflake and every other column engine keep
+  one accumulator per SIMD lane and merge at the end, for the same reason and with the same
+  consequence.
+
+The practical rule is not "floats are inaccurate". It is: **a float sum is not a value you may
+compare, hash, cache, checksum or reconcile against.** Pick the "ledger" shape in the lab —
+every debit has a matching credit, the true total is exactly `0.00`, and the float column is
+not zero. Then this query reports every healthy account as broken:
+
+```sql
+SELECT account_id, SUM(amount) AS net
+FROM   ledger_entries
+GROUP  BY account_id
+HAVING SUM(amount) <> 0;          -- amount is double precision: this finds everything
+```
+
+:::danger[Never use a float as a key]
+A float column in a primary key, a unique constraint, a `GROUP BY` key, a join predicate or a
+partition key is a latent bug: the value that goes in is not always the value that comes out
+of an arithmetic path, and equality is exact. PostgreSQL also gives `NaN` non-IEEE ordering
+semantics so that its B-tree stays usable — `NaN = NaN` is true, and `NaN` sorts greater than
+every other value — which means a stray `NaN` compares equal to itself in the index and
+unequal to itself in your application language.
+:::
+
+## NUMERIC/DECIMAL: what exactness costs
+
+`numeric` is a variable-length, base-10 number: a sign, a weight, a display scale, and a
+sequence of digits. PostgreSQL packs four decimal digits into each 2-byte digit word (base
+10 000), and the documentation states the storage cost directly: *two bytes for each group of
+four decimal digits, plus three to eight bytes of overhead*. So `1234.56` costs about 8–9
+bytes — not meaningfully more than `float8`'s fixed 8. The range is absurd on purpose: up to
+131 072 digits before the decimal point and 16 383 after. `NaN` has always been allowed;
+`Infinity` and `-Infinity` were added in PostgreSQL 14.
+
+MySQL's `DECIMAL` is a fixed-width binary-packed decimal since 5.0.3: nine decimal digits per
+4 bytes, maximum 65 digits total with at most 30 after the point.
+
+The cost is not storage, it is **CPU and allocation**. Every `numeric` addition is a software
+loop over base-10⁴ limbs rather than one FPU instruction, and in PostgreSQL every intermediate
+result is a freshly allocated varlena in the executor's per-tuple memory context. In an OLTP
+statement touching a handful of rows this is unmeasurable. In an analytic aggregate over
+hundreds of millions of rows it is the difference between a scan that is I/O-bound and one
+that is CPU-bound — which is why column engines go to considerable trouble to represent
+decimals as fixed-width 64- or 128-bit integers with an implied scale instead.
+
+Two details that bite:
+
+- **`NUMERIC` with no precision is not `NUMERIC(p,s)`.** Unconstrained `numeric` stores
+  whatever scale arrived, and keeps it for display: `10.10` and `10.1` compare equal and print
+  differently. A declared `numeric(12,2)` rounds on assignment instead — **half away from
+  zero**, which is what accountants expect but is not what your language's default rounding
+  does.
+- **Division is the one place `numeric` must round.** Addition, subtraction and multiplication
+  of decimals are exact; division generally is not, so the engine picks a result scale. MySQL
+  exposes that choice as `div_precision_increment` (default 4). The moment you write
+  `total / quantity`, you are back in approximate arithmetic and you need to say where the
+  rounding happens.
+
+:::caution[`round()` does not mean one thing in PostgreSQL]
+`round(numeric)` breaks ties **away from zero**; `round(double precision)` breaks ties **to
+even**, because it hands off to C's `rint()`. `round(2.5::numeric)` is `3`, `round(2.5::float8)`
+is `2`. Changing a column's type therefore changes your rounding rule silently, in the
+direction of a half-cent per tie.
+:::
+
+Avoid PostgreSQL's `money` type. It is an `int64` whose number of fractional digits comes from
+`lc_monetary` at the time of input, it carries no currency code, and changing the locale
+changes the meaning of data already stored.
+
+## Integer minor units
+
+The other exact representation is an integer count of the currency's smallest unit —
+`amount_minor bigint` plus an explicit currency code:
+
+```sql
+CREATE TABLE payment (
+  id            bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  amount_minor  bigint  NOT NULL,          -- 1999 = $19.99, or ¥1999, or 1.999 KWD
+  currency      char(3) NOT NULL REFERENCES currency (code),
+  CONSTRAINT amount_nonneg CHECK (amount_minor >= 0)
+);
+```
+
+It is exact, it is fixed-width, it adds at full integer speed, and `SUM` over it is
+order-independent. The costs are real and worth naming:
+
+- **"Cents" is an assumption, not a fact.** The ISO 4217 exponent is 2 for most currencies, **0
+  for JPY**, **3 for KWD, BHD, OMR and TND**, and 4 for a couple of fund codes. The exponent
+  has to come from the currency row, not from a `/ 100` hard-coded in six services.
+- **Sub-minor precision still exists.** Unit prices, FX rates, interest and per-unit tax all
+  need more digits than the money they produce. Keep those in `numeric` with an explicit scale,
+  and make the conversion to minor units an explicit, named rounding step — a function, not an
+  implicit cast.
+- **Allocation needs a rule.** Splitting `100.00` three ways gives `33.33` three times and a
+  cent left over. Largest-remainder allocation assigns it deterministically; the invariant you
+  are protecting is that the parts sum to the whole. The same choice appears in tax: rounding
+  per line and rounding per invoice differ by a cent, and tax authorities specify which.
+- **`bigint` is not optional.** `int4` minor units cap out at **$21 474 836.47**. That is a
+  perfectly reasonable per-line-item limit and a catastrophic per-account or per-day-total
+  limit, which is why this bug ships and then surfaces on an aggregate months later.
+
+<IntegerWidthOverflowLab client:visible />
+
+## Overflow: four engines, four answers
+
+Push the counter past the maximum and the behaviour depends entirely on who is executing the
+statement.
+
+| Engine | Column overflow | Arithmetic overflow | Notes |
+|---|---|---|---|
+| PostgreSQL | `ERROR: integer out of range` (SQLSTATE 22003) | same error | No unsigned integer types at all. The statement aborts; the transaction is left in a failed state |
+| MySQL, strict mode (default since 5.7) | `ERROR 1264 (22003): Out of range value for column 'n' at row 1` | `ERROR 1690 (22003): BIGINT value is out of range` | `UNSIGNED` exists; the `int(11)` display width is cosmetic and deprecated since 8.0.17 |
+| MySQL, non-strict | **clamps to the column's limit** and inserts, with `Warning 1264` | as above | A plausible wrong number and a warning nobody reads |
+| SQLite | none — the declared width is advisory, and every integer value is 64-bit signed | past 2⁶³−1, integer arithmetic silently becomes `REAL` | `sum()` over integers raises `integer overflow`; `total()` returns a float and never raises |
+| Your application language | — | Java, Go, C and release-mode Rust wrap in two's complement | So the overflow usually happens *before* the `INSERT`, and the database faithfully stores the wrapped value |
+
+PostgreSQL deliberately widens the accumulator rather than trusting the column width:
+`sum(int)` returns `bigint` and `sum(bigint)` returns `numeric`. The column type is a
+constraint on the data; the aggregate type is a promise about the answer.
+
+The overflow you will actually meet is **sequence exhaustion**. `serial` is `int4`, and an
+`IDENTITY` column inherits whatever type you declared:
+
+```
+ERROR:  nextval: reached maximum value of sequence "orders_id_seq" (2147483647)
+```
+
+At 10 000 inserts per second a signed 32-bit counter is gone in about **2.5 days**; a 64-bit
+one at a million inserts per second lasts roughly 292 000 years. The fix —
+`ALTER TABLE ... ALTER COLUMN id TYPE bigint` — rewrites the whole table and every index under
+an `ACCESS EXCLUSIVE` lock, which is cheap on a small table and an outage on a large one. Use
+`bigint` identity columns from the start; the eight bytes are not the expensive part.
+
+:::caution[The 2⁵³ client trap]
+A JSON number is a double in almost every parser, and JavaScript's `Number.MAX_SAFE_INTEGER`
+is 2⁵³−1 = 9 007 199 254 740 991. A `bigint` ID or a `numeric` amount serialized as a JSON
+number is silently rounded by the client — this is why Twitter's API shipped an `id_str`
+alongside `id`. Good drivers already refuse the coercion: `node-postgres` returns `int8` and
+`numeric` as **strings** by default, and `psycopg` maps `numeric` to `decimal.Decimal`. If your
+ORM has "helpfully" configured those back into native numbers, it has reintroduced the bug.
+:::
+
+## Where it bites in production
+
+- **A report that disagrees with itself.** Same query, same data, two different totals across
+  runs, differing around the 12th digit. The cause is almost always a different parallel
+  worker count on a busier server, not a data change. A `float8` sum is the tell.
+- **Reconciliation that fails on healthy rows.** `HAVING SUM(amount) <> 0` or
+  `WHERE balance = 0` over a float column. The fix is the column type, not an epsilon — an
+  epsilon comparison in a ledger is a decision to tolerate an unknown amount of real money.
+- **A cent that appears and disappears.** Per-line versus per-invoice tax rounding, or a
+  `round()` whose tie behaviour changed when a column moved from `numeric` to
+  `double precision`.
+- **The `int4` cent ceiling.** Everything works for months, then the first customer crosses
+  $21 474 836.47 in a daily total and PostgreSQL raises `integer out of range` — or
+  non-strict MySQL clamps it and reports $21 474 836.47 for the rest of time.
+- **Sequence exhaustion on a hot table.** Watch it: compare `last_value` from the sequence
+  against the type maximum as a monitored ratio, on every `serial` column you still have.
+- **Aggregates that got slower after a type change.** Moving a wide fact table from `float8` to
+  `numeric` is correct and is not free; if the scan became CPU-bound, the answer is usually
+  integer minor units rather than going back to floats.
+
+:::note[What to take forward]
+Money gets exactly two representations: `NUMERIC`/`DECIMAL`, or an integer count of minor
+units with the currency stored alongside it. Binary floats are for measurements and estimates,
+where the input was approximate anyway — never for a value that has to compare equal,
+reconcile to zero, or return the same total twice, because float addition is not associative
+and neither the row order nor the parallel worker count is yours to fix. And whichever exact
+representation you pick, choose the width for the *aggregate*, not the row: `bigint`
+everywhere, because the overflow always shows up on a total.
+:::

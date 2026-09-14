@@ -1,0 +1,202 @@
+---
+title: Why a DBMS instead of files
+description: The four things a flat file cannot do — concurrent writes, crash atomicity, sub-linear lookup, and enforced integrity — and the four components every engine grows to answer them.
+depth: basics
+sidebar:
+  order: 1
+---
+
+import FileVsEngineLanes from '../../../../components/viz/FileVsEngineLanes';
+
+Every database begins as a file somebody appends to. That works until two processes write at
+once, until the power goes out halfway through a record, until the file is large enough that
+finding one row means reading all of them, or until the eleventh program to touch it disagrees
+about what a valid row looks like. A DBMS is not a file format — it is the four pieces of
+machinery you are forced to build once those four things happen, bundled behind one API.
+
+<FileVsEngineLanes client:visible />
+
+## The baseline: a database in two functions
+
+Martin Kleppmann opens *Designing Data-Intensive Applications* with the world's smallest
+database, and it is worth taking seriously because it is genuinely correct for a real, narrow
+set of workloads:
+
+```bash
+db_set () { echo "$1,$2" >> database; }
+db_get () { grep "^$1," database | sed -e "s/^$1,//" | tail -n 1; }
+```
+
+Writes are an append — O(1), sequential, the fastest thing a disk does. Reads are a `grep` —
+O(n) over the whole file, taking the *last* match so an update is just another append. This is,
+structurally, a log-structured storage engine with the interesting parts removed, and everything
+in the rest of this site can be read as a response to one of its four defects.
+
+## 1. Two writers, one offset
+
+A file offset is not shared state. It belongs to the *open file description*, so two processes
+that each do `lseek(fd, 0, SEEK_END)` and then `write()` will compute the same "end of file" and
+write to the same place. The second write silently lands on top of the first. Nothing returns an
+error: both `write()` calls report the full byte count, because both did exactly what they were
+told.
+
+`O_APPEND` fixes precisely this, by making the seek-to-end and the write one operation at the
+inode level. It is a real fix and it is narrow:
+
+- It says nothing about crash atomicity, duplicates or integrity — the other three problems below
+  are untouched.
+- `write()` may still return short, and a short write on an appended record leaves half a record
+  in the file with nothing to mark it as half.
+- It does not survive NFS. The protocol has no append operation, so the client computes the offset
+  itself; `open(2)` carries the warning explicitly — `O_APPEND` "may lead to corrupted files on NFS
+  filesystems if more than one process appends data to a file at once."
+
+The usual next move is to add locking, and that is where the homemade database starts becoming a
+bad database. `flock()` and `fcntl()` locks are **advisory** — they bind only the processes that
+agree to ask — and `fcntl()` locks have the notorious property of being released when the process
+closes *any* descriptor for that file, including one a library opened and closed behind your back.
+A whole-file lock also has exactly one granularity: everyone waits for everyone.
+
+What an engine does instead is not "a better lock" but a *hierarchy* of them. PostgreSQL and InnoDB
+take a short-lived latch on the page while the bytes are physically moved, and a transactional lock
+on the row for the duration of the transaction; readers under MVCC take no row lock at all, because
+they read a version rather than the current bytes. Two clients inserting two different orders never contend
+at all. The mechanisms are the subject of the concurrency-control modules; the point here is that
+the unit of exclusion is the *logical row*, not the file, and that no file API has such a unit
+because a file has no rows.
+
+## 2. A crash in the middle of a record
+
+Turn on "crash mid-write" in the lab. Both lanes end up holding half a record. Only one of them
+can tell.
+
+Bytes reach the media through the page cache, in whatever order the kernel and the drive choose, and
+a power cut can leave the last write partially applied — see
+[fsync, write barriers and the durability contract](/p01-foundations/hardware-os-durability/06-fsync-write-barriers-and-the-durability-contract/)
+for how partial that can get. A CSV line has no length prefix, no checksum and no commit marker, so
+after the reboot the truncated line is a perfectly ordinary line as far as any reader is concerned.
+Worse, the damage is not even confined to one file: if the order lives in `orders.csv` and its
+total lives in `daily_totals.csv`, there is no filesystem operation that updates both or neither.
+`rename()` is atomic, but only for a whole file, and only for one file at a time.
+
+The engine's answer is the **write-ahead log**: before a page changes, a record describing the
+change is appended to a log, and the log is made durable first. That log is a file too — but a file
+with the framing the CSV lacked. A PostgreSQL WAL record carries its own length and a CRC-32C over
+its contents; recovery replays forward from the last checkpoint and **stops at the first record
+whose CRC does not match**, which is exactly how a torn tail becomes a clean end-of-log rather than
+corruption. The transaction that was in flight left no commit record, so its changes are never
+applied. All-or-nothing is not a property of the write; it is a property of the log plus the
+recovery algorithm that reads it, and the canonical description of that algorithm is the 1992 ARIES
+paper (Mohan et al.), which the WAL module works through in detail.
+
+The same framing answers a subtler failure the lab also reproduces: the client whose request
+succeeded but whose response was lost, so it retries. The file grows by one duplicate line, because
+a file has no notion of a key. The table answers
+`ERROR: duplicate key value violates unique constraint "orders_pkey"` — SQLSTATE 23505, or
+`ER_DUP_ENTRY (1062)` in MySQL — and the retry becomes idempotent for free. Idempotency in a
+distributed system is usually just a uniqueness constraint someone remembered to declare.
+
+:::caution[The fix you will be tempted to write]
+"We'll write to a temp file and `rename()` it into place." That gives you atomic *replacement of one
+whole file*, which is genuinely useful for config files and snapshots — the safe-replace pattern —
+and it costs a full rewrite per change and still cannot span two files. It is a correct answer to a
+different question.
+:::
+
+## 3. A lookup that costs the whole dataset
+
+Drag the row count in the lab from a thousand to ten million and watch the two bars separate. The
+scan cost is linear because the file has no guarantee to exploit: nothing declares that `order_id`
+is unique, so a correct reader *cannot stop at the first match*. That is the same defect as the
+missing key in problem 2, wearing its performance costume.
+
+At 10 million rows of ~48 bytes, a full scan touches roughly 480 MB. At NVMe streaming speed that
+is well over a hundred milliseconds of pure I/O before any parsing, per lookup, and it grows in
+exact proportion to your success as a business.
+
+The B-tree answer is the fan-out. A PostgreSQL index page is 8 KB, and an index entry on a
+`bigint` key costs about 20 bytes once you count the index tuple header and the line pointer — so
+roughly 370 entries on a page that is about 90% full. Three levels
+address ~50 million keys; four address ~18 billion. A point lookup is therefore **four page reads,
+not four million**, and in practice fewer physical reads than that, because the root and the level
+below it are almost always already resident in the buffer pool.
+
+Now try to build that yourself on top of files. Switch the lab's file lane to "keep it sorted" and
+watch the second bar: binary search gets the lookup down to ~24 probes, and the insert cost explodes,
+because holding a flat file in sorted order means rewriting its tail on every insert. The way out is
+to leave the data unsorted and maintain a separate index file — which means every insert must update
+two files atomically, and you are back at problem 2 with no log. **Every hand-rolled fix to one of
+these four problems reintroduces another one.** That is the actual argument for a DBMS: the four
+problems are coupled, and only a design that solves them together stays solved.
+
+## 4. Constraints, and the file format as an API
+
+The file lane accepts `qty` of `"two"` and an empty amount without complaint, because `write()` has
+no opinion about your bytes. The error surfaces later, in whichever consumer parses that line — at
+3 a.m., in the report job, three weeks after the writer that produced it was deployed. The table
+rejects it at insert time with `ERROR: invalid input syntax for type integer: "two"` (SQLSTATE 22P02)
+or a `CHECK` violation, and the rule is declared *once, next to the data*, so it binds every writer
+that will ever exist, including the ad-hoc script somebody runs next year.
+
+Behind that is the older and bigger idea. Codd's 1970 paper, *A Relational Model of Data for Large
+Shared Data Banks*, is mostly an argument about **data independence**: applications should be
+protected from changes in how data is physically stored and accessed. With a CSV, the byte layout
+*is* the API — add a column and every reader breaks, change the sort order and every reader's
+assumptions break, compress it and they all break. With a table, the engine is free to add an index,
+change the page format, partition, compress, cluster or switch the physical order, and
+`SELECT qty FROM orders WHERE order_id = $1` keeps working. Codd separated this into *physical* data
+independence (the storage layout can change under a fixed logical schema) and *logical* data
+independence (the schema can evolve under fixed application views). The first is why an engine can
+keep improving underneath you; the second is why `ALTER TABLE ADD COLUMN` does not take down your
+readers.
+
+That declarative interface buys one more thing: you say *what* you want, and the engine picks *how*.
+The same `WHERE order_id = $1` becomes a sequential scan on an unindexed 200-row table and an index
+lookup on a 200-million-row one, chosen at plan time from statistics, with no code change. The query
+planner exists because of Codd's independence, not alongside it.
+
+## What the box actually contains
+
+Strip any engine down and the same four components are there, because they are the four answers
+above:
+
+| Component | Answers | PostgreSQL | SQLite | RocksDB |
+|---|---|---|---|---|
+| Storage manager | durability, layout, buffering | 8 KB pages, heap files, shared buffers | 4 KB pages in one file | memtable + immutable SSTables |
+| Access methods (indexes) | lookup cost | B-tree, hash, GiST, GIN, BRIN | B-tree (the table *is* a B-tree) | the LSM levels themselves, plus bloom filters |
+| Transaction manager + log | atomicity, isolation, recovery | WAL (16 MB segments), MVCC with `xmin`/`xmax` | rollback journal, or WAL mode; one writer at a time | WAL + MANIFEST; optimistic or pessimistic `TransactionDB` |
+| Query interface | data independence | SQL + cost-based planner | SQL + planner | **none** — a byte-key/byte-value API |
+
+The RocksDB column is the instructive one. It is a library you link into your process, it has no
+SQL, no planner and no server, and it is still unmistakably a database: it has a log, an ordered
+access method and a storage manager, because those three are not optional once you care about the
+first three problems. What it gives up is the fourth — you hand-roll your key encoding, your
+secondary indexes and your integrity rules, and in exchange you get an engine with no network hop
+and no query layer. SQLite sits in between: same in-process shape, full SQL, and a concurrency model
+(one writer at a time, readers concurrent in WAL mode) that is honest about being a single-file
+embedded engine. Choosing between them is a real engineering decision; choosing *nothing* and
+appending to a CSV is not, because you will build all four components anyway, one incident at a
+time, with no tests.
+
+## Where it bites in production
+
+- **Duplicate side effects after a retry storm.** A timeout, a client retry, and two rows for the
+  same logical event. The symptom is double-charged customers, not a stack trace. The fix is a
+  unique constraint on an idempotency key, not application-side deduplication.
+- **A parse failure at 3 a.m.** in a consumer nobody remembers owning, caused by a writer that
+  shipped last month. Integrity checks that live in producers scale with the number of producers.
+- **p99 latency rising linearly with table size** while CPU and disk utilization look fine. That is
+  a full scan where an index was assumed, and it looks identical whether the "file" is a CSV or a
+  table with a missing index.
+- **Two files that disagree.** A row in `orders` and no matching row in `order_totals`, at exactly
+  the rate of your crash frequency. Nothing short of a shared log can make two writes one event.
+- **`flock()` on an NFS mount**, in a job somebody scaled from one replica to three. Advisory
+  locking and network filesystems have a long, bad history together.
+
+:::note[What to take forward]
+A flat file cannot serialize concurrent writers, cannot make a write all-or-nothing across a crash,
+cannot find a row without reading all of them, and cannot refuse a bad one. The four answers — a
+storage manager, an access method, a transaction manager with a write-ahead log, and a declarative
+interface that decouples your queries from the layout — are what "a DBMS" names. Every module that
+follows is one of those four, opened up.
+:::

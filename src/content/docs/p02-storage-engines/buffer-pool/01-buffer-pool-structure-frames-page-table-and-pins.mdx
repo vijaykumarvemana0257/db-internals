@@ -1,0 +1,237 @@
+---
+title: "Buffer pool structure: frames, page table and pins"
+description: The three structures every buffer pool is built from — a frame array, a partitioned hash on the page identity, and a descriptor holding the pin count, dirty bit and I/O flags — and the miss path that ties them together.
+depth: basics
+sidebar:
+  order: 1
+---
+
+import BufferFrameDescriptorLab from '../../../../components/viz/BufferFrameDescriptorLab';
+
+A storage engine cannot read a row without reading the whole page it lives on, and it cannot
+read the same page twice per query without going broke. The buffer pool is the one structure
+that answers "is this page already in memory, and if not, which resident page do I throw away
+to make room" — and it has to answer both questions for hundreds of concurrent backends without
+ever handing one of them a frame that another is still reading.
+
+<BufferFrameDescriptorLab client:visible />
+
+## Three structures, not one
+
+"Buffer pool" names a bundle of three things that are usually described as one:
+
+1. **The frames.** A single flat allocation of `NBuffers × BLCKSZ` bytes, carved into
+   page-sized slots. In PostgreSQL this is the `BufferBlocks` array in shared memory; with the
+   default `shared_buffers = 128MB` and an 8 KB block size that is 16 384 frames. InnoDB
+   allocates the equivalent in chunks of `innodb_buffer_pool_chunk_size` (128 MB by default),
+   each chunk sliced into `innodb_page_size` frames.
+2. **The descriptors.** A parallel array of small fixed-size control blocks — one per frame,
+   holding everything *about* the page that is not the page: which page it currently holds,
+   how many backends are looking at it, whether it has been modified, whether an I/O is in
+   flight. PostgreSQL calls this `BufferDescriptors`, an array of `BufferDesc`; InnoDB calls it
+   `buf_page_t`, embedded in `buf_block_t`.
+3. **The page table.** A hash table mapping *page identity* → *frame index*, so that "do I
+   already have this page?" is one probe rather than a scan of 16 384 descriptors.
+   PostgreSQL's is `SharedBufHash`; InnoDB's is the `page_hash`.
+
+The load-bearing invariant is that the first two are indexed identically: buffer *i* means
+`BufferDescriptors[i]` and the bytes at `BufferBlocks[i * BLCKSZ]`, forever. A page moves
+through the pool by having a frame's descriptor re-tagged, never by being copied between
+frames. (PostgreSQL's public `Buffer` type is that index plus one, so that 0 can mean
+`InvalidBuffer`; negative values are per-backend *local* buffers for temporary tables, sized by
+`temp_buffers` and needing none of the locking below because nobody else can see them.)
+
+## The BufferTag is the whole key
+
+The hash key is the page's identity on disk, and nothing about its contents. In PostgreSQL a
+`BufferTag` is:
+
+```c
+typedef struct buftag {
+    Oid       spcOid;      /* tablespace */
+    Oid       dbOid;       /* database */
+    RelFileNumber relNumber;/* the relation's on-disk file */
+    ForkNumber forkNum;    /* main = 0, fsm = 1, vm = 2, init = 3 */
+    BlockNumber blockNum;  /* 0-based page within that fork */
+} BufferTag;
+```
+
+(Through PostgreSQL 15 the first three fields were a `RelFileNode`; version 16 renamed the
+struct to `RelFileLocator` and `relNode` to `relNumber`. Same key.)
+
+Two details matter. First, **the fork number is part of the key**: block 0 of a table's main
+fork, block 0 of its free space map and block 0 of its visibility map are three different pages
+that share a block number, and they occupy three different frames. Second, **the key is the
+physical file, not the table**: a `TRUNCATE` or a `VACUUM FULL` gives the relation a new
+relfilenode, which means every buffer tagged with the old one becomes garbage the pool must
+drop, and the table comes back completely cold. InnoDB's key is the same shape, a `page_id_t`
+of (`space_id`, `page_no`), where the space is the tablespace file.
+
+Hashing that tag gives a hash code, and the hash code picks two things at once: which bucket of
+the table the entry lives in, and which **partition lock** must be held to touch that bucket.
+PostgreSQL uses `NUM_BUFFER_PARTITIONS = 128` `BufMappingLock`s; a lookup takes exactly one of
+them in shared mode, and an insert or delete takes it exclusively. Because the bucket count and
+the partition count are both powers of two and both derive from the same hash code, the
+partition is a pure function of the bucket — which is why the visual can label each bucket with
+its lock. InnoDB goes further and shards the *entire* pool: `innodb_buffer_pool_instances`
+independent pools, each with its own page hash, free list and LRU chain, with the page id
+choosing the instance.
+
+## One descriptor, field by field
+
+This is where the interesting state lives. PostgreSQL packs the volatile part into a single
+32-bit atomic word (`pg_atomic_uint32 state`) so that the common paths — pin, unpin, bump the
+usage count — are one compare-and-swap rather than a spinlock acquisition:
+
+| Field | Width | What it means |
+|---|---|---|
+| `tag` | 20 bytes | Which page this frame holds. Meaningless unless `BM_TAG_VALID` is set |
+| refcount | 18 bits of `state` | The **pin count**: how many backends are currently using this frame |
+| usage count | 4 bits of `state` | Bumped on every hit, capped at `BM_MAX_USAGE_COUNT = 5`; the clock sweep decrements it |
+| `BM_VALID` | flag | The bytes in the frame are the page. Without it the frame is a promise, not a page |
+| `BM_DIRTY` | flag | Modified since it was read in; the on-disk copy is stale |
+| `BM_IO_IN_PROGRESS` | flag | A read or a write is in flight on this frame right now |
+| `BM_IO_ERROR` | flag | That I/O failed |
+| `BM_JUST_DIRTIED` | flag | Dirtied again while it was being written — so the write does not get to clear `BM_DIRTY` |
+| `BM_PIN_COUNT_WAITER` | flag | Somebody (usually VACUUM) is waiting for the pin count to fall to 1 |
+| `content_lock` | LWLock | The lock on the page's *contents*, shared for readers, exclusive for writers |
+| `freeNext` | int | Intrusive free-list link. A frame is on that list only before it has ever held a page, or after its relation was dropped or truncated — eviction does *not* put a frame back on it |
+
+InnoDB's `buf_page_t` carries the same ideas under different names: `buf_fix_count` is the pin
+count, `io_fix` is a small enum (`BUF_IO_NONE`, `BUF_IO_READ`, `BUF_IO_WRITE`) instead of the
+I/O flags, and dirtiness is not a bit but a pair of LSNs — `oldest_modification` and
+`newest_modification` — because the flush list must be kept in LSN order for checkpointing.
+
+Note what is *not* in the descriptor: anything about the page's contents. The pool is
+deliberately ignorant of tuples, keys and rows; that is the whole reason a single buffer manager
+can serve heap pages, index pages, free space maps and visibility maps at once. The byte layout
+inside the frame belongs to
+[Page anatomy and the slotted page](/p02-storage-engines/pages-tuples-heap-files/01-page-anatomy-and-the-slotted-page/).
+
+## The pin contract
+
+A **pin** is a reference count on a frame, taken before you dereference the pointer and released
+when you are done. Its only promise is total: *a frame with a non-zero pin count will not be
+evicted, and its tag will not change.* The clock sweep skips pinned frames; the tag swap refuses
+them; an online pool shrink waits on them. Without that guarantee, a backend holding a pointer
+into a page could have the bytes under it replaced by a completely different block mid-loop.
+
+`ReadBuffer()` returns a buffer *already pinned*, and `ReleaseBuffer()` drops the pin. Each
+backend also tracks its own pins privately — PostgreSQL keeps an eight-entry
+`PrivateRefCountArray` with a hash table for the overflow — so that a second pin of a page you
+already hold is a local increment with no shared-memory traffic at all.
+
+:::caution[A pin is not a lock]
+Pinning says "this frame will not move"; it says nothing about whether the contents are stable.
+Reading or writing the page needs the descriptor's `content_lock`
+(`LockBuffer(buf, BUFFER_LOCK_SHARE)` or `..._EXCLUSIVE`) on top of the pin. The split exists so
+that a scan can keep a pin — and therefore a valid pointer into the page — across many tuples
+while holding the content lock for only microseconds at a time. Holding the pin without the
+content lock is normal and correct; holding the content lock without a pin is a bug.
+:::
+
+A pin you forget to release is a real bug class with a visible symptom. PostgreSQL registers
+every pin with the current `ResourceOwner`, and at transaction end an unreleased pin produces a
+`buffer refcount leak` warning in the log before the pin is force-released. Until then that
+frame is unevictable, and `pg_buffercache`'s `pinning_backends` column will show it.
+
+## The miss path, in order
+
+Step the visual through a miss and you are walking `ReadBuffer_common` → `BufferAlloc`:
+
+1. **Build the tag and hash it.** No locks yet.
+2. **Take the partition lock shared, probe the bucket.** Found → pin the frame, bump its usage
+   count, release the partition lock, return. That is the hit path, and it is short: one lock
+   acquisition, one hash probe, one atomic increment.
+3. **Not found → find a victim frame.** `StrategyGetBuffer()` takes the first frame off the free
+   list if any frame has never been used; otherwise it runs the clock sweep, decrementing usage
+   counts as it passes and skipping anything pinned, until it finds a frame with usage count 0
+   and refcount 0. If a full circuit finds nothing, it raises
+   `ERROR: no unpinned buffers available` rather than break the pin contract. Which frame gets
+   picked is the subject of
+   [Replacement policies](/p02-storage-engines/buffer-pool/03-replacement-policies-lru-clock-lru-k-2q-and-arc/).
+4. **If the victim is dirty, write it out first.** The backend that wanted a frame pays for the
+   write — which is why a plain `SELECT` can report buffers *written*. The WAL for that page
+   must be flushed before the page itself may leave memory; that ordering rule is
+   [Dirty pages, write-back and the WAL-before-data rule](/p02-storage-engines/buffer-pool/06-dirty-pages-write-back-and-the-wal-before-data-rule/).
+5. **Swap the tag.** Delete the old entry, insert the new one — two buckets, therefore two
+   partition locks, acquired in a fixed order so that two backends swapping in opposite
+   directions cannot deadlock.
+6. **Mark the frame `BM_IO_IN_PROGRESS` and leave it invalid**, still pinned, then release the
+   partition locks *before* doing the I/O. This is the crucial ordering: the hash entry is
+   published while the frame is still empty.
+7. **Read the block** through the storage manager (`smgrread`), into the frame.
+8. **`TerminateBufferIO`:** set `BM_VALID`, clear `BM_IO_IN_PROGRESS`, broadcast on the buffer's
+   condition variable.
+
+### Why the entry is published before the read
+
+Because step 6 happens before step 7, a second backend asking for the same missing page finds
+the entry, pins the frame, sees `BM_IO_IN_PROGRESS`, and waits — on a condition variable in
+current PostgreSQL, on a per-buffer I/O LWLock in older releases; InnoDB spins and waits on
+`io_fix == BUF_IO_READ`. Without that published-early entry, ten backends hitting the same cold
+index root would issue ten reads of the same block into ten different frames, nine of which are
+pure waste and all of which would then fight over which entry wins the hash table.
+
+Try it in the visual: request a missing page as backend A, step until the frame is tagged and
+orange, then switch to B and request the same page. B blocks. Step A once more and B wakes up
+already holding its pin.
+
+One counter-intuitive consequence: **the waiter records a hit, not a read.** `BufferAlloc`
+reports "found" based on whether the hash lookup succeeded, and the backend that merely waited
+did find an entry. An `EXPLAIN` plan can therefore say `shared hit` for a page whose bytes were
+being fetched off an NVMe device while the query sat there.
+
+## Reading the counters this produces
+
+Every one of these transitions increments something you can query:
+
+| You want to know | PostgreSQL | MySQL / InnoDB |
+|---|---|---|
+| Hits and misses for *one query* | `EXPLAIN (ANALYZE, BUFFERS)` → `shared hit=… read=… dirtied=… written=…` | `SHOW STATUS LIKE 'Innodb_buffer_pool_read%'` around the statement |
+| Pool-wide I/O by backend type and context | `pg_stat_io` (PostgreSQL 16+): `reads`, `hits`, `writes`, `evictions`, `reuses`, `extends` | `SHOW ENGINE INNODB STATUS` → BUFFER POOL AND MEMORY; `information_schema.INNODB_BUFFER_POOL_STATS` |
+| What is actually resident right now | the `pg_buffercache` extension: `bufferid`, `relfilenumber`, `relforknumber`, `relblocknumber`, `isdirty`, `usagecount`, `pinning_backends` | `information_schema.INNODB_BUFFER_PAGE` |
+| Time spent waiting on those reads | `track_io_timing = on` → `I/O Timings: read=…` in EXPLAIN | `performance_schema` file I/O instruments |
+
+The trap in all of them: **`read` means "missed the buffer pool", not "went to the disk".** On a
+default PostgreSQL install with buffered I/O, a `shared read` may be served entirely from the
+operating system's page cache in a few microseconds, and the same counter is used whether it cost
+2 µs or 2 ms. This is exactly why `track_io_timing` exists, and why a "99% buffer cache hit
+ratio" dashboard tells you so little on its own — the 1% is where all the time is.
+
+## Where it bites in production
+
+- **`buffer refcount leak` warnings in the log.** Almost always an extension or a PL function
+  with an error path that skips `ReleaseBuffer`. Harmless per-occurrence, because the resource
+  owner cleans up at transaction end — but the leak pins a frame for the life of the
+  transaction.
+- **VACUUM stuck behind a pin.** Defragmenting a heap page needs a *cleanup lock*: an exclusive
+  content lock plus a pin count of exactly 1. A cursor left open by an idle client holds a pin
+  on the page it is positioned on, and VACUUM either skips the page or, when it must freeze it,
+  sets `BM_PIN_COUNT_WAITER` and waits — visible as the `BufferPin` wait event in
+  `pg_stat_activity`.
+- **Resizing is not a knob you turn casually.** `shared_buffers` is fixed at postmaster start, so
+  changing it is a restart and a completely cold pool; see
+  [Cache warm-up](/p02-storage-engines/buffer-pool/02-cache-warm-up-cold-pools-dump-load-and-prewarming/).
+  InnoDB *can* resize online, in chunk-sized steps, but a shrink has to withdraw chunks and
+  relocate or flush every page in them — watch `Innodb_buffer_pool_resize_status`, and expect a
+  burst of writes plus a colder cache when it finishes. Drag the pool-size slider in the visual
+  onto a pinned frame and the shrink stalls exactly the same way.
+- **A `TRUNCATE` or `VACUUM FULL` on a hot table is a cache flush.** The relfilenode changes, so
+  every buffer tagged with the old file is dropped. The table is not slow because of the
+  rewrite; it is slow for the next several minutes because the pool is empty for it.
+- **A hit ratio that looks fine while latency does not.** Pool hit ratios are dominated by a few
+  hot pages (catalogs, index roots, the FSM), so the number stays at 99% while the workload's
+  real working set misses constantly. Per-query `BUFFERS` output and `pg_stat_io` tell you
+  something; a global ratio does not.
+
+:::note[What to take forward]
+A buffer pool is a frame array, a parallel descriptor array and a hash table keyed on the
+page's physical identity — relation file, fork, block number — and every interesting behaviour
+falls out of the descriptor's single packed state word: the pin count that makes eviction illegal, the
+dirty bit that makes eviction expensive, and the valid / I/O-in-progress pair that makes a
+frame's tag meaningful before its contents are. The hash entry is deliberately published before
+the read begins, so concurrent misses on the same block wait on one I/O instead of issuing
+several — and that waiter is counted as a hit, which is the first place buffer counters will
+mislead you.
+:::

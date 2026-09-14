@@ -1,0 +1,222 @@
+---
+title: fsync, write barriers and the durability contract
+description: What write(), fdatasync(), fsync() and the device FLUSH each actually promise, why a drive can acknowledge data it then loses, and how a failed fsync in 2018 forced Postgres to PANIC.
+depth: intermediate
+sidebar:
+  order: 6
+---
+
+import DurabilityStackLab from '../../../../components/viz/DurabilityStackLab';
+
+The D in ACID is not a property of your code, it is a chain of promises made by four separate
+pieces of machinery — your process, the kernel, the drive's controller, and the media itself —
+and each one is allowed to say "done" while the bytes are still in something volatile. A
+storage engine's entire commit path exists to make exactly one of those promises real at
+exactly one moment. Getting the chain wrong is not a performance bug; it is the kind of bug
+where the database comes back up and the last four minutes of committed transactions are not
+there.
+
+<DurabilityStackLab client:visible />
+
+## Four layers, and what each call moves between them
+
+Every byte you write can exist in up to four places at once. The useful mental model is not
+"the write goes to disk" but "which layers currently hold a copy, and which of those layers
+lose their contents when the power goes".
+
+| Call | Moves bytes | Returns when | Survives |
+|---|---|---|---|
+| `write()` / `pwrite()` | user buffer → page cache | the memcpy is done, `PG_dirty` is set | your process crashing — nothing else |
+| `sync_file_range()` | page cache → device | the I/O is queued or complete | nothing: it issues no barrier, and its man page carries an explicit warning saying so |
+| `fdatasync()` | page cache → device → media | data plus *retrieval-critical* metadata are on media | power loss |
+| `fsync()` | same, plus the whole inode | data plus `i_size` plus `mtime`/`ctime` are on media | power loss |
+| `fsync(dirfd)` | directory entry → media | the dirent naming your file is durable | power loss (a new file is not durable until its directory is) |
+| `O_DIRECT` write | user buffer → device, skipping the page cache | the drive acknowledges — often from its volatile cache | **nothing by itself** |
+| `O_DSYNC` / `O_SYNC` write | user buffer → media | the write completes with a `FUA` tag or a trailing flush | power loss |
+
+Two of these rows cause most of the confusion in production.
+
+**`fdatasync()` is not "fsync without the safety".** It omits metadata that is not needed to
+read the data back — `mtime`, `ctime` — and nothing else. If your write extended the file,
+`i_size` *is* retrieval-critical, so `fdatasync()` journals it, and on ext4 that means an extra
+jbd2 commit and an extra device flush: roughly double the cost. Toggle "write extends the file"
+in the lab and watch the `fdatasync()` cost change. This is precisely why PostgreSQL
+pre-allocates and *recycles* 16 MB WAL segments rather than growing a file: a commit into an
+already-sized file changes no metadata at all, so `fdatasync()` collapses to one flush. It is
+also why `wal_sync_method` defaults to `fdatasync` on Linux — `src/include/port/linux.h` sets the
+platform default explicitly — rather than to the `open_datasync` that platforms with a distinct
+`O_DSYNC` otherwise fall into.
+
+**`O_DIRECT` is not durability.** It bypasses the page cache, which is a *caching* decision,
+not a *persistence* one. Without `O_DSYNC` the write is acknowledged by the drive out of its own
+DRAM. InnoDB's `innodb_flush_method = O_DIRECT` (the usual Linux production setting) avoids
+double-buffering tablespace pages in the page cache; it does not remove the need for a flush of
+the redo log at commit.
+
+## The layer nobody owns: the drive's write cache
+
+A `fsync()` that returns after the kernel has handed pages to the device has proved nothing.
+Every consumer SATA and NVMe drive ships with a volatile DRAM write cache — typically 256 MB to
+4 GB on a modern SSD — and it acknowledges writes the instant they land in it. The only thing
+that pushes that cache to media is an explicit command:
+
+- **SATA:** `FLUSH CACHE EXT`, or the `FUA` bit on an individual `WRITE DMA FUA EXT`
+- **NVMe:** the `Flush` command, or `FUA` in the write command's control field
+- **SCSI/SAS:** `SYNCHRONIZE CACHE`, or `FUA` in the CDB
+
+Linux calls this a **write barrier**; the block layer issues it as `REQ_OP_FLUSH` (and
+`REQ_FUA`), and `fsync()` is the syscall that ends with one. You can see whether the kernel
+thinks a barrier is needed at all: `cat /sys/block/nvme0n1/queue/write_cache` prints
+`write back` (volatile, flushes issued) or `write through` (the device claims it needs none).
+`hdparm -W 0` turns a drive's cache off entirely — correct, and usually catastrophic for
+throughput.
+
+Enterprise drives change this equation with **power-loss protection**: a bank of capacitors
+holding enough charge to drain the DRAM cache to NAND after the rails drop. A PLP drive can
+therefore report `Flush` complete immediately — its cache is already non-volatile — which is why
+an fsync on a Samsung PM9A3 or Solidigm D7 costs tens of microseconds while the same call on a
+consumer drive costs hundreds of microseconds to milliseconds. Flip the PLP toggle in the lab
+and watch the power-loss boundary move up a layer: the same bytes, the same syscalls, a
+different answer after the reboot.
+
+:::danger[Devices that lie]
+Some cheap SSDs, most USB sticks and SD cards, and a number of early-2010s consumer drives
+acknowledge `FLUSH CACHE` without doing anything. The filesystem, the kernel and your database
+all behave perfectly and the data is still gone. The only way to know is to test it: Brad
+Fitzpatrick's `diskchecker.pl` against a machine you can physically unplug, or a PDU you can
+switch off mid-workload. The software-only test, `pg_test_fsync`, is a strong hint — if it
+reports more than about 50 000 fsyncs/second on a drive with no PLP, the drive is not flushing.
+:::
+
+:::caution[macOS is different]
+On macOS, `fsync()` pushes data to the drive and stops there. It does *not* issue a cache
+flush. The barrier is `fcntl(fd, F_FULLFSYNC)`, which is why SQLite sets it under
+`PRAGMA fullfsync`, and why a laptop benchmark of "fsyncs per second" on a Mac is not measuring
+durability at all.
+:::
+
+Virtualization adds another layer with the same failure mode. QEMU's `cache=writeback` exposes
+the host page cache as a volatile device cache that *is* flushed on barrier — safe, if the
+guest issues barriers. `cache=unsafe` discards flushes entirely and is exactly as bad as it
+sounds. NFS with `async` on the export ack's the server-side write before it is stable. And the
+ext3-era `nobarrier` / `barrier=0` mount option still appears in tuning runbooks, where it
+quietly converts every `fsync()` in the system into a no-op past the page cache.
+
+## The cost ladder, and why group commit exists
+
+One durable commit costs one barrier, and the barrier dominates everything else on the page:
+
+| Path | fsync/fdatasync cost | Commits/s, one at a time |
+|---|---|---|
+| HDD 7200 rpm, volatile cache | ~10 ms (a rotation or more) | ~100 |
+| Consumer SATA SSD, volatile cache | 0.5–2 ms | 500–2 000 |
+| Cloud network block (EBS gp3) | ~0.5–1 ms | 1 000–2 000 |
+| NVMe SSD, volatile cache | ~250 µs | ~4 000 |
+| Enterprise NVMe with PLP | 20–50 µs | 20 000–50 000 |
+| Battery/flash-backed RAID cache | ~100 µs | ~10 000 |
+
+A single-threaded committer can never beat `1 / fsync_latency`, and on an HDD that is 100
+transactions per second no matter how many cores you own. The fix is not a faster flush, it is
+**fewer flushes per transaction**: let N transactions accumulate in the WAL buffer, write them
+all, and issue one barrier for the batch. Cost per commit becomes `fsync / N`. Drag the group
+commit slider in the lab and watch the durable-commits-per-second number scale linearly — until
+N is large enough that waiting for the batch costs more latency than the flush it saves.
+
+Every serious engine does this, and each exposes the knobs differently:
+
+| Engine | Knob | What it does |
+|---|---|---|
+| PostgreSQL | `commit_delay` / `commit_siblings` | The first committer sleeps `commit_delay` µs before flushing if at least `commit_siblings` other transactions are active, so followers join its flush |
+| PostgreSQL | `synchronous_commit = off` | Returns commit *before* the WAL flush; bounded loss window of up to 3 × `wal_writer_delay` (600 ms by default). Atomicity is preserved, durability is not |
+| InnoDB | `innodb_flush_log_at_trx_commit = 1 / 2 / 0` | 1: write + flush every commit. 2: write to the page cache every commit, flush once a second — survives `mysqld` dying, not the machine. 0: neither |
+| MySQL binlog | `sync_binlog = 1`, `binlog_group_commit_sync_delay` | The binlog needs its own flush; the delay knob deliberately widens the batch |
+| SQLite | `PRAGMA synchronous = FULL / NORMAL / OFF` | FULL flushes on every commit; NORMAL in WAL mode flushes only at checkpoints |
+| RocksDB | `WriteOptions::sync`, `Options::manual_wal_flush` | Per-write barrier choice, plus an explicit leader-based write group |
+
+The `= 2` and `synchronous_commit = off` settings are the honest ones: they say plainly that
+you are trading a bounded window of durability for throughput. The dangerous configurations are
+the ones that *look* durable — `= 1` on a drive that ignores flushes, or on a mount with
+`nobarrier`.
+
+## fsyncgate: the day fsync stopped meaning anything
+
+In March 2018 Craig Ringer posted to pgsql-hackers that PostgreSQL's handling of `fsync()`
+errors was unsafe on ext4 and XFS. The mechanism is worth understanding exactly, because it
+inverts the assumption every retry loop in every codebase is built on.
+
+When writeback of a dirty page fails — a remapped sector, a thin-provisioned LUN out of space,
+an NFS server that vanished, a USB disk pulled out — Linux does two things. It records the error
+on the file, and it **marks the page clean**. On some filesystems it discards the page outright.
+The rationale is memory management: the kernel cannot pin failed pages in DRAM forever. The
+consequence is that the data no longer exists anywhere, and the page cache has nothing left to
+retry with.
+
+The error is then delivered to exactly one caller. Before Linux 4.13, it lived as a single
+`AS_EIO` bit in the address space, cleared by whoever called `fsync()` first
+(`test_and_clear_bit`). Linux 4.13 replaced that with `errseq_t`, so each file descriptor that
+had the file open at the time of the failure gets the error once. Either way the second
+`fsync()` finds no dirty pages, does no work and **returns 0**.
+
+That is fatal for PostgreSQL specifically because of how it divides labour: ordinary backends
+`write()` dirty buffers, and a separate **checkpointer** process fsyncs them, via a queue of
+fsync requests. The checkpointer frequently opens the file *after* the failing writeback, so
+pre-4.13 it could never have seen the error at all — and even afterwards, a checkpoint that got
+an EIO, retried, and got a 0 would conclude the checkpoint had succeeded. It would then advance
+the redo pointer past those pages and recycle the WAL segments that were the only remaining
+copy. Silent, permanent corruption, reported to nobody.
+
+Reproduce it in the lab: press **write()**, then **Inject write error**, then **fsync()** — you
+get `-1 EIO` and the page turns grey. Press **fsync()** again and it returns `0` with the bytes
+gone. The retry is not wrong about anything it can see; the kernel's bookkeeping genuinely has
+nothing left to do.
+
+PostgreSQL 12 fixed this the only way available from userspace: an `fsync()` failure is now a
+**PANIC**, not an ERROR.
+
+```
+PANIC:  could not fsync file "base/16384/2619": Input/output error
+LOG:  checkpointer process (PID 1234) was terminated by signal 6
+LOG:  database system is shut down
+```
+
+The server dies and comes back through crash recovery, replaying the WAL from the last
+checkpoint that actually reached the disk — which is safe, because the WAL was written and
+flushed before the checkpoint was allowed to advance. The new `data_sync_retry` GUC (default
+`off`) restores the old retry-and-hope behaviour for platforms where the kernel really does keep
+dirty pages after a failure; on Linux you should never turn it on. Switch the lab's "on fsync
+error" control to **PANIC** and the retry path is not even offered.
+
+:::note[The rule this leaves you with]
+A non-zero return from `fsync()` is not a transient error you may retry. It means an unknown
+set of bytes is gone, and the only correct response is to stop, recover from a log you know was
+durable, and never let the checkpoint that would discard that log complete.
+:::
+
+## Where it bites in production
+
+- **Latency spikes on the checkpointer, not on the query.** A drive with a volatile cache under
+  a checkpoint-driven flush storm shows p99 commit latency stepping from 50 µs to 5 ms while
+  CPU sits idle. `pg_stat_wal` (`wal_sync_time`, `wal_sync`) and the `WALSync` wait event name
+  it directly; InnoDB's equivalent is `os_log_pending_fsyncs` and the `log_thread` waits.
+- **A fast benchmark that isn't durable.** If `pg_test_fsync` reports tens of thousands of
+  fsyncs/second on hardware with no PLP, or an EC2 instance using instance-store NVMe (which has
+  no PLP and does not survive a stop/start at all), the numbers are measuring a cache, not a
+  commit.
+- **EIO in `dmesg` and nowhere else.** `Buffer I/O error on dev nvme0n1`, or
+  `EXT4-fs error ... remounting filesystem read-only`, at the moment a checkpoint "succeeded".
+  Alert on kernel I/O errors on database hosts; the database may never tell you.
+- **ENOSPC from thin provisioning.** The most common real trigger of fsyncgate is not a dying
+  disk — it is a thin-provisioned SAN LUN or an overcommitted LVM thin pool hitting its limit
+  during writeback, where the write was accepted and the flush cannot be.
+- **Migrations that quietly change the contract.** Moving a database onto NFS, onto a VM image
+  with `cache=unsafe`, or onto a filesystem mounted `nobarrier` keeps every benchmark green and
+  removes durability entirely.
+
+:::note[What to take forward]
+`write()` buys you survival of a process crash and nothing more; only `fsync()`/`fdatasync()`
+plus a device FLUSH (or an `FUA` write) crosses the power-loss boundary, and only if the drive
+honours it. The barrier is the expensive part, so engines amortize it with group commit rather
+than trying to make it cheap. And an `fsync()` error is unrecoverable by construction: the
+kernel has already thrown away the pages, so the retry succeeds and lies — which is why
+PostgreSQL 12 chose to PANIC instead.
+:::

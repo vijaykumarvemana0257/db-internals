@@ -1,0 +1,50 @@
+---
+title: How Databases Work
+description: Databases and distributed data explained visually — from bytes on disk to planet-scale consensus.
+template: splash
+hero:
+  tagline: Every page is an interactive model of a real mechanism. Manipulate the inputs, watch the internal state change, and see why engines are built the way they are.
+  actions:
+    - text: Start at the beginning
+      link: /p01-foundations/hardware-os-durability/01-memory-hierarchy-and-latency-numbers/
+      icon: right-arrow
+      variant: primary
+    - text: Browse the full curriculum
+      link: /curriculum/
+      icon: open-book
+      variant: minimal
+---
+
+import { Card, CardGrid } from '@astrojs/starlight/components';
+
+## Why this exists
+
+Most database material is either a tutorial that stops at `CREATE INDEX`, or a paper
+that assumes you already know how a buffer pool works. This site covers the whole
+distance — first principles to the depth a senior engineer is expected to have — and
+it explains mechanisms by **letting you run them**.
+
+<CardGrid>
+  <Card title="Built on mechanisms, not analogies">
+    A B+tree page splits because it ran out of room on an 8KB page. You will insert the
+    keys and watch the split propagate, not read a metaphor about filing cabinets.
+  </Card>
+  <Card title="Single-node depth before distributed">
+    Replication, consensus and distributed transactions only make sense once pages,
+    logs, MVCC and recovery do. The order here is deliberate.
+  </Card>
+  <Card title="Real systems throughout">
+    PostgreSQL, InnoDB, SQLite, RocksDB, Cassandra, DynamoDB, Spanner, CockroachDB,
+    Kafka, ClickHouse — named, compared, and traced back to the mechanism.
+  </Card>
+  <Card title="Internals and usage">
+    How the engine works *and* how to use it well: EXPLAIN literacy, index selection,
+    zero-downtime migrations, incident playbooks, capacity math.
+  </Card>
+</CardGrid>
+
+## How to read it
+
+Modules are tagged **foundations → core → advanced → expert**, and pages inside them run
+**basics → intermediate → deep**. Going front-to-back works; so does dropping into a
+module whose prerequisites you already have — each module lists them.

@@ -1,0 +1,253 @@
+---
+title: Entities, relationships and cardinality
+description: Entities, attributes and relationships, weak entities and identifying relationships, and the three cardinalities crossed with total or partial participation — read in both Chen and crow's-foot notation.
+depth: basics
+sidebar:
+  order: 3
+---
+
+import ErCardinalityCanvas from '../../../../components/viz/ErCardinalityCanvas';
+
+A schema is a set of claims about what can exist. Most of those claims are not about types —
+they are about *counts*: whether an order can exist without a customer, whether a customer can
+have two, whether a student and a course can be paired more than once. Get a count wrong and
+you do not get a bug, you get a table that cannot hold next quarter's reality, and a migration
+that touches every query in the codebase.
+
+<ErCardinalityCanvas client:visible />
+
+## Three nouns, and what each one really is
+
+An **entity type** is a set of things you want to record facts about: `Customer`, `Order`,
+`Course`. An **entity instance** is one member of that set. The distinction matters because
+almost every diagram is drawn at the type level and almost every argument about it is really
+about instances — "can a customer have two addresses?" is a question about instances that only
+the type-level box can answer.
+
+An **attribute** is a function from an entity instance to a value in a domain: `Customer →
+email`. The words "a function" carry real weight. A function returns exactly one value, so an
+attribute that can return two — three phone numbers, a set of tags — is not an attribute of
+that entity. It is another entity, or at minimum another table. This is the single most
+productive test in conceptual modeling and the rest of this page keeps returning to it.
+
+A **relationship type** is a subset of the Cartesian product of two (or more) entity sets: a
+relationship instance is a tuple of entity instances that belong together. `places ⊆ Customer ×
+Order`. Every question this page asks — cardinality, participation — is a question about which
+subsets are legal.
+
+That definition already tells you something the diagrams do not. A relationship *set* has no
+duplicates, because sets do not. If a student can enrol in the same course twice in different
+terms, then "enrols" is not a relationship between `Student` and `Course`; the term is part of
+the identity, and you are looking at an `Enrolment` entity with its own key. Relationships that
+grow attributes — a grade, an enrolment date, a role — are entities wearing a disguise.
+
+## Cardinality is the maximum
+
+Cardinality answers: at most how many instances of B may one instance of A be related to, and
+vice versa. The three named shapes come from the two maximums:
+
+- **1:1** — each A relates to at most one B and each B to at most one A. `Person` holds at most
+  one current `Passport`; a `Passport` belongs to one `Person`.
+- **1:N** — one A may relate to many B, but each B to at most one A. One `Customer`, many
+  `Order`s. This is the overwhelming majority of edges in a real schema.
+- **M:N** — many on both sides. `Student` and `Course`; `Post` and `Tag`.
+
+The reason this is the first thing you decide is that the three shapes have *different physical
+representations*, and only one of them is cheap to change:
+
+| Shape | Representation | What changing it costs later |
+|---|---|---|
+| 1:N | A foreign key column on the many side | Nothing — it is already the general case within "at most one parent" |
+| 1:1 | A foreign key on one side with a `UNIQUE` constraint | Dropping the `UNIQUE` turns it into 1:N in place |
+| M:N | A third table whose primary key is both foreign keys | A new table, a data migration, and every query that touched the column |
+
+:::tip[A 1:1 is often two tables that should be one]
+If both ends are total — every `Person` has exactly one `Passport` and vice versa — the two
+entities have the same key and the same lifetime, and the honest representation is usually one
+table. Splitting is justified by access, not by the diagram: a rarely-read column that is
+megabytes wide, or a column with a different security boundary. PostgreSQL weakens even that
+argument, because TOAST already does the split for you: once a row exceeds about 2 KB (a quarter
+of the 8 KB page), the widest variable-length values are compressed and, if that is still not
+enough, moved out to a side table, and an out-of-line value is not read at all unless the query
+selects that column.
+:::
+
+A foreign key column cannot express M:N — a column holds one value, so it can point at one
+parent. That is the entire reason junction tables exist, and the reason an M:N relationship
+discovered late is expensive: the column you were storing the parent in has to become rows in a
+new table, and every `JOIN`, `INSERT` and report that read it has to be rewritten.
+
+:::caution[Two meanings of "cardinality"]
+In modeling, cardinality is the *maximum count on a relationship edge* — the subject of this
+page. In query optimization, cardinality is the *estimated number of rows* a plan node produces,
+and "cardinality estimation" is the part of the optimizer that gets blamed when a plan goes
+wrong. Same word, unrelated quantity; the context always makes it clear which one is meant, but
+the collision catches people once.
+:::
+
+## Participation is the minimum
+
+Cardinality alone leaves the more common production question unanswered: is the relationship
+*required*? That is **participation**, and it has two values per end:
+
+- **Total** (mandatory) — every instance of that entity must participate in at least one
+  relationship instance. Every `Order` has a `Customer`.
+- **Partial** (optional) — an instance may participate in none. A `Customer` may have no
+  `Order`s yet.
+
+Cross the three cardinalities with total and partial and you get the six shapes the textbooks
+name — the matrix in the lab. Because each end carries its own minimum, a fully specified edge is
+one of twelve combinations, and each one lands somewhere different in DDL:
+
+| Shape | DDL |
+|---|---|
+| 1:N, total on the many side — every `Order` has a `Customer` | `customer_id int NOT NULL REFERENCES customer` on `order` |
+| 1:N, partial on the many side — an `Order` may have none | the same column, nullable; orphan orders are legal |
+| 1:N, total on the one side — every `Customer` has an `Order` | **nothing declarative.** See below |
+| 1:1, total on the side holding the FK | FK column with `UNIQUE NOT NULL` |
+| 1:1, partial both ways | FK column with `UNIQUE`, nullable |
+| M:N | junction table with `PRIMARY KEY (student_id, course_id)` |
+
+That last row is the one worth internalizing. "Every `Order` must have at least one
+`OrderLine`" is total participation on `Order`, and `Order` holds no foreign key — the FK is on
+`order_line`. There is no column to mark `NOT NULL`. A declarative foreign key can enforce
+"this child has a parent"; it can never enforce "this parent has a child".
+
+SQL-92 specified `CREATE ASSERTION` for exactly this — a standalone, multi-table predicate the
+database checks at commit — and no mainstream engine implements it. What you actually have:
+
+- **PostgreSQL:** `CREATE CONSTRAINT TRIGGER ... DEFERRABLE INITIALLY DEFERRED`, which fires at
+  commit rather than at statement time, so an order and its first line inserted in one
+  transaction are both visible when the check runs.
+- **Everywhere:** insert parent and child in the same transaction and check in the application,
+  which is what most teams do, which is why most large schemas contain some rows that violate a
+  total participation the diagram claims.
+
+If you have ever run `SELECT count(*) FROM "order" o WHERE NOT EXISTS (SELECT 1 FROM order_line
+l WHERE l.order_id = o.id)` on a mature database and been surprised, this is why.
+
+## Reading the two notations
+
+The lab draws the same four numbers twice. Both notations put the **maximums** beside the same
+entity, and they read *across*: the number or symbol next to `Order` tells you how many
+`Order`s one `Customer` may have. Chen writes it as a ratio label — `1` next to `Customer`, `N`
+next to `Order`; UML writes a multiplicity, `0..*`, at the same end; crow's foot draws a three-
+pronged foot touching the entity when the maximum is many and a single bar when it is one.
+
+**Participation is where the two notations disagree about position**, and it trips up everyone
+who moves between them. In Chen, total participation of `Customer` is a *double line between
+`Customer` and the relationship diamond* — drawn on the `Customer` end. In crow's foot, the
+same constraint is the *inner symbol at the `Order` end*: a second bar for mandatory, a circle
+for optional. Same claim, opposite ends of the line. Toggle a minimum in the lab and watch the
+double line and the bar move to opposite sides of the diagram together.
+
+The four crow's-foot ends, outer symbol first (the one touching the entity):
+
+| Outer symbol (touching the entity) | Inner symbol | Reads as | Min | Max |
+|---|---|---|---|---|
+| bar | bar | exactly one | 1 | 1 |
+| bar | circle | zero or one | 0 | 1 |
+| crow's foot | bar | one or more | 1 | many |
+| crow's foot | circle | zero or more | 0 | many |
+
+:::caution[Look-here vs look-across]
+Chen ratio labels, UML multiplicities and crow's-foot symbols are all **look-across**: the
+annotation beside an entity counts *that* entity, per one instance of the other. The
+`(min,max)` notation from the Merise tradition — still standard in the French-language
+literature and in some tooling — is **look-here**: the pair beside `Customer` describes how many
+relationships one `Customer` participates in. The two conventions put `(0,N)` and `(1,1)` on
+opposite ends of the same edge. Before arguing about a diagram, establish which one it uses.
+:::
+
+## Weak entities and identifying relationships
+
+Some entities have no key of their own. An `OrderLine` is "line 2" — of *which* order? The
+number alone identifies nothing. Such an entity is **weak**, or existence-dependent: its
+identity is borrowed from an owner, and the relationship that supplies it is **identifying**.
+
+Three things follow, and they are consequences, not conventions:
+
+1. The weak entity's key is the owner's key plus a local **discriminator** (also called a
+   partial key): `PRIMARY KEY (order_id, line_no)`.
+2. Participation on the weak side is necessarily total and the maximum is necessarily one — a
+   weak entity cannot exist without exactly one owner. Flip "identifying" on in the lab and the
+   owner end pins itself to `1..1`; that is the invariant, not a UI choice.
+3. Deletion cascades are the default reading. `ON DELETE CASCADE` is *correct* for an
+   identifying relationship, because the child has no independent existence, and usually wrong
+   for a non-identifying one.
+
+Chen draws a weak entity as a double rectangle and the identifying relationship as a double
+diamond. IDEF1X is a separate standard, and the one ERwin-style tools mix into their
+crow's-foot diagrams: it draws the dependent entity with rounded corners and the identifying
+relationship as a *solid* line, reserving the dashed line for non-identifying. Both are in the
+lab.
+
+The composite key is not just bookkeeping. In InnoDB the table *is* its primary-key B+tree, so
+`PRIMARY KEY (order_id, line_no)` physically stores one order's lines contiguously, and fetching
+them is a single short range scan. With a surrogate `line_id` primary key and a secondary index
+on `order_id`, the same fetch becomes an index scan plus one random primary-key lookup per row.
+PostgreSQL stores the heap separately and gets no such clustering for free — but the composite
+key still expresses the truth, which is that `line_no` means nothing outside its order.
+
+## The attributes that are really entities
+
+Two attribute kinds from the ER vocabulary exist precisely to flag things that should not be
+columns:
+
+**Multi-valued attributes** (Chen: a double ellipse) — a customer's phone numbers, a post's
+tags. An attribute is a function returning one value; if it can return a set, it is a
+relationship to another entity. In a schema this shows up in two smells:
+
+- *The repeated-column smell:* `phone1`, `phone2`, `phone3`. It survives until the fourth phone
+  number arrives, and then you pay with a schema change plus every query that enumerated the
+  columns. Worse, "does this customer have number X?" has to be written `WHERE phone1 = $1 OR
+  phone2 = $1 OR phone3 = $1`, which no single index serves well.
+- *The comma-separated-list smell:* `tags text` holding `'sql,indexes,btree'`. Every lookup
+  becomes `WHERE tags LIKE '%btree%'`, which a B-tree index cannot serve at all — a leading
+  wildcard has no prefix to descend on — so it degrades to a full scan. And `'btree'` matches
+  `'nonbtree'`.
+
+The legitimate exceptions are typed and indexable, not string soup: PostgreSQL's `text[]` or
+`jsonb` with a GIN index answers `tags @> ARRAY['btree']` without a scan. That is a
+denormalization with a named cost (no referential integrity to a tag table, no per-tag
+attributes), not a free pass.
+
+**Derived attributes** (Chen: a dashed ellipse) — `total_spent`, `age`, `order_total`. They are
+computable from other data, so storing them is a caching decision with a consistency bill. Store
+one and you own keeping it true: a trigger, a materialized view, or a batch job, plus the
+reconciliation query for when it drifts. Model it as derived first and decide to store it second,
+deliberately.
+
+The three questions that turn an attribute into an entity: *Can there ever be more than one?*
+*Does it have attributes of its own?* (an enrolment has a grade; a "tag" has a display name) and
+*Will anything ever query by it, or join to it?* Any yes means it wants its own table.
+
+## Where it bites in production
+
+The cardinality mistakes that cost the most are not exotic:
+
+- **An M:N that was modeled as 1:N.** A `product.category_id` that has to become `product_category`
+  rows. New table, backfill, and every read path rewritten — the most expensive routine migration
+  in application development.
+- **A 1:N joined for aggregation.** `SELECT o.id, sum(l.amount), o.shipping FROM "order" o JOIN
+  order_line l ...` — the join fans out one order row into N, and any aggregate over an
+  order-level column now double-counts. The fix is aggregating in a subquery, but the bug is a
+  cardinality misreading.
+- **Optional participation you did not want.** A nullable FK means every consumer must handle
+  `NULL`, every join becomes a `LEFT JOIN` to avoid silently dropping rows, and the "impossible"
+  orphan appears the first time a delete races an insert. If participation is total, say so with
+  `NOT NULL` at creation time; adding it later means finding and fixing the rows that already
+  violate it.
+- **Total participation nobody could enforce.** The parent-must-have-a-child case above. Know
+  which of your diagram's constraints the database is actually enforcing and which are
+  aspirations enforced by code review.
+
+:::note[What to take forward]
+A relationship edge is four numbers: a minimum and a maximum at each end. The maximums give the
+three cardinalities and decide the physical shape — FK column, FK plus `UNIQUE`, or a junction
+table. The minimums give participation, which becomes `NOT NULL` when the end holding the FK is
+mandatory and becomes nothing at all when it is the other end. An attribute that can hold two
+values, or that has attributes of its own, is an entity that has not been promoted yet. The
+[next page](/p01-foundations/data-models-and-sql-primer/04-mapping-an-er-model-to-tables/) turns
+each of these shapes into DDL.
+:::

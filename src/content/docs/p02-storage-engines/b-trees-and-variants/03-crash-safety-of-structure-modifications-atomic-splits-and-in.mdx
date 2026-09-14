@@ -1,0 +1,206 @@
+---
+title: "Crash safety of structure modifications: atomic splits and incomplete-split repair"
+description: Why a page split is never undone when its transaction aborts, how PostgreSQL, InnoDB and ARIES each make the structure modification atomic under redo instead, and what a crash in the middle actually leaves on disk.
+depth: intermediate
+sidebar:
+  order: 3
+---
+
+import SplitCrashRecoveryLab from '../../../../components/viz/SplitCrashRecoveryLab';
+
+Inserting one key can rewrite four pages: the overflowing leaf, a brand-new sibling, the old
+right neighbour whose back-pointer moves, and the parent that needs a downlink. None of those
+pages belong to the transaction that triggered the split — they hold other people's committed
+keys, and other sessions may already be descending through them. So the two obvious answers
+are both wrong: you cannot undo a split when the transaction aborts, and you cannot let a crash
+leave three of the four changes on disk. What engines do instead is make the whole structure
+modification **atomic with respect to redo, and immune to undo**.
+
+<SplitCrashRecoveryLab client:visible />
+
+## Why the split is not the transaction's to undo
+
+Rollback in a transactional engine means "remove the effects that were mine". A page split has
+no such owner. Three separate things go wrong if you try to reverse it byte for byte:
+
+- **The new page is already public.** The moment the right link on the left page points at it,
+  any reader that lands on the left page and finds its key above the high key will walk into
+  it. Another writer may already have inserted a key of its own there. Restoring the pre-split
+  image of the left page would silently delete that key.
+- **The parent and the old sibling already agree with the new shape.** The downlink in the
+  parent and the `btpo_prev` on the old right neighbour are single fields in pages shared by
+  the whole index. Undoing them is not a local operation.
+- **Even alone in the database, the undo would be physical, and the page has moved on.** ARIES
+  undo is *page-oriented*: it re-finds the page, applies the inverse of the logged change, and
+  logs a compensation record. That works for "I put a 40-byte tuple at slot 7" only while slot
+  7 still means what it meant. After a split, half the page's slots are somewhere else.
+
+The resolution is the distinction ARIES calls **physiological logging** — physical to a page,
+logical within a page. Redo can always be physical, because redo replays history in order onto
+the exact pages it was recorded against. Undo cannot, because it runs later, out of order,
+against pages that other transactions have since reorganized. So structure modifications are
+made **redo-only**, and the compensation for an aborted insert is *logical*: delete the key,
+not the space it caused to be allocated. PostgreSQL does not even do that much at abort time —
+the index tuple for the aborted row stays on the page as a dead entry until `VACUUM` reclaims
+it. Press **Roll back the inserter** in the lab: key 25 stops being visible, and the split,
+the right link and the downlink all stay exactly where they are.
+
+:::note[The invariant to hold on to]
+A structure modification changes the *shape* of a shared index, not the *data* of one
+transaction. Shape changes are redone after a crash and never undone by an abort. The only
+thing an abort removes is the key.
+:::
+
+## The atomic unit: one record, or one mini-transaction
+
+If a split can never be undone, then recovery must never be able to apply part of one. Each
+engine buys that with a different unit of atomicity.
+
+### PostgreSQL nbtree: one multi-page record, and a deliberate gap
+
+`_bt_split()` allocates the new block, builds both halves, and then — inside a critical
+section, with every affected buffer exclusively locked and marked dirty — emits a *single* WAL
+record, `XLOG_BTREE_SPLIT_L` or `XLOG_BTREE_SPLIT_R` depending on which half the incoming tuple
+landed in. That one record registers three blocks (four when an internal page is splitting and
+must also clear a child's flag):
+
+| Registered block | Page | What redo does with it |
+|---|---|---|
+| 0 | the original page, now the left half | Rebuilt from the pre-split image already on disk plus the logged split point and new item |
+| 1 | the new right page | Written in full, `REGBUF_WILL_INIT` — there is no prior image to rebuild from |
+| 2 | the old right sibling | Its `btpo_prev` is repointed at the new page |
+
+Because block 0 is reconstructed *from what is already on disk*, redo of a split depends on the
+pre-split page being intact — which is what full-page writes after a checkpoint exist to
+guarantee. And because block 1 is logged in full, a split is one of the fattest records nbtree
+emits; a workload that splits constantly is a workload with a WAL-volume problem, which is the
+subject of the fill-factor page.
+
+What is conspicuously *not* in that record is the parent's downlink. nbtree inserts it
+afterwards, as a separate record (`XLOG_BTREE_INSERT_UPPER`), via `_bt_insert_parent()` walking
+back up the `BTStack` the descent recorded on the way down. In between, the left page carries
+the flag `BTP_INCOMPLETE_SPLIT` in its `btpo_flags`, which says exactly one thing: *my right
+sibling has no downlink in the parent yet*. The downlink record registers the child page too,
+so a single redo step both inserts the downlink and clears the flag.
+
+### InnoDB: the mini-transaction
+
+InnoDB has no equivalent gap, because its unit of atomicity is bigger.
+`btr_page_split_and_insert()` runs inside a **mini-transaction** (`mtr_t`): the split, the
+sibling fix-up and the parent downlink insertion are all one mtr. Its redo records accumulate
+in the mtr's own private buffer and are copied into the global log buffer only at
+`mtr_commit()`, as a group terminated by `MLOG_MULTI_REC_END`. Recovery applies a multi-record
+group only once it has seen that terminator, so a group truncated by a crash at the tail of the
+log is discarded whole. There is no undo for any of it: undo records are written for *row*
+operations, never for page management, which is why rolling back a million-row load in InnoDB
+removes the rows and leaves the index exactly as tall and as fragmented as the load made it.
+
+The mini-transaction is also the scope that holds the page latches — the concurrency side of
+the same object, which the later module on B-tree concurrency picks up.
+
+### The general rule: ARIES nested top actions
+
+Mohan et al.'s 1992 ARIES paper names this pattern a **nested top action**. The transaction
+performs the structure modification and logs its records normally; when the action completes,
+it writes a dummy compensation log record whose `UndoNxtLSN` points to the LSN *immediately
+before* the action began. Rollback follows the `PrevLSN` chain backwards, hits the dummy CLR,
+and jumps straight over every record the SMO produced. The records are still ordinary redo
+records, so recovery replays them; they are simply unreachable from undo. The action has, in
+effect, committed on its own, independently of the transaction that performed it.
+
+| Engine | Atomic unit for a split | Intermediate state visible after a crash? | Undo for the SMO |
+|---|---|---|---|
+| PostgreSQL nbtree | one `SPLIT_L`/`SPLIT_R` record; downlink is a second record | Yes — flagged `BTP_INCOMPLETE_SPLIT` | None |
+| InnoDB | one mini-transaction, `MLOG_MULTI_REC_END` terminated | No | None |
+| SQLite | the whole write transaction (rollback journal, or WAL frames) | No — and there is only ever one writer | Whole-transaction, page-image based |
+| WiredTiger | none: the WAL carries logical row operations, not page structure | N/A — splits are in-memory and re-derived | N/A; durability comes from the checkpoint |
+
+SQLite gets atomicity for free by having a coarser unit and a single writer: its `balance()`
+rewrites whatever pages it needs, and nothing is durable until the transaction commits. At the
+other end, WiredTiger never logs page structure at all — splits happen in the in-memory btree,
+reconciliation writes new page images, and a checkpoint installs a new root atomically, so
+recovery replays logical operations onto the last checkpoint's tree and re-splits as needed.
+Both are coherent answers to the same question, and both pay for it elsewhere: SQLite in
+concurrency, WiredTiger in recovery work per unit of log.
+
+## What a crash actually leaves behind
+
+Drag the crash point in the lab to just after the split record's flush on the nbtree model.
+The tree that comes back has a right page nobody's parent points to. It is not corrupt. Every
+key in blk 4 is still reachable, and the reason is a single structural fact: the parent's
+separator range that used to cover the left page still covers *both* halves, because the new
+separator was never inserted. So a search for 40 descends to blk 2, compares 40 against blk 2's
+high key of 30, finds it does not belong on this page, and follows `btpo_next` to blk 4. One
+extra page read; correct answer.
+
+That rule — **if the key exceeds this page's high key, move right** — is Lehman-Yao's, and it
+was invented for concurrency, not for recovery: it is what lets a reader that descends while
+another session is mid-split find its key anyway. The half-finished state a crash leaves is
+byte-for-byte the same state a concurrent split leaves for a moment during normal running, so
+the same rule covers both. Turn off **Reader follows the right link** in the lab and watch a
+perfectly ordinary incomplete split turn into a missing row. The recovery rule and the
+concurrency rule are one rule seen from two sides.
+
+What the flag forbids is narrower than you might expect. A read-only descent does nothing about
+it. But `_bt_moveright()` called with `forupdate` — which is to say, any descent that is on its
+way to insert — sees `P_INCOMPLETE_SPLIT` and is *obliged* to call `_bt_finish_split()` first:
+re-find the parent, insert the missing downlink, clear the flag, then proceed. Page deletion
+does the same, because `VACUUM` must not delete a page that is the target of an unfinished
+split. The repair is charged to whichever backend happens to pass through next, and it is a
+handful of buffer operations.
+
+This is not how it always worked. Before PostgreSQL 9.4, nbtree's redo routines tracked
+incomplete splits in memory during recovery and fixed them up at the *end* of recovery. That
+scheme cannot survive continuous replay: a hot standby is never at the end of recovery, so it
+would serve queries against a tree whose pending fix-ups had not run. Moving the record of
+"unfinished" onto the page itself, where any descent can see it, made the intermediate state a
+legal, self-describing state of the index rather than a temporary embarrassment of the recovery
+code.
+
+:::caution[The flag is not optional bookkeeping]
+Turn off `_bt_finish_split` repair in the lab and run inserts. Searches still work forever, one
+extra right-link hop at a time — but the flagged page can never be split again and can never be
+deleted, so the first insert that needs to split blk 2 has nowhere to go. A missing downlink
+that nothing records and nothing repairs (the "one record per page" model) is worse still: the
+index is permanently one hop deeper on that path, and no tool will ever notice.
+:::
+
+## Where it bites in production
+
+- **A dangling right link is the corruption you actually see.** Run the lab's per-page logging
+  model and crash after step 1: blk 2's `btpo_next` points at a block nothing ever initialized.
+  That state is unreachable through a correct WAL implementation, but very reachable through a
+  storage stack that reorders or loses writes — a drive that ignores flushes, `nobarrier`, a
+  snapshot taken without quiescing. PostgreSQL reports it as
+  `index "..." contains unexpected zero page at block N`, with the hint to `REINDEX` it.
+- **The symptom before the error is a query that disagrees with itself.** If
+  `SELECT count(*) FROM t WHERE k = 40` returns 0 and the same query with
+  `SET enable_indexscan = off; SET enable_bitmapscan = off;` returns 1, the index and the heap
+  have diverged. That is the first thing to test when a "missing row" ticket arrives.
+- **Verify with amcheck, not with a scan.** `bt_index_check()` validates order and sibling links
+  under an `AccessShareLock`; `bt_index_parent_check()` additionally verifies that every child
+  has a downlink from its parent, at the cost of a `ShareLock` that blocks writes. The parent
+  check is the one that speaks to this page's failure mode.
+- **Look at the flag directly when you suspect a stuck split.** `pageinspect`'s
+  `bt_page_stats()` exposes `btpo_flags` per block; `BTP_INCOMPLETE_SPLIT` showing up on a page
+  and *staying* there across repeated inserts means nothing is descending through it to finish
+  the job.
+- **Splits are a WAL-volume line item.** `pg_waldump --stats=record` breaks WAL down by record
+  type, and a random-key insert workload will show `Btree/SPLIT_*` records each carrying the full
+  contents of the new right page. The fix is not in the recovery code; it is fill factor and key
+  design — the next pages in this module.
+- **InnoDB's equivalent is silence.** A crash mid-mini-transaction leaves an incomplete group at
+  the end of the redo log, and recovery discards it without comment. There is no flag, no repair
+  path and no `amcheck`-shaped tool for it, because the intermediate state never reaches disk in
+  the first place.
+
+:::note[What to take forward]
+A page split belongs to the index, not to the transaction that caused it, so engines make it
+atomic under redo and never undo it — one multi-page WAL record in PostgreSQL, one
+mini-transaction in InnoDB, a nested top action with a dummy CLR in the ARIES formulation.
+PostgreSQL deliberately leaves the parent downlink for later and records that fact on the page
+as `BTP_INCOMPLETE_SPLIT`, so the half-finished tree is a legal state that the next inserter
+through the page is obliged to repair. That half-finished state is searchable only because of
+the high key and the right link — the same mechanism Lehman-Yao uses for concurrent readers,
+which is why the recovery rule and the concurrency rule turn out to be the same rule.
+:::

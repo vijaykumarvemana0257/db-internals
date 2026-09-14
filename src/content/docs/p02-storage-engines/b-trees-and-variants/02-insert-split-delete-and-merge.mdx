@@ -1,0 +1,220 @@
+---
+title: Insert, split, delete and merge
+description: How a B+tree keeps itself balanced — midpoint splits that promote a separator and grow the tree from the root, and the underflow rules that no production engine actually implements.
+depth: basics
+sidebar:
+  order: 2
+---
+
+import BtreeSplitMergeConsole from '../../../../components/viz/BtreeSplitMergeConsole';
+
+A B+tree's invariants — every leaf at the same depth, every page except the root at least half
+full, keys in order — are not maintained by a background process. They are maintained by two
+local repairs performed inline by the operation that broke them: a **split** when a page overflows, and a
+**merge or redistribution** when one underflows. The split half of that pair is universal.
+The merge half is the textbook answer that PostgreSQL declines to implement at all, and which
+InnoDB and SQLite each implement differently — which is why a table you deleted 90% of still
+has an index the same size as before.
+
+<BtreeSplitMergeConsole client:visible />
+
+## Insert: one page write, until it isn't
+
+An insert descends from the root comparing against separators, arrives at exactly one leaf,
+and writes the entry into that leaf's slot array in key order. That is the whole operation
+and it dirties **one page**. No other page in the tree is touched, no ancestor is read again,
+nothing rebalances. In a 16 KB InnoDB leaf holding a few hundred rows, or an 8 KB PostgreSQL
+leaf holding a few hundred index tuples, this is what nearly every insert does.
+
+The exception is the page that has no room left. Then the engine allocates a new page, moves
+roughly half the entries into it, and — this is the part that makes a B+tree a tree rather
+than a linked list — teaches the parent about the new page by inserting a **separator key**
+and a downlink. Two rules govern that promotion, and they differ by level:
+
+- **Copy-up, from a leaf.** The first key of the new right page becomes the separator, and it
+  stays in the leaf as well. It has to: in a B+tree every record lives in a leaf, so a key
+  promoted out of one would vanish from the data set. The separator in the parent is a
+  *routing* copy.
+- **Push-up, from an internal page.** The middle separator moves up and is removed from both
+  halves. It is not a record, it is a boundary, and the parent is where that boundary now
+  belongs. An internal split of a page holding `cap + 1` separators
+  therefore leaves `⌊(cap+1)/2⌋` on the left and the rest on the right, with the promoted key
+  living in the parent and in neither half.
+
+Insert enough keys into a full path and the promotion cascades: the leaf splits, the parent
+takes a separator and overflows, it splits and pushes up, and so on. If the cascade reaches
+the root, the engine allocates a *new* root holding one separator and two downlinks, and the
+tree gets one level taller. That is the only way a B+tree grows in height, and it is why all
+leaves stay at the same depth — the tree grows from the top, not from the bottom. Drive the
+visual's key slider into a full page and watch the cascade; at four keys per page it reaches
+the root every few inserts, which at a real fanout of several hundred happens perhaps three
+or four times in the life of an index.
+
+Splits are rare per insert and expensive when they happen. Under random keys a page absorbs
+roughly `cap/2` inserts between splits, so the amortized cost stays just above one page write
+per insert — but the *distribution* is bimodal, and the tail is what your p99 sees.
+
+## What a split actually costs
+
+Count pages, not comparisons. A leaf split in PostgreSQL's nbtree writes:
+
+1. the original page, now holding the left half plus a **high key** equal to the separator
+   (the upper bound every nbtree page carries, and the anchor of the right-link protocol);
+2. the newly allocated right page, holding the other half;
+3. the old right sibling's `btpo_prev` pointer, because leaves are doubly linked and a page
+   was just spliced into the chain;
+4. the parent, which gains one separator and one downlink.
+
+That is the two-or-three-page split of the textbook plus the parent, and the visual's
+"pages written, last op" tile counts exactly these. The WAL cost is the part people
+underestimate. nbtree logs steps 1–3 as a **single multi-page record** (`XLOG_BTREE_SPLIT_L`
+or `_R`) and the parent's downlink insertion as a *separate* record. If any of those pages is
+being written for the first time since the last checkpoint, `full_page_writes` puts an entire
+8 KB image of it into the log — so one unlucky split just after a checkpoint can emit 24 KB
+of WAL to move a few hundred bytes of keys. You can see this directly: `pg_stat_statements`
+reports `wal_records`, `wal_bytes` and `wal_fpi` per statement, and a split-heavy insert
+workload is visible as a `wal_fpi` count far above the number of heap pages touched.
+
+The reason those two WAL records are separate — and what happens when a crash lands between
+them — is the whole subject of the next page. What matters here is the shape: a split is a
+*physical* change to shared structure, several pages at once, and it has to be made
+crash-atomic by something other than ordinary transaction rollback.
+
+## Delete: the textbook rules
+
+Removing a key from a leaf is as cheap as inserting one, right up until the page falls below
+its occupancy floor of `⌈cap/2⌉` entries. The classical repair has two branches, and the
+visual's **textbook** mode runs them:
+
+- **Redistribution.** If an immediate sibling under the same parent has more than the minimum,
+  move one entry across and fix the separator in the parent. For leaves the new separator is
+  simply the first key of the right page. For internal pages the entry rotates *through* the
+  parent: the separator comes down into the underflowing page, and the sibling's outermost
+  separator goes up to replace it. Three pages written, tree shape unchanged.
+- **Merge.** If no sibling can spare an entry, the two pages fit in one by construction — a
+  page with `⌈cap/2⌉ − 1` entries plus a sibling with exactly `⌈cap/2⌉` is at most `cap`. Merging
+  leaves simply concatenates them and drops the separator, which described a boundary that no
+  longer exists. Merging internal pages must **pull the separator down** between the two key
+  runs, because that separator is the only thing that records the boundary between the
+  subtrees the merged children point at. Either way the parent loses a key and a downlink, and
+  may itself underflow, so the repair can cascade upward exactly as a split cascades.
+
+If the cascade empties the root — an internal root left with a single child and no separators —
+the root is freed and its child becomes the new root. Collapsing the root is the only way a
+B+tree ever gets *shorter*, and it is the mirror image of the new-root allocation on insert.
+
+:::caution[A `DELETE` statement does not do this]
+In PostgreSQL, deleting a row does not touch the index at all: it marks the heap tuple dead
+and the matching index entry survives until VACUUM's index cleanup removes it, or until a scan
+finds the heap tuple dead and sets `LP_DEAD` so the entry can be killed in place. InnoDB
+delete-marks the record and leaves removal to the purge threads. The "delete a key" button in
+the visual is the *maintenance* operation, not the SQL one.
+:::
+
+## What real engines do instead
+
+| Engine | On underflow | Who reclaims the page | Knob |
+|---|---|---|---|
+| Textbook B+tree | redistribute, else merge, inline | the operation itself | — |
+| PostgreSQL nbtree | **nothing** — a half-empty page stays half empty | VACUUM, and only for pages that are *completely* empty | none; `fillfactor` changes how full pages start out, never how they shrink |
+| InnoDB | merge with a sibling if fill drops under `MERGE_THRESHOLD` | the merge itself | `MERGE_THRESHOLD` (default 50), per table or per index |
+| SQLite | `balance_nonroot` redistributes cells across the page and up to two siblings | the balance, plus the database freelist | `PRAGMA auto_vacuum`, `VACUUM` |
+
+**PostgreSQL never merges B-tree pages.** There is no code path in nbtree that redistributes
+entries between siblings or combines two partially-full pages. The only reclamation is
+`_bt_pagedel`, called from VACUUM, and it requires the page to be entirely empty. Deletion then
+happens in two logged steps, which is why the intermediate state has a name: first the downlink
+is removed from the parent and the page is marked **half-dead** (`BTP_HALF_DEAD`) — unreachable
+from above but still in the sibling chain; then the page is unlinked from its left and right
+siblings and marked **deleted** (`BTP_DELETED`) with the transaction id that deleted it. A
+deleted page cannot be handed out again immediately, because a concurrent scan may still be
+holding a pointer to it; it becomes recyclable once that id is old enough, which historically
+meant waiting for a *later* VACUUM. PostgreSQL 14 added a pending-FSM pass so that pages
+deleted during a VACUUM can usually be recycled by that same VACUUM. One more rule the visual
+enforces: nbtree will not delete the rightmost page of a level, so the right edge of the tree
+is never reclaimed.
+
+Switch the visual to **PostgreSQL nbtree** mode, delete a dozen keys, and watch what does not
+happen: fill bars go orange, height stays where it is, and the page count never drops. Press
+VACUUM and the empty pages march one stage per press — empty, half-dead, deleted, free — and
+only then does the next split reuse one instead of extending the file.
+
+**InnoDB merges, but lazily and by bytes.** When a delete (or an update that shortens a
+record) drops a page's fill below `MERGE_THRESHOLD` percent of the page, InnoDB attempts to
+merge it with a neighbouring page under the same parent; if the pages do not fit together, the
+attempt simply fails and the page stays under-full. The threshold defaults to 50 and is set
+with a table or index comment — `CREATE TABLE … COMMENT='MERGE_THRESHOLD=40'`, or the same
+comment on an individual index. Both halves of the outcome are counted:
+`INFORMATION_SCHEMA.INNODB_METRICS` exposes `index_page_merge_attempts` and
+`index_page_merge_successful`, alongside `index_page_splits`. A large gap between attempts and
+successes is the signature of a workload thrashing around the threshold, and lowering
+`MERGE_THRESHOLD` is the documented response. The visual's threshold slider and its
+`merges / attempts` tile model exactly this pair.
+
+**SQLite rebalances across three pages, not two.** Its `balance_nonroot` takes the affected
+page plus up to two siblings and redistributes all their cells evenly, emitting one more or one
+fewer page than it consumed as needed — so it covers the split case and the merge case with one
+routine, and it can leave three pages where the textbook would have left two half-empty ones.
+Deletes trigger it once a page is mostly free space. The root is a special case for a reason
+peculiar to SQLite: a table's root page number is recorded in `sqlite_schema.rootpage`, so the
+root page cannot be *replaced*. `balance_deeper` instead copies the root's contents into a
+freshly allocated child and leaves the root page number intact. Freed pages go on the database
+freelist for reuse; the file itself only shrinks under `VACUUM` or incremental auto-vacuum.
+
+## Why refusing to merge is defensible
+
+Eager merging looks like the obviously correct policy and mostly isn't.
+
+- **It thrashes.** A workload oscillating around the half-full boundary — delete one key, merge,
+  insert one key, split — pays several page writes and a WAL record per operation for a tree
+  whose shape never actually changes. The engines that merge lazily (InnoDB's threshold,
+  SQLite's two-thirds-free test) are buying hysteresis.
+- **The space usually comes back.** An index page emptied by a range of deletes is normally
+  refilled by subsequent inserts in the same key range. Merging it now costs writes to reclaim
+  space you are about to need.
+- **It is the hardest operation to make concurrent.** A merge removes a page that another
+  descending reader may already be pointed at, which is precisely the case a simple latching
+  scheme cannot handle — and it is why a merge in nbtree would have to interact with the
+  right-link protocol that makes concurrent descents safe. That interaction is the subject of
+  the later concurrency module; the relevant fact here is that avoiding merges entirely made
+  PostgreSQL's concurrent B-tree simpler, and that was a deliberate trade.
+
+The cost of the trade is bloat, and it is real: an index whose keys were deleted in a pattern
+that leaves every page 20% full occupies five times the space it needs, keeps five times as
+many pages in the buffer pool, and makes a range scan read five times as many pages.
+
+## Where it bites in production
+
+- **The bulk delete that frees nothing.** `DELETE FROM events WHERE ts < now() - interval '90 days'`
+  removes most entries from the low end of an index and PostgreSQL returns the space only for
+  pages that end up completely empty — and then only to *that index*, for future inserts. The
+  file never shrinks. `pgstatindex()` from the `pgstattuple` extension is the measurement:
+  `avg_leaf_density` well under the ~90% a fresh index shows, plus a large `deleted_pages` or
+  `empty_pages` count. The fix is `REINDEX INDEX CONCURRENTLY` (PostgreSQL 12 and later), not
+  more VACUUM.
+- **Partition dropping beats deleting.** The reason range partitioning is the standard answer to
+  retention is exactly this page: `DROP TABLE` on a partition reclaims the index in full, while
+  a `DELETE` of the same rows leaves a half-empty tree and a VACUUM bill.
+- **Split storms after a checkpoint.** A monotonic insert workload concentrates splits on the
+  rightmost page; each split immediately after a checkpoint writes full-page images of every
+  page it touches. The symptom is periodic WAL-volume spikes correlated with checkpoint
+  boundaries, visible in `pg_stat_statements`' `wal_fpi` and against the checkpoint counts in
+  `pg_stat_bgwriter` (`pg_stat_checkpointer` from PostgreSQL 17).
+- **InnoDB counters that disagree.** `index_page_merge_attempts` climbing far faster than
+  `index_page_merge_successful`, or `index_page_splits` high on a table that is not growing,
+  says the tree is churning; a lower `MERGE_THRESHOLD` or an `OPTIMIZE TABLE` rebuild is the
+  lever.
+- **Verifying the invariants.** When you suspect the tree itself rather than its occupancy,
+  PostgreSQL's `amcheck` extension has `bt_index_check()` — and `bt_index_parent_check()` for
+  the stricter parent/child downlink verification — which check exactly the invariants this
+  page maintains: ordering, downlink correctness, and the sibling chain.
+
+:::note[What to take forward]
+Splits are universal and cheap-until-they-aren't: one page write per insert, then two or three
+pages plus a parent and a multi-page WAL record when a page overflows, with the tree growing
+only at the root. Merges are the half of the algorithm real engines negotiate away — PostgreSQL
+declines entirely and reclaims only wholly empty pages through VACUUM's half-dead/deleted
+protocol, InnoDB merges under `MERGE_THRESHOLD`, SQLite rebalances across three siblings. Plan
+for indexes that do not shrink when rows are deleted, and reach for partition drops or
+`REINDEX CONCURRENTLY` rather than expecting the tree to tidy itself.
+:::

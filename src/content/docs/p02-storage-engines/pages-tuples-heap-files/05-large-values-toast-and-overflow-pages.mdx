@@ -1,0 +1,261 @@
+---
+title: 'Large values: TOAST and overflow pages'
+description: A tuple cannot span pages, so every engine has an escape hatch — PostgreSQL compresses and chunks into a pg_toast relation, InnoDB and SQLite chain overflow pages, and each choice decides what a read, a slice and an UPDATE cost.
+depth: intermediate
+sidebar:
+  order: 5
+---
+
+import ToastOverflowChainLab from '../../../../components/viz/ToastOverflowChainLab';
+
+A tuple may not span pages. That single rule — which buys you a stable `(page, slot)` address,
+a page-sized unit of I/O and a page-sized unit of checksumming — collides immediately with the
+first 2 MB JSON document somebody stores in a column. Every engine resolves the collision the
+same way in outline and very differently in detail: keep a small fixed-size stub in the row,
+put the bytes somewhere else, and pay to fetch them back.
+
+<ToastOverflowChainLab client:visible />
+
+## The trigger is the tuple, not the column
+
+PostgreSQL's mechanism is **TOAST** — The Oversized-Attribute Storage Technique. It does not
+fire because a column is big. It fires when the *whole tuple* would exceed
+`TOAST_TUPLE_THRESHOLD`, which is derived from a target of four tuples per page:
+`MAXALIGN_DOWN((8192 − 40) / 4)` = **2032 bytes**. A 1.5 KB `jsonb` value in an otherwise empty
+row stays in the heap; the same value in a row that already carries 700 bytes of other columns
+gets toasted. Drag the "other columns" slider in the lab with the value fixed and watch the
+threshold cross without the value changing at all.
+
+Once a tuple is over target, `heap_toast_insert_or_update()` runs a four-pass loop, each pass
+repeatedly picking the **largest remaining attribute** and dealing with it until the tuple fits:
+
+1. Compress attributes whose `attstorage` is `EXTENDED`, and immediately externalize any
+   `EXTENDED`/`EXTERNAL` attribute that is still huge.
+2. Move `EXTENDED`/`EXTERNAL` attributes out of line, biggest first.
+3. Compress `MAIN` attributes.
+4. Only now, move `MAIN` attributes out of line.
+
+That ordering is the whole meaning of the per-column strategy, set with
+`ALTER TABLE t ALTER COLUMN c SET STORAGE …` and shown in the `Storage` column of `\d+`:
+
+| Strategy | Compress? | Out of line? | Default for |
+|---|---|---|---|
+| `PLAIN` | no | no | every fixed-length type — `int`, `timestamptz`, `uuid`. Not a choice, a consequence: only varlena types can be toasted |
+| `EXTENDED` | yes | yes | `text`, `varchar`, `bytea`, `jsonb`, `tsvector` — most of what you care about |
+| `EXTERNAL` | **no** | yes | nothing by default; you set it deliberately to make slicing cheap |
+| `MAIN` | yes | last resort | `numeric` — values that are usually small and that you want to stay in the row |
+
+Two things engineers get wrong here. `MAIN` does not mean "never leaves the page": pass 4 will
+evict it if that is the only way to make the tuple fit. And `SET STORAGE` does not rewrite
+anything — it governs tuples written from then on, so a rewrite is what actually moves the
+existing values: `VACUUM FULL`/`CLUSTER` flatten every toasted attribute and re-toast it under
+the new setting, and so does an `UPDATE` that touches the column. The related
+knob `toast_tuple_target` (PostgreSQL 11+, a per-table storage parameter accepting 128 up to
+8160 bytes) moves the threshold itself: raise it and wider rows stay in the heap, again only for
+newly written tuples.
+
+If a value cannot be moved at all — `PLAIN` storage, or a row of fixed-width columns that is
+simply too wide — you get the honest failure:
+
+```
+ERROR:  row is too big: size 8168, maximum size 8160
+```
+
+## Compression happens before eviction
+
+The default compressor is **pglz**, PostgreSQL's own LZ77 variant, and its default strategy is
+a set of bail-outs worth knowing because they explain values that "should" have compressed and
+didn't:
+
+- `min_input_size = 32` — anything smaller is not attempted.
+- `first_success_by = 1024` — if no match is found in the first kilobyte, give up on the whole
+  value. Random-looking data (UUID text, base64, already-compressed images) hits this.
+- `min_comp_rate = 25` — the output must be at least 25% smaller or the raw bytes are stored.
+
+PostgreSQL 14 added **LZ4** as an alternative: `default_toast_compression = lz4` server-wide, or
+`ALTER TABLE … ALTER COLUMN c SET COMPRESSION lz4` per column, on a build configured
+`--with-lz4`. LZ4 typically gives a somewhat worse ratio and decompresses several times faster,
+which matters because **detoasting is on every read, forever**, while compression happens once.
+`pg_column_size(c)` tells you the on-disk size of the datum and `pg_column_compression(c)` tells
+you which algorithm produced it — mixed values in one column are normal after a settings change,
+since nothing is rewritten.
+
+Set the lab's compressibility slider low with pglz selected and the value is stored raw and
+evicted anyway; raise it and watch a 4 KB value compress under 2032 bytes and stay in the heap
+entirely. That is the common case for JSON: verbose, repetitive keys compress several times
+over, and rows that look oversized never leave the page.
+
+## The toast relation: chunks, a B-tree, and an 18-byte pointer
+
+Every table with at least one toastable column gets a companion relation,
+`pg_toast.pg_toast_<oid>`, recorded in `pg_class.reltoastrelid`. Its schema is fixed:
+
+```sql
+chunk_id    oid,     -- one per toasted value
+chunk_seq   int4,    -- 0, 1, 2, … within that value
+chunk_data  bytea    -- up to TOAST_MAX_CHUNK_SIZE = 1996 bytes
+```
+
+with a unique B-tree on `(chunk_id, chunk_seq)`. The chunk size is not arbitrary: 1996 is what
+is left of a 2032-byte tuple slot after the toast tuple's own header, so **exactly four chunks
+fit on an 8 KB page**. A 10 MB value becomes ~5 250 chunks over ~1 315 toast pages, plus its
+index.
+
+What stays in the row is a `varatt_external` pointer — **18 bytes**: a 2-byte varlena header and
+tag, then `va_rawsize` (the logical length), `va_extsize` (the stored length, smaller if
+compressed), `va_valueid` (the `chunk_id`) and `va_toastrelid`. The compression method is encoded
+in the high bits of `va_extsize`, which is how a row knows whether to run pglz or LZ4 on the
+bytes it fetches.
+
+Reading the column back is an index scan on the toast index with `chunk_id = va_valueid`,
+followed by a fetch of every chunk in `chunk_seq` order. Press **Read the column** in the lab at
+10 MB and the page counter tells the real story: one heap page, a handful of index pages, and
+over a thousand chunk pages — for one column of one row.
+
+The indexed layout pays for itself on **slices**. `toast_fetch_datum_slice()` adds a second scan
+key on `chunk_seq`, so for an *uncompressed* external value the engine computes
+`offset / 1996` and fetches exactly the chunks that overlap the slice. This is the entire reason
+`SET STORAGE EXTERNAL` exists: it forfeits compression to make `substr(doc, 4000000, 100)` cost
+two page reads instead of a full detoast. For a compressed value the plaintext offset says
+nothing about which chunk holds it, so anything but a prefix requires decoding from chunk 0.
+Compare the **substr(mid, 100)** button under `EXTENDED` and under `EXTERNAL`.
+
+:::caution[Two hard ceilings]
+A varlena value tops out at **1 GB** — `va_rawsize` is a 32-bit field with two bits spent on
+flags — and that is the field size limit for `text`, `bytea` and `jsonb` regardless of TOAST.
+Separately, `chunk_id` is an **OID**, allocated by probing the toast index for a free value.
+A single toast relation holding billions of live values makes that probe loop increasingly
+often; the symptom is inserts on one wide table getting slower with no plan change.
+:::
+
+## What the pointer buys: an UPDATE that does not move a megabyte
+
+The 18 bytes are the interesting part. When you `UPDATE` a column that is *not* the toasted one,
+PostgreSQL builds a new tuple version and **copies the pointer verbatim**. No chunk is read, no
+chunk is written, and both row versions reference the same `chunk_id` until VACUUM removes the
+dead one. Updating a small counter next to a 5 MB document costs one heap page and a small WAL
+record. Press **UPDATE another column** and then **UPDATE this column** in the lab and compare
+the written-pages counter — the difference is three orders of magnitude.
+
+Update the toasted column itself and there is no in-place path at all: a new `chunk_id` is
+allocated, the whole value is chunked again, and the old chunks become dead rows in the toast
+table awaiting their own autovacuum. This is why "one wide `jsonb` blob per row, rewritten on
+every request" is a write-amplification bug rather than a schema style, and why splitting the
+frequently-updated keys into their own narrow columns is usually the fix.
+
+:::note[Interaction with HOT]
+Whether the new heap tuple is a heap-only tuple is a separate question, decided by the rules in
+the previous page — but the two mechanisms compose: an unrelated-column UPDATE on a row with a
+toasted value can be both HOT (no index entries) and pointer-sharing (no toast writes), which is
+the cheapest possible update of a very wide row.
+:::
+
+## InnoDB: a 768-byte prefix, or a 20-byte pointer
+
+InnoDB's clustered index leaf is the table, so the constraint is the same and the limit is
+blunter: a row must fit twice on a page, giving a maximum of **8126 bytes** on the default 16 KB
+`innodb_page_size`. When a record is over, InnoDB moves its longest variable-length columns
+off-page, one at a time, until it fits. Columns of 40 bytes or less are never eligible.
+
+The row format decides what is left behind, and it is the single most consequential storage
+choice in MySQL:
+
+| Row format | Left in the clustered record | Since |
+|---|---|---|
+| `REDUNDANT`, `COMPACT` | the first **768 bytes** of the column *plus* a 20-byte pointer | the original formats |
+| `DYNAMIC` (default since MySQL 5.7.9), `COMPRESSED` | a **20-byte** pointer only — space id, page number, offset, length | `innodb_default_row_format` |
+
+The 768-byte prefix is why a `COMPACT` table with a dozen `TEXT` columns fails to be created at
+all: twelve prefixes already blow the 8126-byte budget, and MySQL says so with the prefix size
+in the message —
+
+```
+ERROR 1118 (42000): Row size too large (> 8126). Changing some columns to TEXT or BLOB
+may help. In current row format, BLOB prefix of 768 bytes is stored inline.
+```
+
+Switch the lab to `COMPACT` and watch the row bar keep a 768-byte block no matter how large the
+value gets; switch to `DYNAMIC` and it collapses to the pointer. The same distinction sets the
+maximum index key prefix — 767 bytes on the old formats, 3072 on `DYNAMIC`/`COMPRESSED`.
+
+Off-page data lives in `FIL_PAGE_TYPE_BLOB` pages in the same tablespace, each holding
+`16384 − 38 (FIL header) − 8 (BTR_BLOB_HDR) − 8 (FIL trailer)` = **16 330 bytes** of payload,
+and each storing the page number of the next one. That is the crucial structural difference from
+TOAST: it is a **singly-linked chain with no index**, so reaching byte 5 000 000 of a blob means
+reading every page before it. The lab's mid-slice button makes the contrast visible — a Postgres
+`EXTERNAL` value needs one index probe and one chunk; the equivalent InnoDB blob needs half the
+chain. InnoDB also has no per-column compression: `ROW_FORMAT=COMPRESSED` or page compression
+compress whole pages, not attributes.
+
+:::note[MySQL 8.0 added a second LOB layout]
+The single chain above is the classic `FIL_PAGE_TYPE_BLOB` format. MySQL 8.0 introduced an
+alternative for off-page LOBs — `FIL_PAGE_TYPE_LOB_FIRST` plus `LOB_INDEX` and `LOB_DATA` pages —
+whose first page carries an index of the data pages, which is what makes partial update of a
+`JSON` column (a diff in the redo/undo log rather than a full rewrite) possible. It gives the
+engine random access for its own partial reads and writes; it does not turn a SQL `SUBSTRING()`
+on a `LONGTEXT` into a one-page fetch, and `ROW_FORMAT=COMPRESSED` keeps the older chain.
+:::
+
+## SQLite: one chain, no index, and the whole record rewritten
+
+SQLite stores a row as one serialized record in a b-tree cell. If the payload `P` exceeds
+`maxLocal` (`U − 35`, i.e. 4061 bytes on the default 4 KB page), it keeps a computed amount
+between `minLocal` (489 bytes) and `maxLocal` in the cell and spills the rest into a chain of
+overflow pages, each of which spends its **first four bytes** on the number of the next page and
+the remaining 4092 on data. The value ceiling is `SQLITE_MAX_LENGTH`, one billion bytes by
+default.
+
+Two consequences fall straight out of "the row is one byte string": there is no way to update a
+column without rewriting the record, so an `UPDATE` of a small column next to a 2 MB blob
+rewrites the entire overflow chain — the exact case where TOAST's shared pointer wins — and
+random access into a blob is a chain walk. SQLite mitigates the second with incremental blob
+I/O (`sqlite3_blob_open`, `sqlite3_blob_read`) and by caching the chain's page numbers on the
+open cursor, so repeated seeks into the same blob are cheap even though the first is not.
+
+## Where it bites in production
+
+- **`SELECT *` on a wide table is not the scan you measured.** A sequential scan never touches
+  the toast relation; returning the column does. A dashboard query that added one `jsonb` column
+  to its select list can go from tens of milliseconds to seconds with an unchanged plan, and the
+  extra time shows up as buffer reads on a relation whose name you do not recognise. Check with
+  `EXPLAIN (ANALYZE, BUFFERS)`.
+- **The table looks small and the disk is full.** `pg_relation_size('t')` excludes the toast
+  relation; `pg_total_relation_size('t')` includes it. Toast bloat is real bloat: it has its own
+  dead tuples, its own autovacuum, and `SELECT reltoastrelid::regclass FROM pg_class WHERE
+  relname = 't'` is how you find the thing to inspect.
+- **You cannot B-tree index a large value.** Indexed values are detoasted first, and a btree
+  tuple is capped at roughly a third of a page: `index row size 3000 exceeds btree version 4
+  maximum 2704 for index …`. The answers are an expression index on a digest, a prefix
+  (`substr(c, 1, 100)`), or a GIN/full-text index that stores tokens rather than the value.
+- **Logical replication and unchanged TOAST values.** An UPDATE that does not change a toasted
+  column does not put that column's bytes in the WAL — there is nothing to log, the pointer was
+  copied. Decoding plugins therefore emit an "unchanged TOAST" placeholder, and any consumer that
+  reconstructs whole rows (or uses `REPLICA IDENTITY FULL`) has to handle it rather than writing a
+  NULL. This surprises nearly every home-grown CDC pipeline once.
+- **`WHERE big_col LIKE '%needle%'` detoasts every row it examines**, including compressed
+  decode CPU, before any filter can help. The fix is a generated column or an index over derived
+  tokens, not a better predicate.
+- **A migration that changes the InnoDB row format changes the row-size arithmetic.** Importing a
+  5.6-era schema into a `DYNAMIC` default, or the reverse, moves 768 bytes per blob column in or
+  out of every record; the failure is at `CREATE TABLE` time with ER_TOO_BIG_ROWSIZE, and the
+  success case silently changes your page density.
+
+## The same problem, one level up
+
+LSM engines face a harsher version of this: a value written once is rewritten by every compaction
+that touches its key, so a 100 KB value in a 7-level tree can be copied a dozen times. The
+answer is the same answer — store a pointer, put the bytes elsewhere — under the name **key-value
+separation**, introduced by WiscKey (FAST '16) and shipped as RocksDB's integrated BlobDB
+(`enable_blob_files`, `min_blob_size`) and TiKV's Titan. It trades TOAST's problem set for a new
+one: the blob files need their own garbage collection, and every read gains a hop. The LSM module
+takes that up properly.
+
+:::note[What to take forward]
+The unit that triggers out-of-line storage is the *tuple*, not the column, and PostgreSQL tries
+compression before eviction — so how wide your other columns are, and how compressible your JSON
+is, decide whether a value leaves the page at all. What is left behind is the design decision:
+Postgres leaves an 18-byte pointer into an indexed chunk table, which makes unrelated-column
+updates nearly free and slices of uncompressed values O(1); InnoDB and SQLite leave a pointer
+into a singly-linked chain, which makes any offset into a large value a walk. And detoasting is
+paid on every single read, forever, while compression is paid once.
+:::

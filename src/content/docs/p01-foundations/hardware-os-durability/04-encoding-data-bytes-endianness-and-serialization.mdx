@@ -1,0 +1,225 @@
+---
+title: 'Encoding data: bytes, endianness and serialization'
+description: How a row becomes bytes — varints, IEEE-754, length prefixes, alignment padding, pinned byte order, and why a portable schema is not the same thing as a serializer.
+depth: basics
+sidebar:
+  order: 4
+---
+
+import RecordByteEncoder from '../../../../components/viz/RecordByteEncoder';
+
+A storage engine does not store values, it stores bytes, and every byte it writes it must
+later read back on a different machine, from a different binary, after a crash. The encoding
+is where the abstractions end: a `BIGINT` is eight bytes in some order, `NULL` is a bit in a
+bitmap, `NaN` is a bit pattern that half your stack refuses to admit exists, and padding is
+space you pay for forever and can never read.
+
+<RecordByteEncoder client:visible />
+
+## Fixed width buys seeks, varints buy space
+
+There are exactly two ways to encode an integer and they optimize opposite things.
+
+**Fixed width** — an `int64` is eight bytes whether it holds 3 or 9 × 10¹⁸. The win is that
+field *k* of a record sits at a computable offset: you can read the 7th column without
+decoding the first six, and you can `memcpy` the whole struct into a register. This is why
+Cap'n Proto and FlatBuffers are fixed-width and aligned — there is no parse step at all, you
+point a struct at the buffer and dereference.
+
+**Varints** — spend one byte per 7 bits of value, with the high bit as a continuation flag.
+Protobuf's LEB128 emits groups **least-significant first**; SQLite's varint emits them
+**most-significant first**, in 1–9 bytes. Same idea, incompatible bytes, and both are worth
+knowing because you will eventually read both formats in a hex editor.
+
+The costs are real and asymmetric:
+
+- A varint field has no fixed offset, so a reader must scan fields it does not want.
+- `int64` in protobuf sign-extends negatives to 64 bits before encoding, so **−1 costs ten
+  bytes**. `sint64` applies zigzag (`(n << 1) ^ (n >> 63)`) and costs one. Choosing `int64`
+  for a column of negative deltas is a common 10× regression — push the id slider below zero
+  in the visual and watch it happen.
+- SQLite dodges the problem with **serial types**: the record header stores a type code per
+  column, and the code picks the width (1, 2, 3, 4, 6 or 8 bytes, big-endian two's
+  complement). Codes 8 and 9 mean "the integer 0" and "the integer 1" with *zero* body bytes,
+  which is why a SQLite boolean costs one header byte and nothing else.
+
+## IEEE-754, and the three ways engines disagree about it
+
+A `double` is 1 sign bit, 11 exponent bits, 52 mantissa bits, stored raw in essentially every
+engine. Two of its bit patterns break the assumption that "equal value" and "equal bytes" are
+the same statement:
+
+- **Negative zero.** `-0.0 = 0.0` is true in IEEE-754 and in SQL, but the bytes differ in
+  exactly one bit (`80 00 00 00 00 00 00 00` versus all zeros). Anything that compares
+  *bytes* — a hash index, a `memcmp` on a serialized key, a checksum, a dedup over serialized
+  blobs — sees two values where `=` sees one. `JSON.stringify(-0)` is `"0"`, so the sign does
+  not survive a JSON round trip at all. Protobuf, by contrast, keeps it: the proto3
+  "is this field at its default?" test on a `double` is a comparison of the raw 64 bits
+  (`Double.doubleToRawLongBits` in Java, the equivalent bit check in C++ and Go), precisely so
+  that `-0.0` and `NaN` are still written.
+- **NaN.** IEEE-754 says NaN ≠ NaN, including itself. A B-tree needs a *total order* — every
+  value comparable, comparison transitive — so engines cannot simply obey the standard:
+  - **PostgreSQL** deliberately departs from IEEE: `'NaN'::float8 = 'NaN'::float8` is true and
+    NaN sorts **greater than every non-NaN value**, so `ORDER BY`, `DISTINCT` and btree all
+    work. Your application language says `false` to the same comparison.
+  - **SQLite** has no NaN: binding one to a `REAL` column stores **NULL**. The value you read
+    back is not the value you wrote.
+  - **MySQL** has no NaN at all: there is no literal for it, `SELECT 0e0/0e0` returns `NULL`,
+    and a client that binds a NaN `double` gets an out-of-range rejection (SQLSTATE `22003`)
+    rather than a stored value.
+- **Inexactness.** `0.1` is `3F B9 99 99 99 99 99 9A`. `WHERE price = 0.1` is a bug in every
+  engine; money is `NUMERIC`/`DECIMAL`, which is a *different* encoding (Postgres stores
+  base-10000 digit groups, not a float).
+
+:::caution[Byte equality is not value equality]
+Three predicates disagree about floats: `=` (IEEE semantics, mostly), `IS NOT DISTINCT FROM`
+(NULL-aware), and `memcmp` over the encoded bytes. Deduplication, cache keys and
+content-addressed storage all quietly use the third one. Making float keys byte-comparable
+takes an explicit transform — flip the sign bit for positives, flip every bit for negatives —
+and that belongs to the [B-tree key-encoding](/curriculum/) page, not here.
+:::
+
+## Length-prefixed or delimited: pick your failure mode
+
+A string is bytes plus a way to know where it stops.
+
+**Delimited** — a terminator (C's `NUL`, a newline, CSV's comma) or a bracket structure
+(JSON). Reading requires scanning, length is O(n), and the delimiter can never appear in the
+data, so you need escaping — which is where CSV injection, framing bugs and the whole
+quoting-rules genre live. Postgres cannot hold a NUL code point in a `text` value at all —
+`chr(0)` raises `null character not permitted`, and a `\u0000` escape inside `jsonb` raises
+`unsupported Unicode escape sequence` — because a backend string is still a C string that ends
+at the first zero byte.
+
+**Length-prefixed** — the count comes first, so a reader can `read(n)` or skip the field
+without looking at it, and the payload may contain any byte, `0x00` included. Every serious
+binary format does this:
+
+| Format | How length is carried |
+|---|---|
+| SQLite record | Folded into the serial type: `13 + 2×len` for text, `12 + 2×len` for blob, no terminator |
+| Protobuf | Wire type 2 = varint length, then the bytes |
+| PostgreSQL wire protocol | 1 type byte + `Int32` length **in network (big-endian) order**, length includes itself |
+| PostgreSQL varlena | 4-byte header (length ≪ 2), or a **1-byte** header for values ≤ 126 bytes since 8.3 |
+| Redis RESP | `$5\r\nhello\r\n` — a length prefix *and* delimiters |
+| WAL records | `xl_tot_len` first, then a CRC that says whether the record was torn |
+
+The length prefix is also a durability primitive: a reader that knows the record length can
+distinguish "this record is incomplete" from "this record is corrupt", which is exactly how
+WAL replay decides where the log ends.
+
+## Alignment padding: bytes you buy and never use
+
+A CPU loads an 8-byte value fastest when its address is a multiple of 8, so compilers insert
+padding and row formats inherit the rule. Turn off **Natural alignment** in the visual and
+watch the native row shrink without a single value changing.
+
+Postgres makes this visible in the catalog: `pg_attribute.attalign` is `d` (8), `i` (4), `s`
+(2) or `c` (1), the heap tuple header is 23 bytes rounded up to `MAXALIGN` = 8, and columns
+are laid out in `attnum` order with padding between them. So:
+
+```sql
+CREATE TABLE naive  (a bool, b bigint, c bool, d bigint);  -- 56 bytes/row
+CREATE TABLE tetris (b bigint, d bigint, a bool, c bool);  -- 42 bytes/row
+```
+
+The first form is 14 bytes of pure padding per row — 25% of the row, 1.4 GB at 100M rows,
+paid in the heap, the buffer pool, the WAL and every backup. Reordering columns widest-first
+is the "column tetris" trick and it is free. (Short varlenas are exempt: `heap_fill_tuple`
+skips the 4-byte alignment when the next `text` value carries a 1-byte header.)
+
+Variable-length formats have no padding at all, which is much of why the protobuf and SQLite
+lanes in the visual are smaller than the native row — and why they cannot be read in place.
+
+## Endianness, and why a format pins one
+
+x86 and ARM are little-endian; network byte order, s390x and older SPARC/POWER are
+big-endian. The bytes `01 00 00 00` are either 1 or 16 777 216 depending on who reads them,
+and nothing in the bytes says which. Formats settle it in one of three ways:
+
+- **Pin big-endian.** SQLite: the 100-byte file header starts with `SQLite format 3\0` and
+  *every* multi-byte field in it — the page size at offset 16, the change counter, the schema
+  cookie — is big-endian, as are all record integers. InnoDB does the same; `mach_write_to_4`
+  writes the high byte first, which has the pleasant side effect that unsigned keys compare
+  correctly under `memcmp`.
+- **Pin little-endian.** Protobuf `fixed32`/`fixed64`/`double`, Avro, Cap'n Proto,
+  FlatBuffers — matching the dominant hardware, so encoding is a `memcpy` on the machines
+  that actually run.
+- **Pin nothing, and refuse mismatches.** PostgreSQL writes heap pages in *native* order.
+  That is why a `PGDATA` directory is not portable across architectures, why `pg_upgrade`
+  requires the same platform, and why the cross-platform path is `pg_dump`. The refusal is
+  explicit: `pg_control` stores `pg_control_version`, `catalog_version_no`, `blcksz`,
+  `MAXALIGN` and a CRC-32C, and `ReadControlFile()` recognizes a byte-swapped version number
+  and prints `This could be a problem of mismatched byte ordering. It looks like you need to
+  initdb.` Run `pg_controldata` and `Maximum data alignment: 8` and `Database block size:
+  8192` sit right next to the LSNs — the file is the cluster's ABI contract with itself.
+  (`sizeof(ControlFileData)` is capped at `PG_CONTROL_MAX_SAFE_SIZE` = 512 bytes so the whole
+  thing lands in a single sector write; that constraint belongs to the
+  [fsync and atomicity](/curriculum/) page.)
+
+The remaining option is self-description: TIFF begins with `II` or `MM`, Unicode has a byte
+order mark. Nobody sensible invents a fourth.
+
+## Language-native serialization is not a data format
+
+`java.io.Serializable`, Python `pickle`, Ruby `Marshal` and .NET `BinaryFormatter` are a
+one-line convenience and a long-term liability — the case DDIA chapter 4 makes:
+
+- **They encode classes, not data.** The byte stream names types that the reader will
+  instantiate, so a deserializer is an interpreter. The Apache Commons Collections gadget
+  chain (CVE-2015-7501) turned "read this cached object" into remote code execution;
+  `pickle.loads` on untrusted input is equivalent to `exec`.
+- **They are single-language.** The moment a second service in a second language needs the
+  data, the format is a wall.
+- **Versioning is accidental.** Renaming a class or reordering fields changes the bytes.
+
+Portable schema formats separate the two ideas:
+
+| Format | Names on the wire | Field identity | Schema needed to read | Size |
+|---|---|---|---|---|
+| JSON / CBOR / MessagePack | Yes, in every record | Field name | No | Largest |
+| Protobuf / Thrift | No | Numeric tag | Yes | Small |
+| Avro | No | Positional, resolved by name | Yes — *both* writer's and reader's | Smallest |
+
+**Protobuf** spends one key byte per field: `(field_number << 3) | wire_type`, with wire types
+0 (varint), 1 (64-bit), 2 (length-delimited) and 5 (32-bit). Field numbers 1–15 fit in that
+single byte and 16–2047 take two, so hot fields get the low numbers. Names never appear, so
+renaming is free and *renumbering* is data corruption — which is why `.proto` files carry
+`reserved 4, 7;` for retired tags. Proto3 also omits any scalar sitting at its default, so
+`0`, `""` and `false` are byte-identical to "absent"; set `flag` to `false` in the visual and
+watch the field vanish. Distinguishing them again requires `optional` or a wrapper message.
+
+**Avro** writes no tags at all: a record is pure concatenated payload, and the reader makes
+sense of it with the **writer's schema** — stored once in the object-container file header, or
+fetched from a registry by id — resolved against its own **reader's schema**, matching fields
+by name. That is the densest of the three and the one that is completely unreadable without
+out-of-band metadata. The compatibility rules that come with writer/reader resolution are the
+[data-modeling module's](/curriculum/) subject.
+
+## Where it bites
+
+- **A `PGDATA` copied between architectures** will not start: you get the byte-ordering hint
+  above, or a control-file CRC failure. The fix is always a logical dump, never `rsync`.
+- **Int64 ids through JSON.** JSON has one number type and most parsers land it in a double,
+  so anything above 2⁵³ silently rounds. Snowflake ids and Twitter's `id_str` exist for this;
+  the symptom is two records colliding on ids that differ only in the last two digits.
+- **NaN crossing a boundary.** Postgres groups NaNs together, your JVM service says
+  `Double.NaN != Double.NaN`, and a `GROUP BY` result disagrees with its client-side
+  recomputation about how many groups there are.
+- **A wide, badly ordered table.** Compare `SELECT pg_column_size(t) FROM t LIMIT 1` against
+  the sum of the declared column widths and you have measured your padding; on a 100M-row
+  table it is the cheapest gigabyte you will ever recover.
+- **A protobuf tag reused after a field was deleted.** Old readers decode new data into the
+  dead field's type. No error, no CRC failure — just wrong values, forever.
+- **`pickle` or Java serialization in a cache or a queue.** It is an RCE waiting for an
+  attacker with write access to Redis.
+
+:::note[What to take forward]
+Encoding is a three-way trade between size, random-access cost and portability: fixed width
+gives you offsets and zero-copy reads, varints give you bytes, delimiters give you
+human-readability at the price of scanning and escaping. Every durable format pins its byte
+order, prefixes its lengths, and records its own layout assumptions somewhere — SQLite in a
+100-byte big-endian header, Postgres in `pg_control` — because the reader is always a
+different program than the writer. And the bit patterns that carry no value, negative zero
+and NaN, are exactly where value equality and byte equality come apart.
+:::

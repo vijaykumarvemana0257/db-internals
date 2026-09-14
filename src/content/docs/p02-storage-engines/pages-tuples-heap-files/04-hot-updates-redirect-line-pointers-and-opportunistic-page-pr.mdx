@@ -1,0 +1,265 @@
+---
+title: HOT updates, redirect line pointers and opportunistic page pruning
+description: Why one UPDATE can cost one heap write or six, how a HOT chain hides extra versions behind a single line pointer, and what a plain SELECT can clean up without VACUUM.
+depth: intermediate
+sidebar:
+  order: 4
+---
+
+import HotChainPruneLab from '../../../../components/viz/HotChainPruneLab';
+
+PostgreSQL never overwrites a heap tuple. Every `UPDATE` writes a new version, and the only
+question the storage layer gets to answer is whether that version can hide on the same page —
+costing one dirty buffer and nothing else — or has to be inserted somewhere new and announced
+to every index on the table. The difference between those two paths is the difference between
+an update-heavy table that stays the same size for a year and one that triples in a week, and
+it is decided by two predicates evaluated inside `heap_update`.
+
+<HotChainPruneLab client:visible />
+
+## The two predicates
+
+A Heap-Only Tuple update — HOT, in the tree since PostgreSQL 8.3 — is taken when both of these
+hold:
+
+1. **No indexed column changed.** Before writing anything, `heap_update` builds a bitmap of the
+   columns any index depends on (`RelationGetIndexAttrBitmap`) and compares old and new values
+   for exactly those columns. The comparison is on values, not on your SQL: `SET status = status`
+   does not count as a change, and neither does an update that happens to write the same string
+   back. Since PostgreSQL 16 summarizing indexes — BRIN — are excluded from that bitmap, because
+   a BRIN range summary stays correct when a value moves within it.
+2. **The new version fits on the same page.** `PageGetHeapFreeSpace` has to return at least the
+   new tuple's MAXALIGN'd length — that function already deducts the four bytes a new
+   `ItemIdData` would cost, so the comparison is against the tuple alone. Nothing else will do:
+   a HOT chain may not cross a page boundary, because the whole trick depends on the index entry and
+   the new version being reachable from one pinned buffer.
+
+Fail either one and the update is *non-HOT*: the new version gets its own line pointer (here or
+on another page), and an entry is inserted into **every** index on the table — not just the one
+whose key changed, because there is no way to reach the new tuple from the old index entry.
+
+That second predicate is the entire reason `fillfactor` exists. The heap's default is **100** —
+`HEAP_DEFAULT_FILLFACTOR`, unlike the B-tree's 90 — so out of the box a freshly loaded page has
+no room for a second version of anything, and the first update on it must go elsewhere. Set the
+visual's fillfactor to 100, press `UPDATE`, and watch `n_tup_newpage_upd` tick on the very first
+try; drop it to 80 and the same stream turns into HOT updates that write nothing to any index.
+
+```sql
+ALTER TABLE sessions SET (fillfactor = 85);
+```
+
+:::caution[fillfactor is not retroactive]
+It is consulted by inserts choosing a target page, so it governs pages written *after* the
+setting. Existing full pages stay full until they are rewritten — `VACUUM FULL`, `CLUSTER` or
+`pg_repack`. A plain `VACUUM` will not create the headroom, and neither will the `ALTER TABLE`
+itself.
+:::
+
+## What the bytes say
+
+A HOT update writes the new version into a free slot on the page and then edits two things:
+
+- The **new** tuple gets `HEAP_ONLY_TUPLE` set in `t_infomask2`. That bit means exactly one
+  thing: *no index entry points at me*. It is why this tuple can be moved around or thrown away
+  by page-local operations that never touch an index.
+- The **old** tuple gets `HEAP_HOT_UPDATED`, and its `t_ctid` — which in a live tuple points at
+  itself — is repointed at the new version's `(block, offset)`. `t_ctid` is doing double duty:
+  self-reference for a live tuple, forward pointer for a superseded one.
+
+Walk the line-pointer table in the visual's "Show the numbers" panel after a few updates and the
+shape is unmistakable: one row of the table has two, three, four versions in it, exactly one of
+them with `xmax = 0`, and only the first has no `HEAP_ONLY_TUPLE` flag. That first tuple is the
+**root**, and its line pointer is the only thing indexes ever name.
+
+The invariant is worth stating on its own, because everything else on this page is machinery to
+preserve it:
+
+> Every index entry names a root line pointer. That item number is assigned when the row is first
+> inserted and never changes while the row's chain lives on that page — whatever happens to the
+> tuple bytes underneath it.
+
+An index scan therefore lands on the root item and walks forward: follow `t_ctid` while
+`HEAP_HOT_UPDATED` is set, checking each version against the snapshot, and stop at the one that
+is visible. Press **Index scan** in the visual and the path lights up. Every hop is a pointer
+chase inside one already-pinned buffer — no extra I/O, no extra lock — which is why a HOT chain
+is cheap, and why an unpruned chain on a very hot row is still real CPU.
+
+## LP_REDIRECT: keeping the root when the root tuple is gone
+
+The chain's head eventually becomes invisible to every running transaction, and its bytes are
+pure waste. But its line pointer cannot simply be freed, because index entries name it. The
+resolution is the third of the four `lp_flags` states an `ItemIdData` can be in:
+
+| State | Means | Who can create it | Who can clear it |
+|---|---|---|---|
+| `LP_UNUSED` | Free slot, reusable by any insert | VACUUM's second pass, pruning of a heap-only tuple | any insert |
+| `LP_NORMAL` | Holds a tuple at `lp_off`, `lp_len` | insert / update | pruning, VACUUM |
+| `LP_REDIRECT` | Holds no tuple; `lp_off` is the item number of the chain head | pruning, VACUUM | pruning or VACUUM, when the whole chain dies — and it becomes `LP_DEAD`, not free |
+| `LP_DEAD` | Holds no tuple; index entries may still point here | pruning, VACUUM | **only** VACUUM's second pass |
+
+Pruning frees the dead root tuple's bytes and turns its item into `LP_REDIRECT` pointing at the
+first surviving version. The index entry still says `(0,4)`, item 4 still exists, and a scan that
+lands there is bounced one step forward. The row's identity — its root TID — survived the loss of
+every byte it was originally made of.
+
+Dead tuples *in the middle* of a chain are simpler: they are heap-only, nothing outside the page
+knows they exist, so their line pointers go straight back to `LP_UNUSED` and can be reused by the
+next update on the page. This is the recycling loop that lets a well-tuned table absorb updates
+forever in the same file.
+
+## Pruning: cleanup that a SELECT can do
+
+`heap_page_prune_opt` is called from ordinary page access — `heapgetpage`, an index fetch, the
+bitmap heap scan. A plain read-only query cleans up after the writers. It is deliberately cheap
+and deliberately reluctant:
+
+- It checks `pd_prune_xid` in the page header first. If no update on this page ever left a chain
+  candidate behind, the call returns immediately.
+- It only bothers when the page is marked full, or has less free space than
+  `Max(the free space the relation's fillfactor asks for, BLCKSZ/10)` — 819 bytes at the
+  default 8 KB page and fillfactor 100. A page with room to spare is left alone. The visual refuses to prune for exactly
+  this reason until you have filled the page; the note tells you which threshold it is under.
+- It takes a **cleanup lock** — exclusive, *plus* the requirement that nobody else holds a pin —
+  and it takes it conditionally. If another backend has the page pinned, pruning silently gives
+  up rather than wait. Cleanup is opportunistic in the literal sense.
+
+When it does fire, it removes dead versions, collapses chains into redirects, and calls
+`PageRepairFragmentation` to slide the surviving tuples together so the free space is one
+contiguous run between `pd_lower` and `pd_upper`. Press **SELECT this page** in the visual after
+filling it and watch the free-space bar jump — no `VACUUM` involved, and space recovered for
+reuse by this page.
+
+:::note[A read that writes]
+Pruning modifies the page and is WAL-logged, so a `SELECT` can dirty a buffer and generate WAL.
+This surprises people twice: once when a read-only replica cannot do it — a standby only ever
+replays the prune records the primary generated, so a chain a query on the primary would have
+collapsed stays long on the standby until the primary gets round to it — and once when a
+"read-only" workload shows up in `pg_stat_wal`.
+:::
+
+## Why VACUUM still needs two heap passes
+
+Pruning cannot free an `LP_DEAD` item, and the reason is a correctness argument, not an
+efficiency one. Suppose it did: the slot goes to `LP_UNUSED`, an insert reuses it for an
+unrelated row, and a stale index entry that still names that TID now points at a row that does
+not match its key. So the sequence has to be:
+
+1. **Heap pass 1.** Prune every page — unconditionally this time, no free-space threshold — and
+   record each `LP_DEAD` item's TID in the dead-TID store (a `TidStore` since PostgreSQL 17, a
+   flat array bounded by `maintenance_work_mem` before that).
+2. **Index vacuum.** Scan *every index in full* and delete the entries whose TID is in that list.
+   This is the expensive part, and it is proportional to the size of the indexes rather than to
+   the number of dead rows — which is why a table with eight indexes costs roughly eight times the
+   vacuum of the same table with one. If the dead-TID store overflows, VACUUM does this whole
+   round more than once for a single table scan.
+3. **Heap pass 2.** Now, and only now, set those items `LP_UNUSED`. Trailing unused items are
+   given back by lowering `pd_lower`; interior ones just wait for an insert.
+
+Run **VACUUM pass 1** then **index vacuum + pass 2** in the visual and watch the *Index entries*
+tile fall before the line pointers are released — never the other way round.
+
+The cheap counterpart runs in the index. When an index scan follows an entry into the heap and
+finds nothing visible there, it sets that index tuple's own `LP_DEAD` hint — the
+`kill_prior_tuple` mechanism. Later scans skip the entry without visiting the heap at all, and a
+B-tree page about to split can drop all its killed entries first to make room. It never frees a
+heap line pointer, and it is not a substitute for VACUUM; it just stops the same dead entry from
+costing a heap visit over and over. PostgreSQL 14 added a stronger version of the same instinct,
+bottom-up index deletion, which targets exactly the duplicate entries that non-HOT version churn
+leaves behind in an index.
+
+## The counters that tell you whether any of this is working
+
+Everything above is observable per table:
+
+| Column in `pg_stat_all_tables` | Meaning |
+|---|---|
+| `n_tup_upd` | All updates |
+| `n_tup_hot_upd` | Updates that required no new index entries |
+| `n_tup_newpage_upd` | Updates whose new version landed on a different page (PostgreSQL 16+) |
+
+```sql
+SELECT relname,
+       n_tup_upd,
+       n_tup_hot_upd,
+       n_tup_newpage_upd,
+       round(100.0 * n_tup_hot_upd / nullif(n_tup_upd, 0)) AS hot_pct
+FROM pg_stat_user_tables
+WHERE n_tup_upd > 0
+ORDER BY n_tup_upd DESC;
+```
+
+A low `hot_pct` has exactly two causes, and the two other counters separate them. High
+`n_tup_newpage_upd` means predicate 2 is failing: the pages are full, and the fix is fillfactor
+plus a rewrite, or finding out what is stopping pruning. A low HOT ratio with `n_tup_newpage_upd`
+near zero means predicate 1 is failing: some index covers a column your updates touch. An index
+on `updated_at` is the classic — it is touched by every single write, so it converts 100% of
+updates to non-HOT, and it usually exists to serve a query that a different index could serve.
+
+To look at an individual page, `pageinspect` shows the whole structure, `lp_flags` included:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pageinspect;
+SELECT lp, lp_flags, lp_off, t_ctid, t_infomask2
+FROM heap_page_items(get_raw_page('sessions', 0));
+```
+
+`lp_flags` is 0/1/2/3 for unused/normal/redirect/dead, and a `t_ctid` that does not equal its own
+`(0,lp)` is a chain link or a forwarding pointer to another page.
+
+## The other design: update in place, keep the past elsewhere
+
+InnoDB answers the same question differently, and the visual's engine switch replays the same
+update stream against it. The clustered-index record is rewritten **where it sits** whenever the new
+value still fits — a row that grows too big for its slot is delete-marked and reinserted, the one
+case InnoDB does move a record. The prior column values are copied into an update undo record in
+the rollback segment, and the record's
+7-byte `DB_ROLL_PTR` points at it, with `DB_TRX_ID` set to the writing transaction. A reader with
+an older read view rebuilds the version it is allowed to see by walking that pointer chain
+backwards.
+
+The index consequence follows from where secondary indexes point. InnoDB secondary entries store
+the **primary key**, not a physical location, so moving or rewriting a record does not invalidate
+them. Only an index whose own key changed needs maintenance — and then as a delete-mark plus an
+insert, with the delete-marked entry removed later by the purge threads. There is no fillfactor
+predicate at all: a non-key update touches zero indexes whether the page is empty or bursting.
+
+| | PostgreSQL | InnoDB |
+|---|---|---|
+| Where the old version lives | in the heap, same page if HOT | undo log, reached via `DB_ROLL_PTR` |
+| Indexes touched by a non-key update | none (HOT) or all of them (non-HOT) | none |
+| Indexes touched by a key update | all of them | only the changed one (delete-mark + insert) |
+| Reader cost of old versions | walk the HOT chain forward | rebuild the row backwards from undo |
+| Cleanup | pruning + VACUUM's two passes | purge threads |
+| What a long transaction bloats | the heap and every index | the undo log and read latency |
+
+Neither design escapes the underlying cost, they relocate it. Oracle makes a third choice worth
+knowing: it updates in place, and when a row no longer fits it *migrates* the row to a new block
+and leaves a forwarding pointer at the original ROWID — the same idea as `LP_REDIRECT`, at row
+granularity, with `PCTFREE` playing fillfactor's role.
+
+## Where it bites in production
+
+- **A long-running transaction stops all of it.** Pruning may not remove any version an open
+  snapshot could still need. Tick "long-running snapshot open" in the visual and watch the prune
+  reclaim nothing: the page fills, predicate 2 starts failing, updates spill, the table grows.
+  `idle in transaction` sessions, an abandoned replication slot and `hot_standby_feedback` from a
+  slow standby all pin the horizon the same way. Check
+  `SELECT max(age(backend_xmin)) FROM pg_stat_activity` and `pg_replication_slots.xmin` before
+  blaming autovacuum.
+- **One index kills the HOT ratio for everyone.** The predicate is over *all* indexed columns.
+  Adding an index on a frequently-updated column silently converts every update on the table into
+  N index inserts, and shows up as index bloat rather than as a slow query.
+- **A page full of stubs.** Repeated non-HOT same-page updates accumulate `LP_DEAD` items faster
+  than anything reclaims them, and an 8 KB heap page tops out at `MaxHeapTuplesPerPage` = 291
+  items. Only VACUUM releases them, and only trailing ones shrink `pd_lower`.
+- **Pruning gets skipped under contention.** The cleanup lock is conditional, so a page that is
+  constantly pinned by other backends can stay unpruned while everything around it is cleaned.
+
+:::note[What to take forward]
+An `UPDATE` is cheap when the new version can hide behind the old one's line pointer, and that
+requires two things at once: no indexed column changed, and free space on the same page. Every
+knob on this page — fillfactor, index count, how long your transactions run — is a lever on one
+of those two predicates. Pruning is what keeps recycling that free space during normal reads;
+VACUUM's two passes exist only because freeing a line pointer means first removing the index
+entries that name it.
+:::

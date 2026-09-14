@@ -1,0 +1,223 @@
+---
+title: Collation, Unicode and byte-comparable key encoding
+description: A btree is only sorted with respect to some comparator, and for text that comparator usually lives in libc — so a glibc upgrade can reorder an index without touching a byte, which is why key-value engines encode keys to compare with memcmp instead.
+depth: deep
+sidebar:
+  order: 7
+---
+
+import CollationOrderDriftLab from '../../../../components/viz/CollationOrderDriftLab';
+
+A btree is not sorted. It is sorted *with respect to a comparator*, and for a text column that
+comparator is usually a function in a shared library that ships with the operating system, versioned
+independently of your database and upgraded by someone patching a base image. Change it and nothing
+on disk moves: the pages are intact, the checksums verify, every downlink still points where it
+pointed — and a perfectly correct binary search now walks into the wrong subtree and reports that a
+row you can see with `SELECT *` does not exist.
+
+<CollationOrderDriftLab client:visible />
+
+Two moves are worth making before you read on. Press **Upgrade glibc 2.27 → 2.28** and probe
+`de Vries`: the descent is textbook, the comparisons are real, and the answer is wrong. Then press
+**INSERT the probe key** and watch a `UNIQUE` index accept a value it already contains, because a
+uniqueness check only looks where the descent lands. The orderings are a committed fixture with its
+provenance printed under "Show the numbers": a browser has one unversioned ICU and no way to ask for
+"glibc 2.27", so the ICU columns were captured offline from a named ICU build and the two glibc
+columns are modelled from the documented pre- and post-2.28 weight rules.
+
+## The comparator is baked into the structure
+
+Every btree page carries one invariant that search depends on: the items on it are in ascending
+order, and each separator in a parent is a true bound for the subtree below it. PostgreSQL's
+`_bt_binsrch` binary-searches each page on the way down, calling the operator class's comparison
+function — for `text`, `varstr_cmp()` in `varlena.c`, which calls `strcoll_l()` or ICU's
+`ucol_strcoll()` unless the collation is `C`, in which case it shortcuts straight to `memcmp()`.
+Nothing anywhere re-validates that the page's stored order agrees with the comparator being used
+right now. The order was decided once, when the entry was inserted, and then written down.
+
+That means a comparator change does not corrupt the tree in any structural sense. Sibling pointers
+are fine, the levels are balanced, no page is half-written. What breaks is only the *meaning* of
+the bytes, and it breaks in three directions at once:
+
+- **A search misses.** The descent picks the child whose separator range the new comparator thinks
+  contains the key. The old layout put it somewhere else. `WHERE display_name = 'de Vries'` returns
+  zero rows through the index and one row with `SET enable_indexscan = off`.
+- **`UNIQUE` stops being unique.** Uniqueness is enforced by descending to the insertion point and
+  looking at the neighbours there, not by scanning the index. Land in the wrong leaf and the
+  duplicate is invisible.
+- **Ordered reads come back unordered.** An index scan feeding `ORDER BY`, a merge join, or a
+  `DISTINCT` that relies on index order now yields a sequence that is sorted by the old rules and
+  claimed to be sorted by the new ones.
+
+The comparator has one more requirement that is easy to miss: it must be a **total order**. glibc's
+`strcoll()` is allowed to return 0 for two different strings — most often because the locale's
+tables never assigned a weight to some character, so it contributes nothing at any level. If the
+engine believed that, two distinct values would collapse, so PostgreSQL's `varstr_cmp()` breaks the
+tie with `strcmp()` on the raw bytes. Switch the lab to **glibc 2.27** and probe `🐙kraken`: the
+collation calls it equal to `kraken`, and only the byte-level tiebreak keeps both rows in the index.
+The same rule is why NFC `é` (`c3 a9`) and NFD `e` + U+0301 are adjacent but never equal in a
+deterministic PostgreSQL collation. (What a collation is, level by level, and the
+deterministic/nondeterministic distinction are covered in
+[Text, encoding and collation](/p01-foundations/sql-semantics-types-and-schema-design/04-text-encoding-and-collation/);
+this page is about what that function does to the physical tree.)
+
+Cost matters here too. A three-level tree with a few hundred entries per page costs roughly
+`3 × log₂(fanout)` comparator calls per lookup — around 24 — and each one for a linguistic collation
+walks weight tables, possibly several passes over the string. A `memcmp()` of the same two keys is a
+handful of instructions with no table lookups and no branching per character. That gap is the entire
+motivation for the next section, and it is also why PostgreSQL's sort code builds **abbreviated
+keys**: the leading bytes of `strxfrm()`'s (or ICU's `ucol_nextSortKeyPart()`'s) sort key packed
+into a `Datum`, so most comparisons during a sort are integer compares and the real collation call
+happens only when abbreviations tie. That optimization applies to sorting, not to the binary search
+inside an existing btree page, where the full comparator runs every time.
+
+## Making the comparator disappear: memcomparable encoding
+
+Key-value storage engines take the other road. They define exactly one comparison — `memcmp` on the
+key bytes — and push all the type semantics into an **encoding** with a single property:
+
+> `encode(x) < encode(y)` bytewise **if and only if** `x < y` logically.
+
+Once keys have that property, the whole engine gets simpler. The comparator is a
+`memcmp`, range scans are prefix iterations, the block format can delta-encode against the previous
+key, and a composite key is just the concatenation of its columns' encodings. The rules that make it
+work are small and the same everywhere:
+
+| Value | Encoding | Why |
+|---|---|---|
+| NULL | a single tag byte ahead of everything else (FoundationDB's tuple layer uses `0x00`) | NULLS FIRST falls out of the byte order; NULLS LAST needs the opposite tag |
+| Unsigned int | big-endian, fixed width | most significant byte first is the only order `memcmp` can read |
+| Signed int | big-endian with the **sign bit flipped** (`XOR 0x80` on the top byte) | two's complement puts −1 (`ff ff…`) above +1; flipping the sign bit restores the order. TiKV's `EncodeInt` does exactly this in 8 bytes; CockroachDB instead tags by length, with `0x88` meaning zero |
+| IEEE-754 double | if the sign bit is clear, flip it; if set, flip **all 64 bits**; then big-endian | negative doubles are stored in descending magnitude order, so the whole word has to be inverted |
+| String / bytes | UTF-8 as-is, with any `0x00` escaped (`0x00 0xff`) and a terminator (`0x00 0x01`) | without escaping, `"a\0b"` and `"a"` + a following column could interleave; the terminator makes a prefix sort before its extensions |
+| Descending column | complement every byte (`0x41` → `0xbe`), with a mirrored terminator (`0xff 0xfe`) | one encoding change replaces a reversed comparator |
+| Composite key | concatenate the per-column encodings, no separator | each encoding is self-delimiting, so column boundaries cannot be confused |
+
+Toggle **DESC (complement the bytes)** in the lab with a `memcmp` comparator selected and watch the
+hex change: this is how CockroachDB and TiKV implement a descending index column, and it costs
+nothing at read time. PostgreSQL, which does *not* use memcomparable keys, instead records the
+direction per column in `pg_index.indoption` and reverses the comparator.
+
+Who does what:
+
+| Engine | Key encoding | Text handling |
+|---|---|---|
+| FoundationDB | tuple layer: type byte per element (`0x00` null, `0x01` bytes, `0x02` UTF-8, `0x14` integer zero, `0x21` double), `0x00` escaped as `0x00 0xff` | bytes only — collation is the application's problem |
+| CockroachDB | `util/encoding`: tagged varints, `0x12` bytes marker, `0x00 0x01` terminator, distinct ascending/descending encoders | non-`C` collations are encoded as an ICU sort key alongside the original value |
+| TiDB / TiKV | `EncodeInt` (sign-flipped, 8-byte BE), `EncodeBytes` (8-byte groups, each followed by `0xFF − padCount`) | collation-aware sort keys for the new collation framework |
+| MyRocks | memcomparable index keys, plus `unpack_info` when the original cannot be reconstructed from the key | `rocksdb_strict_collation_check` refuses to index a column whose collation it cannot handle, unless the table matches `rocksdb_strict_collation_exceptions` |
+| MongoDB / WiredTiger | `KeyString`: order-preserving encoding of BSON values, with type bits stored aside so the original is recoverable | a collation-aware index stores the ICU sort key and keeps the original value for reads |
+| PostgreSQL | none — index tuples hold native datums plus a null bitmap | the opclass comparison function runs on every page search |
+
+The price of a memcomparable text key is that a sort key is **lossy**: you cannot get `Bäcker` back
+from its ICU sort key, and the sort key is usually longer than the source. So an engine either
+stores the original next to the key, which inflates the index, or refuses to support the collation
+at all — which is what MyRocks' strict check does. It is also the reason this page and
+[key layout and suffix truncation](/p02-storage-engines/b-trees-and-variants/06-key-layout-prefix-compression-and-suffix-truncation/)
+are connected: PostgreSQL truncates trailing *columns* off a separator, never a partial byte string,
+because a text prefix is not guaranteed to be a valid bound under a linguistic comparator. Engines
+with byte-comparable keys can truncate at any byte, which is exactly what makes their internal
+nodes so dense.
+
+:::tip[The cheap version of all this]
+`C` and `C.UTF-8` collations *are* memcomparable, because in UTF-8 byte order is codepoint order.
+That is not true of UTF-16 — a supplementary character sorts above U+E000 by codepoint but below it
+by code unit, because its surrogate pair lives in D800–DFFF. That is why SQL Server offers `_BIN2`
+collations and why a Java `String.compareTo()` ordering does not match a UTF-8 byte ordering. If
+you can accept codepoint order for an index, you get a comparator no OS upgrade can change — and a
+`LIKE 'prefix%'` that a btree can serve.
+:::
+
+## Why 2018 is the year every DBA learned the word "collation"
+
+glibc 2.28, released in August 2018, replaced its locale data with the ISO 14651:2016 tables.
+Space, punctuation and symbols, which had been `IGNORE` at the first three levels and only
+reappeared at the fourth, acquired real primary weights. So `Al-Rashid`, which used to collate as
+`alrashid` and sit between `Alavi` and `Alston`, now compares its hyphen at the first level and
+sorts before both. Nothing about English changed; the tables did. Select **glibc 2.27** and
+**glibc 2.28** in the lab and compare the rank columns in "Show the numbers": five of the 24 keys
+move — everything holding a hyphen, an apostrophe, a space, or a symbol the old table never
+assigned — and every btree, every unique constraint and every range partition bound built on them is
+now describing an order the server no longer uses.
+
+The distributions carried it into production quietly: RHEL 8, Debian 10 and Ubuntu 18.10 shipped
+2.28, while Ubuntu 18.04 stayed on 2.27 and 22.04 arrived at 2.35. A minor-version PostgreSQL
+upgrade that moved the container's base image was enough. Restoring a `pg_dump` re-sorts everything
+and is safe; a `pg_upgrade`, a filesystem snapshot, a physical replica promoted onto a newer host,
+or a logical replica applying changes with a different libc are not.
+
+PostgreSQL's defence is version tracking, not prevention. `pg_collation.collversion` stores the
+version the collation had when the index was built — for ICU collations since v10, and for glibc
+since v13, where the glibc release string stands in for the data version — and
+`pg_database.datcollversion` does the same for the database default since v15. When they disagree
+you get a warning, not an error:
+
+```
+WARNING:  database "app" has a collation version mismatch
+DETAIL:  The database was created using collation version 2.27, but the operating
+         system provides version 2.35.
+HINT:  Rebuild all objects in this database that use the default collation and run
+       ALTER DATABASE app REFRESH COLLATION VERSION, or build PostgreSQL with the
+       right library version.
+```
+
+The warning tells you the data *may* be wrong; it cannot tell you which indexes actually changed.
+That job belongs to **amcheck**: `bt_index_check('users_display_name_key')` walks the leaf level and
+verifies each adjacent pair against the comparator in force right now, raising
+`ERROR: item order invariant violated for index "..."` when it finds a pair the current collation
+would have ordered the other way. It takes only an `AccessShareLock`, so it runs on a live primary;
+`bt_index_parent_check` is stricter and takes a `ShareLock`, which blocks writes. Press **Run
+amcheck** in the lab before and after the upgrade — the check is the only thing in the stack that
+notices.
+
+The fix is `REINDEX INDEX CONCURRENTLY`, or `reindexdb --all --concurrently`, followed by
+`ALTER DATABASE ... REFRESH COLLATION VERSION` (and `ALTER COLLATION ... REFRESH VERSION` for
+explicit collations) to stamp the new version. But the ordering matters, and the lab shows why:
+admit one duplicate through a broken unique index and the rebuild fails with
+`ERROR: could not create unique index ... DETAIL: Key (display_name)=(de Vries) is duplicated`. The
+index can be rebuilt; the rows that got in while it was broken have to be reconciled by hand. The
+[operational drill](/p10-production-practice/failover-stacks-poolers-and-upgrades/05-the-collation-trap-silent-index-corruption-after-an-os-upgra/)
+is a page of its own.
+
+Other engines are exposed differently rather than not at all. MySQL compiles its collations into the
+server, so the OS cannot move them — but upgrading MySQL can: 8.0 changed the default from
+`utf8mb4_general_ci` to `utf8mb4_0900_ai_ci`, which is a different UCA version *and* NO PAD, so
+`'zoe ' = 'zoe'` flips from true to false and every index on those columns is rebuilt by the `ALTER`
+that changes the collation. Select the **primary strength** comparator in the lab to see what an
+`ai_ci` collation does to a unique index: `Adams` and `adams`, `Backer` and `Bäcker`, `Muller` and
+`Müller` are each one value, and the second of each pair is rejected at build time. SQLite ships
+only `BINARY`, `NOCASE` and `RTRIM` plus application-defined collations — open a database whose
+index uses a collation you did not register and you get `no such collation sequence`, and changing
+that function's behaviour silently requires a `REINDEX`. SQL Server versions its collations in their
+names (`Latin1_General_100_CI_AS`), so a change is always an explicit act.
+
+## Where it bites in production
+
+- **A query that returns nothing and a `COUNT(*)` that disagrees with it.** The classic test is
+  `SET enable_indexscan = off; SET enable_bitmapscan = off;` — if the row appears, the index is
+  sorted by rules the server is no longer using.
+- **A `REINDEX` that fails on a duplicate key months after the upgrade.** The rebuild is the first
+  full re-sort since the drift started, so it is where every admitted duplicate surfaces at once.
+- **Foreign keys that no longer hold.** The FK check probes the referenced unique index; a missed
+  probe on the parent side can leave an orphan that `ALTER TABLE ... VALIDATE CONSTRAINT` will
+  refuse later.
+- **Range partitions routing to the wrong partition.** Partition bounds are compared with the
+  partition key's collation. A row inserted after the upgrade can land in a different partition than
+  its twin from before.
+- **A logical replica on a newer base image.** The apply worker looks up rows by replica identity
+  through an index built under the publisher's rules on the subscriber's OS, and drifts in exactly
+  one direction.
+- **The `LIKE` index you forgot you had.** `text_pattern_ops` indexes compare bytewise regardless of
+  the column's collation, so they survive the upgrade while the plain index next to them does not —
+  and the two now disagree about which rows match.
+
+:::note[What to take forward]
+Sortedness is not a property of the bytes in a btree; it is a property of the bytes *plus* the
+comparator that put them there, and for text that comparator usually lives outside the database and
+carries its own version. Either pin the comparator to something that cannot move — `C`, `C.UTF-8`,
+PostgreSQL 17's builtin provider, or an ICU collation whose version you track — or accept that an OS
+upgrade is an index rebuild, and use `amcheck` to find out which indexes it touched. Key-value
+engines sidestep the whole problem by encoding keys so that `memcmp` *is* the comparator: sign-flip
+the integers, invert the negative floats, escape the NULs, complement for DESC, and the only
+ordering rule left in the system is one that no library upgrade can redefine.
+:::

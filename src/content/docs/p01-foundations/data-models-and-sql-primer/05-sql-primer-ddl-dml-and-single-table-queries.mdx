@@ -1,0 +1,251 @@
+---
+title: "SQL primer: DDL, DML and single-table queries"
+description: CREATE TABLE, INSERT/UPDATE/DELETE with RETURNING, and the FROM→WHERE→SELECT→DISTINCT→ORDER BY→LIMIT evaluation order that explains why an alias works in ORDER BY and not in WHERE.
+depth: basics
+sidebar:
+  order: 5
+---
+
+import SqlClausePipelineSandbox from '../../../../components/viz/SqlClausePipelineSandbox';
+
+SQL is the only mainstream language whose statements are not executed in the order they are
+written. You write `SELECT` first and the engine runs it third; you write `LIMIT` last and it
+is the only clause the engine may be able to shortcut. Almost every confusing thing about the
+language — why an alias works in one clause and not its neighbour, why a `WHERE` silently ate
+half your rows, why `LIMIT 10` still read the whole table — falls out of that reordering and
+out of what `NULL` does inside it.
+
+<SqlClausePipelineSandbox client:visible />
+
+Run example 2 and step to the **WHERE** stage. `city <> 'Tacoma'` drops the two Tacoma rows —
+expected — and also the two rows where `city` is `NULL`, which most people do not expect. Then
+switch the engine to MySQL and re-run example 4: the same `ORDER BY credit DESC` puts the
+`NULL` credits at the opposite end of the result.
+
+## The statement you write is not the program that runs
+
+The SQL standard defines a **logical evaluation order** for a query. Every engine is free to
+execute it however it likes as long as the answer matches what this order would produce:
+
+| Written | Evaluated | Clause | What it does |
+|---|---|---|---|
+| 2nd | 1st | `FROM` | Names the relation and produces its rows |
+| 3rd | 2nd | `WHERE` | Keeps rows whose predicate is **strictly TRUE** |
+| — | 3rd | `GROUP BY` / `HAVING` | Collapses rows into groups (the [next page](/p01-foundations/data-models-and-sql-primer/06-sql-primer-joins-group-by-subqueries-and-set-operations/)) |
+| 1st | 4th | `SELECT` | Evaluates the output list — **this is where aliases are created** |
+| 1st | 5th | `DISTINCT` | Folds duplicate output rows |
+| 4th | 6th | `ORDER BY` | Sorts the output rows |
+| 5th | 7th | `LIMIT` / `OFFSET` | Cuts the sorted result |
+
+Two consequences do most of the work.
+
+**An alias does not exist until `SELECT` has run.** Example 7 in the sandbox writes
+`ROUND(total * 0.0925, 2) AS tax` and then `WHERE tax > 40`. Postgres answers
+`ERROR: column "tax" does not exist`; MySQL answers `ERROR 1054 (42S22): Unknown column 'tax'
+in 'where clause'`. Example 8 is the same alias in `ORDER BY` and both engines accept it,
+because by then the projection has already produced a column called `tax`. `ORDER BY` also
+accepts a 1-based **ordinal** (`ORDER BY 2`) for the same reason — it is sorting output columns,
+not table columns. SQLite is the odd one out: it accepts result-set aliases in `WHERE` as an
+extension the other two reject. Switch the engine and watch example 7 start returning rows.
+
+**`LIMIT` is last, so it is not a way to read less.** `LIMIT 3` on top of an `ORDER BY` over a
+million rows still sorts a million rows; the cut happens after. An engine can only stream a
+`LIMIT` when the stage below it produces rows in the right order already — an index scan whose
+order matches the `ORDER BY`, for instance. Otherwise the sort is a blocking operator that must
+consume its whole input before it emits anything. This is the same reason `OFFSET 100000` is a
+performance trap: the engine produces and throws away a hundred thousand rows every time
+someone clicks to page 5000.
+
+:::caution[`LIMIT` without `ORDER BY` promises nothing]
+A result with no `ORDER BY` has no defined row order. The same query can return rows in a
+different order after an index is added, after a row is updated in place, or when the planner
+decides to use a parallel sequential scan. If you paginate on `LIMIT`/`OFFSET` with no
+`ORDER BY`, rows will duplicate and vanish between pages, and nothing is broken.
+:::
+
+## DDL: the declarations every later write is checked against
+
+`CREATE TABLE` costs nothing at runtime and buys you a checkpoint that every subsequent write
+must pass. Load example 17 in the sandbox — the `CREATE` stage shows exactly what the catalog
+now holds:
+
+```sql
+CREATE TABLE refunds (
+  id        INTEGER PRIMARY KEY,
+  order_id  INTEGER NOT NULL,
+  reason    VARCHAR(20) NOT NULL DEFAULT 'unspecified',
+  amount    NUMERIC NOT NULL CHECK (amount > 0),
+  issued_on DATE NOT NULL
+);
+```
+
+Four things are being declared, and they are independent: the **type** (what values may be
+stored and how they are encoded on the page), **nullability**, a **default** for when the
+column is not supplied, and **constraints** the row must satisfy.
+
+The types are where the three engines diverge hardest.
+
+| Idea | PostgreSQL | MySQL 8 | SQLite |
+|---|---|---|---|
+| 32/64-bit integer | `integer`, `bigint` (no unsigned types) | `INT`, `BIGINT`, and `UNSIGNED` variants | `INTEGER` — one variable-width type, 1–8 bytes |
+| Exact decimal | `numeric(p,s)` | `DECIMAL(p,s)` | none — `NUMERIC` affinity stores an integer or a float |
+| Binary float | `real`, `double precision` | `FLOAT`, `DOUBLE` | `REAL` |
+| String | `text`, `varchar(n)` — identical performance | `VARCHAR(n)`, `TEXT`; row limit 65,535 bytes | `TEXT` — `VARCHAR(n)`'s length is parsed and ignored |
+| Boolean | real `boolean`, prints `t`/`f` | alias for `TINYINT(1)`, prints `1`/`0` | none — `TRUE`/`FALSE` are literals for `1`/`0` |
+| Date/time | `date`, `timestamptz` | `DATE`, `DATETIME`, `TIMESTAMP` | none — text or a number, by convention |
+
+SQLite is not sloppily typed, it is *differently* typed: a value has one of five **storage
+classes** (NULL, INTEGER, REAL, TEXT, BLOB), and a column has an **affinity** that says what
+SQLite will *try* to convert an incoming value into. If the conversion is not lossless, the
+value is stored as it arrived. Run example 16 — `'three'` into an `INTEGER` column — on all
+three engines: Postgres says `invalid input syntax for type integer: "three"`, MySQL (whose
+default `sql_mode` has included `STRICT_TRANS_TABLES` since 5.7) says
+`ERROR 1366 (HY000): Incorrect integer value`, and SQLite stores the string. If you want
+Postgres-like enforcement, SQLite 3.37 added `CREATE TABLE ... STRICT`.
+
+Example 15 is the same story for width: `'San Francisco'` is 13 characters going into
+`city VARCHAR(12)`. Postgres raises `value too long for type character varying(12)`, MySQL
+raises `ERROR 1406 (22001): Data too long for column 'city' at row 1`, SQLite stores all
+thirteen characters.
+
+Constraints are where the declaration can quietly not be a declaration. MySQL parsed `CHECK`
+and silently ignored it until 8.0.16. SQLite enforces foreign keys only if the connection has
+run `PRAGMA foreign_keys = ON`, and it is off by default, so a schema full of `REFERENCES`
+clauses can be enforcing nothing at all. (What `UNIQUE`, `NOT NULL` and a foreign key *mean*
+under NULLs is [page 2's subject](/p01-foundations/data-models-and-sql-primer/02-the-relational-model-precisely-relations-keys-constraints-an/);
+this page is about the SQL that trips over them.)
+
+A `DEFAULT` is an expression evaluated **at insert time**, not at `CREATE TABLE` time —
+`DEFAULT now()` stores the moment of the insert, not the moment of the migration.
+
+## DML: `INSERT`, `UPDATE`, `DELETE`, and getting the row back
+
+Run example 11 and step through the four stages. The row constructor in `VALUES` is evaluated
+first, with no table context at all — nothing in it can reference a column. Then the columns
+you did not name are filled from their defaults, and every value is coerced to its declared
+type. Then constraints run, in order: `NOT NULL`, then `PRIMARY KEY`/`UNIQUE`, then `CHECK`.
+
+The `RETURNING` stage is the one worth internalizing. Without it, an insert tells you a row
+count and you make a second round trip to find out what was actually stored — the generated
+key, the applied default, the value after coercion. `RETURNING` hands all of that back from
+the same statement. Postgres has had it since 8.2 and SQLite since 3.35; MySQL has no
+`RETURNING` at all, which is why MySQL code is full of `LAST_INSERT_ID()` and why switching the
+sandbox to MySQL turns examples 11–13 into `ERROR 1064` syntax errors.
+
+`UPDATE` has a trap the sandbox's **SET** stage spells out: in standard SQL, every assignment
+reads the row as it was *before* the statement, so `SET a = b, b = a` swaps the two columns —
+that is what Postgres and SQLite do. MySQL documents the opposite: single-table `UPDATE`
+assignments are evaluated left to right, so the same statement copies `b` into both. This is a
+real portability bug, not a trivia question.
+
+`DELETE` is not a free operation. Run example 13 and read the **DELETE** stage: Postgres does
+not erase the rows, it marks them dead by setting `xmax`, and `VACUUM` reclaims the space
+later; InnoDB marks them and a purge thread follows. A `DELETE FROM t` with no `WHERE` writes a
+WAL record per row and leaves the table exactly as large as it was. `TRUNCATE` is the different
+operation that actually drops the storage.
+
+## `NULL` is why half of this is confusing
+
+`NULL` is not a value. It is a marker meaning "no value here", and every operator that touches
+it returns `NULL` rather than an answer. That turns boolean logic into **three-valued logic**:
+a predicate can be TRUE, FALSE, or UNKNOWN.
+
+The rule that matters: **`WHERE` keeps only rows whose predicate is strictly TRUE.** FALSE and
+UNKNOWN are both discarded, and nothing in the output distinguishes them. The sandbox's WHERE
+stage labels every row with its verdict and counts the UNKNOWNs separately, because in
+production that distinction is the difference between a correct report and a quietly wrong one.
+`city <> 'Tacoma'` does not mean "not from Tacoma", it means "known to be from somewhere that
+is not Tacoma". To get the rows you meant, you have to say so:
+
+```sql
+WHERE city IS DISTINCT FROM 'Tacoma'   -- Postgres / SQLite
+WHERE NOT (city <=> 'Tacoma')          -- MySQL's null-safe equality
+WHERE city <> 'Tacoma' OR city IS NULL -- portable everywhere
+```
+
+`IS NULL` is a separate operator precisely because `= NULL` cannot work — it is always UNKNOWN,
+so it matches nothing and errors nowhere. Two functions do most of the day-to-day repair work:
+`COALESCE(a, b, …)` returns the first non-NULL argument (and evaluates only as far as it must),
+and `NULLIF(a, b)` returns NULL when the two are equal, which is the idiom for turning a
+sentinel like `0` or `''` back into a real absence. Example 3 runs both.
+
+Three places break the "NULL is never equal to NULL" rule, deliberately:
+
+- **`DISTINCT`** treats two NULLs as the same value, so example 6 collapses both NULL cities
+  into a single output row.
+- **`GROUP BY`** does the same, putting all NULLs in one group.
+- **`ORDER BY`** must put NULLs somewhere. Postgres treats NULL as *larger* than every value,
+  so `ASC` puts NULLs last and `DESC` puts them first. MySQL and SQLite treat NULL as
+  *smaller*, giving the exact opposite. `ORDER BY x DESC NULLS LAST` makes it explicit in
+  Postgres and SQLite; MySQL has no such syntax and you write `ORDER BY x IS NULL, x DESC`.
+
+A `CHECK` constraint runs the same three-valued logic with the opposite convention — it rejects
+a row only when the predicate is **FALSE**, so `CHECK (amount > 0)` accepts a NULL `amount` and
+the column also needs `NOT NULL`. Watch it happen in the sandbox's **CONSTRAINTS** stage.
+
+## Casts: explicit, assignment, and the ones you did not ask for
+
+A cast converts a value from one type to another. There are three kinds, and only one of them
+is in your code.
+
+An **explicit** cast is `CAST(x AS integer)`, or Postgres's `x::integer` shorthand. Neither
+spelling travels: `::` is a syntax error outside Postgres, and MySQL's `CAST` target list has
+no `INTEGER` in it at all — the integer target is spelled `SIGNED` (or `UNSIGNED`), and
+`CAST(x AS INTEGER)` is `ERROR 1064`. Example 10 is the standard spelling; run it on each
+engine and only MySQL rejects it.
+
+An **assignment** cast happens when you store a value into a column of a different type, and
+it is stricter than an explicit one. Postgres rounds `2.6` to `3` on the way into an `integer`
+column but refuses `'three'` outright. SQLite, having affinity rather than types, converts
+when the conversion is lossless and stores the original otherwise.
+
+An **implicit** cast is the engine coercing operands so an operator can be applied, and this is
+where the three engines are furthest apart. Run example 9 and switch engines — it holds the
+four expressions below that every engine will parse; the other two you have to type yourself,
+because `text_col + 1` and `1 / 0` both abort the statement on Postgres:
+
+| Expression | PostgreSQL | MySQL 8 | SQLite |
+|---|---|---|---|
+| `'7' + 1` | `8` — an undecorated literal has type *unknown* and is resolved to `integer` | `8`, with warning 1292 on non-numeric text | `8` |
+| `text_col + 1` | `ERROR: operator does not exist: text + integer` | numeric prefix of the string, else `0` | numeric prefix, else `0` |
+| `7 / 2` | `3` — integer ÷ integer is integer | `3.5` — `/` is always decimal; `DIV` truncates | `3` |
+| `1 / 0` | `ERROR: division by zero` | `NULL` | `NULL` |
+| `'a' \|\| 'b'` | `'ab'` | `0` — in the default `sql_mode`, `\|\|` is logical **OR** | `'ab'` |
+| `'Seattle' = 'seattle'` | false under a standard collation | **true** — `utf8mb4_0900_ai_ci` is case-insensitive | false |
+
+Postgres is strict on purpose. Version 8.3 removed most implicit casts to `text` precisely
+because they made wrong queries silently succeed, and the unknown-literal rule is what keeps
+`WHERE id = '42'` working while `WHERE name + 1` fails. The reason to care is that the *same
+application query* can return different answers on a MySQL replica of a Postgres schema, and
+none of the three engines will tell you.
+
+## Where it bites in production
+
+- **Reports that quietly lose rows.** A dashboard filtered on `status <> 'cancelled'` omits
+  every row where `status` is NULL. The number is wrong, no error is raised, and the bug
+  surfaces when someone reconciles two totals. Check the sandbox's *Dropped as UNKNOWN* stat
+  for the shape of what you are missing.
+- **`NOT IN` over a list containing NULL returns nothing at all.** `x NOT IN (1, 2, NULL)` is
+  `x <> 1 AND x <> 2 AND x <> NULL`, whose last term is UNKNOWN, so the whole conjunction can
+  never be TRUE. The same is true when that list comes from a subquery — this is the single
+  most common NULL bug in real SQL.
+- **Pagination that slows down as users go deeper.** `LIMIT 20 OFFSET 200000` produces 200,020
+  rows and discards 200,000 of them, on every page load. Keyset pagination
+  (`WHERE (created_at, id) < (?, ?) ORDER BY created_at DESC, id DESC LIMIT 20`) reads 20.
+- **`SELECT *` in application code.** The column list is resolved at execution time, so adding
+  a column to the table changes the shape of every result the application already parses
+  positionally, and it also forces the engine to fetch columns nobody reads — which matters a
+  great deal once you get to wide rows and column stores.
+- **An `UPDATE` or `DELETE` whose `WHERE` went UNKNOWN.** It does not error; it just affects
+  zero rows, or — with the `WHERE` omitted entirely — all of them. Run the statement as a
+  `SELECT` first, and use `RETURNING` so the write tells you what it actually touched.
+
+:::note[What to take forward]
+A SQL statement is a pipeline evaluated `FROM → WHERE → SELECT → DISTINCT → ORDER BY → LIMIT`,
+not a program read top to bottom; aliases exist only from the `SELECT` stage onward, and
+`LIMIT` cuts a result that has already been fully produced unless the stage below it can
+stream. `NULL` makes every predicate three-valued, `WHERE` keeps only TRUE while `CHECK`
+rejects only FALSE, and `DISTINCT`, `GROUP BY` and `ORDER BY` each break the rule in their own
+way. And "it's just SQL" is not portable: `||`, `/`, NULL ordering, type enforcement and
+`RETURNING` all differ across PostgreSQL, MySQL and SQLite.
+:::

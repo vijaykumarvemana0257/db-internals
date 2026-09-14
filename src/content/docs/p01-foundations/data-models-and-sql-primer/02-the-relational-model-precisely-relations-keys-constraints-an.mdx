@@ -1,0 +1,271 @@
+---
+title: "The relational model precisely: relations, keys, constraints and NULLs"
+description: What a relation, a candidate key and a constraint actually are, how SQL deviates from the model, and why NULL makes a CHECK pass and a WHERE row disappear.
+depth: basics
+sidebar:
+  order: 2
+---
+
+import RelationalConstraintLab from '../../../../components/viz/RelationalConstraintLab';
+
+Every mechanism later on this site — a query plan, a row lock, an MVCC snapshot, a replica
+that diverged — is defined over a relation and the predicates declared on it. Two ideas carry
+most of the weight: a relation is a *set* of tuples over typed domains, and a constraint is a
+predicate the engine is *obliged* to enforce on every state change. SQL implements both
+approximately, and almost every data-corruption bug you will debug lives in the gap.
+
+<RelationalConstraintLab client:visible />
+
+## A relation is a set; a SQL table is a bag
+
+In Codd's 1970 model a relation has a **heading** — a set of (attribute name, domain) pairs —
+and a **body**: a set of tuples over that heading. Three properties fall straight out of
+"set":
+
+- **No duplicate tuples.** If two tuples are equal they are the same tuple.
+- **No order.** Neither of rows nor of attributes; you address an attribute by name.
+- **No addressing by position.** There is no "third column".
+
+SQL keeps the third property only by convention and breaks the first two outright. A SQL
+table is a **bag** (a multiset): `INSERT` the same values twice into a table with no key and
+you get two rows that no `WHERE` clause can tell apart. PostgreSQL will let you reach them
+individually through `ctid`, the physical (page, offset) location — an escape hatch that only
+exists because the model was broken. Columns are ordered, too: `SELECT *`, `INSERT` without a
+column list, and `UNION` all match by position, which is why adding a column in the middle of
+a table is a compatibility event.
+
+The deviation is deliberate and it is about cost. Guaranteeing set semantics means
+deduplicating after every operation, and deduplication needs a sort or a hash. SQL made you
+ask: `SELECT` returns a bag, `UNION` deduplicates, `UNION ALL` does not, and `DISTINCT` is a
+sort or hash-aggregate you pay for on the spot. The practical consequence is that **a table
+without a key is not a relation**, and every guarantee in this module is a guarantee about
+tables that have one.
+
+The domain half of the heading matters as much as the tuple half. A domain is a type plus the
+values it admits, and it is what makes a predicate like `total >= 0` meaningful at all.
+PostgreSQL exposes the idea directly with `CREATE DOMAIN us_cents AS integer CHECK (VALUE >= 0)`,
+so the constraint travels with the type instead of being copy-pasted into every table.
+
+## Superkeys, candidate keys, primary keys
+
+The key hierarchy is three definitions, and they are worth getting exact:
+
+- A **superkey** is any set of attributes whose values identify at most one tuple. The whole
+  heading is always a superkey.
+- A **candidate key** is a *minimal* superkey: remove any attribute and it stops identifying.
+- The **primary key** is one candidate key you elected. Every column of it is implicitly
+  `NOT NULL`. The candidates you did not elect are **alternate keys**, and you declare them
+  `UNIQUE`.
+
+In the lab's `order_items`, `(order_id, line)` is a candidate key; `(order_id, line, qty)` is a
+superkey but not a candidate, because dropping `qty` still identifies. Insert `(5001, 1)` twice
+and the composite key collides even though `line = 2` for the same order is fine — the key is
+the *pair*, not either column.
+
+Physically, both a primary key and a `UNIQUE` constraint are backed by a unique index, but
+what the primary key *means* to the storage engine differs sharply:
+
+| Engine | What the primary key is physically |
+|---|---|
+| PostgreSQL | A unique B-tree index plus `NOT NULL` plus a `pg_constraint` row. The table is an unordered heap; the primary key does not determine row placement and is not otherwise privileged |
+| MySQL / InnoDB | The **clustered index** — the table *is* the primary key's B+tree, rows stored in key order. Every secondary index stores the primary key as its row pointer, so a wide key inflates every index |
+| SQLite | `INTEGER PRIMARY KEY` aliases the internal `rowid` and clusters; any other primary key is a separate index over a rowid table |
+| SQL Server | Clustered by default, but you can declare it `NONCLUSTERED` and cluster on something else |
+
+InnoDB's behaviour has a sharp edge: if you declare no primary key it silently picks the first
+`UNIQUE NOT NULL` index, and failing that generates a hidden 6-byte `DB_ROW_ID` you cannot
+query, cannot use for replication filtering, and cannot see in `EXPLAIN`.
+
+## Natural keys, surrogate keys, and the mistake in between
+
+A **natural key** is an attribute the domain already has: an email, an ISBN, a MAC address.
+A **surrogate key** is a value the database generates with no meaning outside it: a sequence,
+an `IDENTITY` column, a UUID.
+
+A key must be **unique, total and immutable**. Natural keys routinely fail the last two —
+people change email addresses, national ID numbers get reissued, a supplier renumbers its
+SKUs — and a mutable key means `ON UPDATE CASCADE` rewriting every child row on a value change.
+That is why production schemas mostly use surrogates.
+
+The mistake is treating the surrogate as a replacement for the natural key rather than an
+addition. A `customers` table with `id serial PRIMARY KEY` and no `UNIQUE (email)` has no
+statement about identity at all: the same person inserted twice gets two ids and the database
+is delighted. **The surrogate gives you a stable handle; the natural key is still the business
+invariant, and it belongs in a `UNIQUE` constraint.** Almost every deduplication job you have
+ever written exists because that constraint was missing.
+
+Surrogates are not free either. A random UUIDv4 primary key scatters inserts uniformly across
+the B-tree's leaves, and in InnoDB — where the primary key is the clustering key — that scatters
+the *rows* too, destroying insert locality and making every secondary-index entry carry a
+16-byte row pointer instead of the 4 or 8 bytes an integer key would cost. Time-ordered UUIDv7
+or ULID restore the locality while keeping the generate-anywhere property.
+
+## Referential integrity and what ON DELETE really does
+
+A foreign key says: every **non-NULL** value of the referencing columns appears as a value of
+a candidate key in the referenced relation. The non-NULL qualifier is the whole reason a
+foreign key and a `NOT NULL` are different decisions. Under `MATCH SIMPLE` — the SQL default —
+if *any* referencing column is NULL the constraint is satisfied with no lookup at all.
+`MATCH FULL` demands all-or-none; `MATCH PARTIAL` is in the standard and implemented by
+essentially nobody, PostgreSQL included.
+
+PostgreSQL implements the check as a pair of **after-row triggers** you can see in `pg_trigger`
+(`RI_FKey_check_ins` on the child, `RI_FKey_noaction_del` and friends on the parent). The child
+side runs, in effect, `SELECT 1 FROM customers WHERE id = $1 FOR KEY SHARE` — a real lookup that
+needs a unique index on the parent (the syntax requires one) and takes a lock that blocks
+updates to the parent's key. The child column gets **no index automatically** in PostgreSQL;
+InnoDB does create one if you have not. That asymmetry is the single most common foreign-key
+performance bug: without a child index, `ON DELETE CASCADE` sequentially scans the child table
+once per deleted parent row.
+
+The referential actions, with the distinctions that matter:
+
+| Action | When it runs | Note |
+|---|---|---|
+| `NO ACTION` | End of statement; **can** be deferred to `COMMIT` | The SQL default. `DEFERRABLE INITIALLY DEFERRED` makes circular references and bulk re-parenting possible |
+| `RESTRICT` | Immediately, inside the row operation | Cannot be deferred. Otherwise identical in effect |
+| `CASCADE` | Immediately | Deletes/updates the children — and each of those is itself subject to every constraint pointing at *them*, so the action recurses |
+| `SET NULL` | Immediately | Fails with `23502` if the column is `NOT NULL`, and always fails if the column is part of the child's primary key |
+| `SET DEFAULT` | Immediately | Fails with `23503` if the default value has no matching parent row |
+
+Set the lab's `orders → customers` action to `CASCADE` and the `items → orders` action to
+`RESTRICT`, then delete customer 1: the cascade reaches `order_items`, is refused there, and
+the whole `DELETE` rolls back with an error naming a table your statement never mentioned.
+A cascade above a restrict is a delete that can never complete.
+
+:::caution[Engines that do not enforce by default]
+SQLite parses foreign keys and ignores them unless you issue `PRAGMA foreign_keys = ON` on
+**every connection** — it is off by default for backward compatibility. MySQL's `MyISAM` parses
+and ignores them permanently, and `SET foreign_key_checks = 0` (the standard bulk-load trick)
+does not re-validate when you turn it back on: the orphans it lets in stay forever. InnoDB has
+no deferrable constraints at all, so a circular reference must be broken by a nullable column.
+:::
+
+## UNIQUE and CHECK: what each can and cannot say
+
+`UNIQUE` is a statement about a *set of rows* and is implemented as a unique index. In
+PostgreSQL a `UNIQUE` constraint creates an index plus a `pg_constraint` row; you can also
+create the index directly, which buys you things a constraint cannot express — a partial index
+(`CREATE UNIQUE INDEX ... WHERE deleted_at IS NULL`) or an expression index
+(`UNIQUE (lower(email))`). `INSERT ... ON CONFLICT (...) DO UPDATE` accepts either as its
+*arbiter*: it needs a concrete index to conflict on, and errors with "there is no unique or
+exclusion constraint matching the ON CONFLICT specification" when none exists. Only the bare
+`ON CONFLICT DO NOTHING`, which names no conflict target, works without one.
+
+`CHECK` is a statement about a *single row*, and the standard requires it to be deterministic
+and self-contained. PostgreSQL will accept a `CHECK` that calls a function reading another
+table and it is unsound: the predicate is evaluated when the row is written and never again, so
+changing the other table silently invalidates it, and a `pg_dump`/restore can fail or succeed
+depending on row order. Cross-row rules belong in a trigger, or in PostgreSQL's exclusion
+constraints, which generalize `UNIQUE` from equality to any commutative operator an index can
+search — `EXCLUDE USING gist (room WITH =, during WITH &&)` makes overlapping bookings
+unrepresentable.
+
+Two operational details: MySQL accepted and silently discarded `CHECK` clauses until 8.0.16, so
+a schema written against 5.7 may have none of the checks its DDL appears to declare. And on a
+large PostgreSQL table, `ALTER TABLE ... ADD CONSTRAINT ... NOT VALID` followed later by
+`VALIDATE CONSTRAINT` adds the rule immediately for new rows and does the full scan under a
+weaker lock, instead of holding `ACCESS EXCLUSIVE` for the length of the scan.
+
+## The third truth value
+
+SQL's NULL is not a value. It is a marker meaning "no value here", and any comparison against
+it yields neither TRUE nor FALSE but **UNKNOWN**. That gives every predicate three outcomes,
+with these rules: `NOT UNKNOWN` is `UNKNOWN`; `TRUE OR UNKNOWN` is `TRUE`; `FALSE AND UNKNOWN`
+is `FALSE`; everything else involving UNKNOWN is UNKNOWN.
+
+The bugs come from the fact that **different parts of SQL treat UNKNOWN differently**:
+
+| Context | Treatment of UNKNOWN | Consequence |
+|---|---|---|
+| `WHERE`, `HAVING`, `JOIN ... ON` | Rejected — only TRUE passes | A NULL row matches neither `total >= 0` nor `total < 0` |
+| `CHECK` constraint | **Accepted** — only FALSE is a violation | `CHECK (total >= 0)` lets a NULL total straight through |
+| `NOT NULL` | Rejected | The only constraint that treats a NULL as a violation by itself |
+| `UNIQUE` | Every NULL is its own value (SQL default) | Unlimited NULLs in a unique column |
+| `GROUP BY`, `DISTINCT`, `UNION` | NULLs are grouped *together* | The same NULLs a unique index lets through collapse into one group |
+| `ORDER BY` | Sorted, not dropped | PostgreSQL: NULLs last for `ASC`, first for `DESC`. MySQL: the opposite |
+| Aggregates | Skipped | `COUNT(col)` ignores NULLs; `COUNT(*)` does not |
+
+Run the lab's `INSERT order — total NULL`, then the `UPDATE orders SET status = 'paid' WHERE
+total >= 0`. The identical predicate `total >= 0` accepted that row as a constraint and then
+refused to match it as a filter. Nothing is inconsistent here — the standard says a check
+constraint is satisfied unless it evaluates to FALSE, and a `WHERE` clause keeps a row only
+when it evaluates to TRUE — but the two rules point in opposite directions, and the row falls
+through the middle.
+
+The same asymmetry produces the two classic query bugs. `WHERE status <> 'paid'` silently drops
+every row where `status` is NULL. And `WHERE id NOT IN (SELECT parent_id FROM child)` returns
+**zero rows** the moment one `parent_id` is NULL, because `id <> NULL` is UNKNOWN and
+`NOT IN` needs every comparison to be TRUE. The null-safe comparison is `IS DISTINCT FROM`
+and its negation `IS NOT DISTINCT FROM`; MySQL has neither and spells the *equal* form `<=>`.
+`NOT EXISTS` is the safe rewrite of `NOT IN`.
+
+Uniqueness inherits the same logic. Because `NULL = NULL` is UNKNOWN rather than TRUE, a unique
+index cannot prove two NULLs are duplicates, so it admits all of them — and engines disagree
+about whether to override that:
+
+| Engine | NULLs in a UNIQUE column |
+|---|---|
+| PostgreSQL | Many allowed; `UNIQUE NULLS NOT DISTINCT` (added in 15) makes them collide |
+| MySQL / InnoDB | Many allowed; no option to change it |
+| SQLite | Many allowed |
+| Oracle | Many allowed; a composite index simply does not store entries whose key columns are all NULL |
+| SQL Server | **Only one** — its unique constraint treats NULLs as equal. The workaround is a filtered index `WHERE col IS NOT NULL` |
+
+Flip the lab's `UNIQUE (email)` control to `NULLS NOT DISTINCT` and insert a second NULL email:
+the same statement that passed a moment ago now returns `23505`.
+
+## Why application code cannot enforce uniqueness
+
+This is the argument that justifies every constraint on this page. Suppose you enforce
+"one customer per email" by querying first:
+
+```sql
+SELECT 1 FROM customers WHERE email = 'kay@vine.io';  -- no rows
+INSERT INTO customers (email) VALUES ('kay@vine.io');
+```
+
+Two sessions interleave. Both `SELECT`, both see nothing — correctly, because under any
+isolation level a transaction's snapshot cannot see another transaction's uncommitted row. Both
+`INSERT`. Both commit. You have two rows. No isolation level below `SERIALIZABLE` prevents
+this, and `SERIALIZABLE` only converts it into a serialization failure (`40001`) you must catch
+and retry — which is a protocol, not an invariant.
+
+The unique index wins because it is not doing a read. PostgreSQL's `_bt_check_unique` walks to
+the leaf page where the entry belongs while holding a buffer lock, and if it finds a conflicting
+entry from a transaction still in flight it **blocks on that transaction's XID** until it
+commits or aborts, then proceeds or raises `23505`. The two inserters serialize on a physical
+page, outside the MVCC snapshot rules that make the application-level check impossible. There is
+no way to reconstruct that from SQL statements; an advisory lock around the read-then-write is
+the only alternative, and it is a worse re-implementation of the same index.
+
+## Where it bites in production
+
+- **Duplicates behind a surrogate key.** A `serial` primary key and no `UNIQUE` on the natural
+  key. Symptom: a recurring dedupe job. Fix: `CREATE UNIQUE INDEX CONCURRENTLY`, then attach it
+  as a constraint — but the existing duplicates must be merged first, and the index build will
+  fail on them.
+- **A cascade with no child index.** `DELETE FROM customers WHERE id = 1` takes minutes.
+  `EXPLAIN` shows nothing; the cost is inside the RI trigger doing a sequential scan on
+  `orders`. `pg_stat_user_tables.seq_scan` on the child is climbing.
+- **Foreign-key lock contention.** Every child insert takes `FOR KEY SHARE` on its parent row.
+  A hot parent (a tenant row, a shared "default" account) turns into a serialization point;
+  you see `tuple` and `transactionid` wait events, and deadlocks between two sessions inserting
+  children of two parents in opposite order.
+- **`NOT IN` after a column became nullable.** A report that returned rows last month returns
+  zero today and raises no error. The migration that added `NULL`s is weeks in the past.
+- **Bulk loads that disabled the checks.** `SET foreign_key_checks = 0` or
+  `PRAGMA foreign_keys = OFF` during an import, never re-validated. The orphans are permanent
+  and invisible until a join quietly loses rows.
+- **`SET NULL` on a column someone later made `NOT NULL`.** The DDL accepts the contradiction;
+  the first parent delete, possibly years later, raises `23502`.
+
+:::note[What to take forward]
+A relation is a set of tuples over typed domains; a SQL table is a bag that only becomes a
+relation once it has a key. Keys come in a strict hierarchy — superkey, candidate, primary —
+and a surrogate primary key never removes the obligation to declare the natural key `UNIQUE`.
+NULL adds a third truth value whose treatment is deliberately inconsistent across SQL: `CHECK`
+accepts UNKNOWN, `WHERE` rejects it, and `UNIQUE` treats every NULL as distinct unless you say
+`NULLS NOT DISTINCT`. And uniqueness is enforceable only by the index, because only the index
+can serialize two concurrent inserters on the same physical page.
+:::

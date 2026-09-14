@@ -1,0 +1,250 @@
+---
+title: Page anatomy and the slotted page
+description: How a fixed-size page holds variable-length records — a pointer array growing forward, record bytes growing backward, and an indirection layer that lets tuples move while their addresses do not.
+depth: basics
+sidebar:
+  order: 1
+---
+
+import SlottedPageEditor from '../../../../components/viz/SlottedPageEditor';
+
+Rows are variable-length, arrive in no useful order, and are deleted from the middle. Pages are
+fixed-length, are read and written whole, and must stay addressable by an index entry written
+months ago. The **slotted page** is the data structure that reconciles those two facts, and it is
+the same structure — with different field names and different politics about who owns an address —
+in PostgreSQL, InnoDB, SQLite, Oracle and SQL Server.
+
+<SlottedPageEditor client:visible />
+
+## Fixed-size pages, and what the size buys
+
+A page (Postgres calls it a block, InnoDB a page, SQLite a page, Oracle a block) is the unit of
+essentially everything below the executor: the unit of a read and a write, of buffer-pool
+residency, of the latch you take to look at a record, of a checksum, and of the physical address
+in an index entry.
+
+| Engine | Page size | Knob | Address arithmetic |
+|---|---|---|---|
+| PostgreSQL | 8 KB | `BLCKSZ`, compile-time, 1–32 KB | block *N* of a fork is at byte `N × 8192` |
+| MySQL / InnoDB | 16 KB | `innodb_page_size`, 4/8/16/32/64 KB, set at initialization | page *N* at `N × 16384` in the tablespace |
+| SQLite | 4 KB | `PRAGMA page_size`, before any content exists or applied by a later `VACUUM` | page *N* at `(N−1) × page_size` |
+| Oracle | 8 KB | `DB_BLOCK_SIZE` sets the standard block size; a tablespace may be created with another | block offset within a datafile |
+
+Fixed size is what makes the address arithmetic free: no extent map, no offset table, no lookup to
+translate "page 41 200" into a byte position. It is also why the page size is so hard to change
+later — every index entry, every free-space map byte and every log record that names a page assumes
+it.
+
+The maximum is not arbitrary either. PostgreSQL's line pointer packs the in-page offset into 15
+bits, so an offset can address at most 32 767 bytes; that is exactly why `BLCKSZ` tops out at 32 KB.
+
+## The PostgreSQL page header, field by field
+
+Every heap and index page begins with a 24-byte `PageHeaderData`:
+
+| Field | Bytes | What it is |
+|---|---|---|
+| `pd_lsn` | 8 | The WAL position of the last change to this page. Recovery replays a log record only if its LSN is greater than this — and the buffer manager refuses to write the page out until the WAL up to `pd_lsn` is flushed |
+| `pd_checksum` | 2 | Page checksum, verified on read when `data_checksums` is on |
+| `pd_flags` | 2 | `PD_HAS_FREE_LINES`, `PD_PAGE_FULL`, `PD_ALL_VISIBLE` — hints that let the engine skip work |
+| `pd_lower` | 2 | Offset of the **end of the line pointer array** |
+| `pd_upper` | 2 | Offset of the **start of the tuple data** |
+| `pd_special` | 2 | Offset of the special-space area at the end: `BLCKSZ` for heap pages, lower for index pages that keep opaque data there (a B-tree page's sibling links live in its 16-byte special space) |
+| `pd_pagesize_version` | 2 | Page size and layout version, checked on read |
+| `pd_prune_xid` | 4 | Oldest xmax on the page — a hint that pruning might be worth attempting |
+
+Two of those fields are the whole mechanism. **Free space on the page is `pd_upper − pd_lower`**,
+and nothing else. There is no free list, no allocation bitmap, no per-page metadata structure: a
+subtraction of two 16-bit integers in the header.
+
+## Two arrays growing towards each other
+
+Immediately after the header comes an array of 4-byte `ItemIdData` line pointers, growing towards
+higher addresses. Starting from `pd_special` at the other end, tuple bytes are laid down growing
+towards lower addresses. The gap in the middle is the free space.
+
+Inserting a tuple of `len` bytes therefore costs `MAXALIGN(len) + 4` and touches exactly three
+numbers: the new line pointer is written at `pd_lower`, `pd_lower` advances by 4, `pd_upper`
+retreats by `MAXALIGN(len)`. `MAXALIGN` is 8 on every 64-bit platform, so tuples always begin on an
+8-byte boundary and the tuple header's fields can be read without unaligned loads.
+
+The line pointer itself is a packed 32-bit word:
+
+```c
+typedef struct ItemIdData
+{
+    unsigned  lp_off:15,   /* offset to tuple (from start of page) */
+              lp_flags:2,  /* state of line pointer, see below */
+              lp_len:15;   /* byte length of tuple */
+} ItemIdData;
+```
+
+Four states fit in those two bits, and all four are things you will meet in `pageinspect` output:
+
+| `lp_flags` | Meaning | `lp_off` / `lp_len` |
+|---|---|---|
+| `LP_UNUSED` (0) | Free pointer slot, reusable by the next insert on this page | both 0 |
+| `LP_NORMAL` (1) | Points at a real tuple | offset and length of the tuple |
+| `LP_REDIRECT` (2) | Points at *another slot on the same page* — the head of a HOT chain | `lp_off` holds a slot number, `lp_len` is 0 |
+| `LP_DEAD` (3) | The tuple is gone but the pointer must stay | both 0 |
+
+An 8 KB page can hold at most `(8192 − 24) / (24 + 4) = 291` heap tuples — `MaxHeapTuplesPerPage` —
+because the smallest possible tuple is a 23-byte header rounded up to 24 plus its 4-byte pointer.
+That cap is why Postgres can statically size its per-page working arrays — VACUUM's list of dead
+offsets, for instance — at `MaxHeapTuplesPerPage` entries.
+
+:::note[Why `LP_DEAD` exists at all]
+A `LP_DEAD` pointer is 4 bytes holding nothing. It cannot be freed at prune time because index
+entries still store that TID, and an index scan that lands on a recycled slot would silently return
+the wrong row. The pointer is released to `LP_UNUSED` only by VACUUM's second heap pass, which runs
+*after* the index entries naming it have been deleted. This ordering — heap prune, index cleanup,
+then heap slot release — is the entire reason `VACUUM` is two-phase.
+:::
+
+## The indirection is the point
+
+The reason the pointer array exists — rather than tuples simply being laid end to end — is that it
+makes a record's *address* independent of its *position*.
+
+A PostgreSQL TID is `(block number, slot number)`. Every index entry stores one. Every `ctid`
+you have ever selected is one. The slot number is an index into the line pointer array, never a byte
+offset, so:
+
+> **Invariant:** a tuple's byte offset may change at any time while the page is exclusively locked;
+> its slot number may not change for as long as any index entry or `t_ctid` link refers to it.
+
+That invariant is what makes in-page compaction legal. `PageRepairFragmentation` walks the line
+pointer array, collects the live tuples, packs them against `pd_special` in offset order, rewrites
+every `lp_off`, and recomputes `pd_upper`. Modern versions do the packing through a scratch copy of
+the page rather than a sequence of overlapping `memmove`s, because an 8 KB page fits comfortably in
+L2 and a straight copy beats an in-place shuffle. Nothing outside the page observes any of it: not
+one slot number moved.
+
+Press **Prune** and then **Compact** in the editor above and watch it happen — the holes vanish,
+`pd_upper` jumps, the connector lines re-aim at new offsets, and the numbered boxes stay exactly
+where they were.
+
+The two steps are separated in the visual for clarity; in the real engine they are one. Opportunistic
+pruning — triggered on a page whose `pd_prune_xid` suggests there is dead space and which a `SELECT`
+happens to be reading — ends by calling `PageRepairFragmentation` before releasing the lock. The
+details of when a dead tuple becomes prunable, and how HOT chains collapse into `LP_REDIRECT`
+pointers, are the subject of a later page in this module.
+
+:::caution[Holes are free space you cannot spend]
+`PageAddItem` allocates only from between `pd_lower` and `pd_upper`. Bytes released by pruning a
+tuple in the middle of the page are, until compaction runs, completely unusable — the free-space map
+may say the page has room while an insert into it fails. The editor shows this directly: delete a row
+in the middle, prune, and the "contiguous free" stat does not move while "in holes" grows. InnoDB and
+SQLite, which keep an explicit free list, do not have this property.
+:::
+
+## InnoDB: the same idea, a different address
+
+An InnoDB page is a leaf of a clustered index — in InnoDB the table *is* the primary-key B-tree — and
+it is built the other way round. Records grow **up** from the header and the page directory grows
+**down** from the trailer:
+
+- A 38-byte **FIL header** (page number, page type, space id, previous and next page in the level,
+  and the page LSN) and an 8-byte **FIL trailer** at the very end holding a checksum and the low 32
+  bits of the LSN. The trailer LSN must match the header's; that is a torn-page detector, covered
+  properly on the checksums page.
+- A 36-byte **index header** carrying `PAGE_N_DIR_SLOTS`, `PAGE_HEAP_TOP`, `PAGE_N_HEAP`,
+  `PAGE_FREE` (the head of the free-record list), `PAGE_GARBAGE` (bytes on that list),
+  `PAGE_LAST_INSERT`, `PAGE_DIRECTION` and `PAGE_N_RECS` — a running commentary on the page's state
+  that Postgres mostly derives on the fly instead.
+- Two sentinel records, **infimum** and **supremum**, at fixed offsets. Infimum sorts below every
+  possible key, supremum above. They exist so that every scan, insert and search has a record to
+  start from and a record to stop on, with no special case for an empty page or a last record.
+- **User records**, each with a 5-byte `COMPACT` record header (delete-mark bit, `n_owned`,
+  `heap_no`, record type, and a *relative* offset to the next record), plus a 6-byte `DB_TRX_ID`
+  and a 7-byte `DB_ROLL_PTR` on clustered-index rows.
+
+Records sit in the heap in insertion order, but are threaded into a **singly linked list in key
+order** by those next-record offsets, running from infimum to supremum. Switch the editor to InnoDB
+and the arcs under the page show it: the physical order is the order you inserted, the link order is
+the key order.
+
+A linked list is a terrible thing to binary-search, so InnoDB adds the **page directory**: a dense
+array of 2-byte offsets at the end of the page, just in front of the FIL trailer, one slot per group
+of 4 to 8 records, with each group's *owner* record — the highest key in the group — recording its
+group size in `n_owned`. A lookup binary-searches the directory, which is short because it holds
+only a sixth or so of a slot per record, then walks at most eight links. That is the same job
+Postgres's line pointer array does for a *scan*, done for a *search*.
+
+The consequential difference is addressing. **InnoDB has no TID.** A secondary index entry stores
+the primary key of the row, not its location, so a secondary lookup is two descents (secondary index
+→ primary key → clustered index) instead of one dereference. The cost buys total physical freedom:
+`btr_page_reorganize` can rewrite a page in key order, renumber every `heap_no` and rebuild the
+directory without notifying anything outside the page. Postgres pays the opposite way — one
+dereference on a secondary lookup, but a compaction pass that may never renumber a slot, and index
+entries that must be cleaned up before a slot can be reused.
+
+## SQLite: a sorted pointer array and a fragmentation counter
+
+A SQLite b-tree page is the smallest of the three and the most explicit about its own bookkeeping.
+After an 8-byte header (12 on interior pages, and page 1 also carries the 100-byte file header) comes
+the **cell pointer array**: 2-byte big-endian offsets, growing forward. Cells — a varint payload
+length, a varint rowid, then the record — grow backward from the end of the page.
+
+The header is five fields that map exactly onto the mechanism:
+
+| Offset | Bytes | Field |
+|---|---|---|
+| 0 | 1 | Page type: `0x0D` table leaf, `0x05` table interior, `0x0A` index leaf, `0x02` index interior |
+| 1 | 2 | Offset of the first **freeblock**, or 0 if there are none |
+| 3 | 2 | Number of cells |
+| 5 | 2 | Start of the cell content area (a 0 means 65 536) |
+| 7 | 1 | **Fragmented free bytes** |
+
+Two differences from Postgres matter. First, the cell pointer array is kept **sorted by key**, not
+in insertion order, so inserting a low key memmoves the 2-byte pointers after it — which is cheap,
+and which means a search can binary-search the pointer array directly. It also means SQLite's
+pointer index is not a stable address; the row's identity is its rowid.
+
+Second, freed space is tracked, not abandoned. A deleted cell of 4 bytes or more becomes a
+**freeblock** — a 4-byte header of `next` offset and size — chained in offset order, and `allocateSpace`
+will hand it to the next cell that fits. Gaps smaller than 4 bytes cannot hold a freeblock header, so
+their size is simply added to that single byte at offset 7. The format caps the total at 60 bytes;
+past that the page must be defragmented, which repacks the cells against the end of the page and
+resets the counter to zero. It is a slotted page that keeps its own garbage-collection statistics in
+one byte.
+
+## Where it bites in production
+
+- **Fill factor and page splits.** Postgres's heap `fillfactor` defaults to 100 — pack pages
+  completely — and its B-tree default is 90. A table that is updated heavily wants a lower heap
+  fillfactor, because a HOT update needs free space *on the same page*; with no room, the new version
+  lands elsewhere and every index on the table gets a new entry. InnoDB's equivalent knobs are
+  `innodb_fill_factor` for bulk index builds and `MERGE_THRESHOLD` (default 50%) for when to merge a
+  sparse page back.
+- **Wide rows waste I/O.** A 2 KB row in an 8 KB page means at most three tuples per page: a
+  sequential scan moves 8 KB of disk and buffer pool per three rows. Because a tuple cannot span
+  pages, rows above about a quarter of the page get pushed out of line — TOAST in Postgres, overflow
+  pages in InnoDB and SQLite. InnoDB enforces the limit with a hard error you will eventually see:
+  `Row size too large (> 8126)` on a 16 KB page.
+- **Line pointer bloat.** A page that once held 200 tuples keeps 200 line pointers even after all
+  200 are dead, because only *trailing* `LP_UNUSED` pointers can be truncated; a gap in the middle of
+  the array is permanent for the life of the page. This is why a table can stay bloated after
+  `VACUUM` reports plenty of free space, and why `VACUUM FULL` or `pg_repack` — which rewrite pages
+  from scratch — are sometimes the only fix.
+- **Inspect it directly.** `CREATE EXTENSION pageinspect;` then
+  `SELECT * FROM page_header(get_raw_page('t', 0));` for `pd_lower`/`pd_upper`/`pd_lsn`, and
+  `SELECT lp, lp_off, lp_flags, lp_len FROM heap_page_items(get_raw_page('t', 0));` for the slot
+  array — `lp_flags = 2` rows are HOT redirects, `lp_flags = 3` rows are dead pointers waiting on
+  VACUUM. `pgstattuple` gives the same story aggregated. For InnoDB, `innodb_ruby`'s `innodb_space`
+  dumps page directories and record lists; for SQLite, `sqlite3_analyzer` and the `dbstat` virtual
+  table report per-page payload and unused bytes.
+- **The page is also the latch.** Reading a record takes a shared buffer content lock on its page;
+  compacting it takes an exclusive one. Every contention problem that shows up as "hot page" — a
+  monotonically increasing key whose inserts all land on the rightmost leaf, a counter row everybody
+  updates — is a consequence of the page being the unit of concurrency as well as the unit of I/O.
+
+:::note[What to take forward]
+A slotted page is two arrays growing at each other with free space in between, and a header whose
+`pd_lower`/`pd_upper` pair *is* the allocator. The pointer array exists so that a record's address
+(a slot number) survives the record's bytes being moved, which is what makes in-page compaction
+possible without touching a single index. The engines differ in which end each array grows from,
+whether freed space is reusable immediately or only after compaction, and — the choice with the
+longest shadow — whether a row is addressed physically by `(page, slot)` as in PostgreSQL or
+logically by its key as in InnoDB.
+:::

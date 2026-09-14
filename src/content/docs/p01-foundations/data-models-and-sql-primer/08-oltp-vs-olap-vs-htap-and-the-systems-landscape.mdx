@@ -1,0 +1,242 @@
+---
+title: OLTP vs OLAP vs HTAP and the systems landscape
+description: Why the same SQL runs a thousand times faster on a different engine — the row-versus-column crossover, the specialized index families, what HTAP actually buys, and the one-system-of-record-plus-derived-stores architecture almost everyone converges on.
+depth: basics
+sidebar:
+  order: 8
+---
+
+import WorkloadShapeRanker from '../../../../components/viz/WorkloadShapeRanker';
+
+Two workloads written in the same language want opposite machines. One fetches a customer
+and their last three orders, twenty thousand times a second, and touches maybe forty rows
+per request. The other reads two columns out of two hundred, across nine billion rows, and
+is allowed to take a minute. Every structural decision in the rest of this site — page
+layout, index choice, compression, concurrency control, replication topology — follows from
+which of those two you are building for, and the single number that separates them is
+**bytes read per answer**.
+
+<WorkloadShapeRanker client:visible />
+
+## The two shapes, measured
+
+"OLTP" and "OLAP" are unhelpful as acronyms and precise as workload descriptions. The
+distinction is not *transactional versus analytical intent*; it is the shape of the access.
+
+| | OLTP | OLAP |
+|---|---|---|
+| Rows touched per query | 1 to a few hundred, found by index | 10⁶–10¹² , found by scan |
+| Columns touched | most of the row (`SELECT *` is normal) | 2–10 of 50–500 |
+| Latency budget | sub-millisecond to ~10 ms | seconds to minutes |
+| Concurrency | thousands of short statements | tens of long ones |
+| Writes | many small, in place, durable per commit | bulk append, rewrite by partition |
+| The expensive resource | random I/O and lock/latch contention | sequential bandwidth and CPU per value |
+| Working set | the hot tail, ideally resident in the buffer pool | everything, never resident |
+
+A row store optimizes the first column of that table. It stores whole tuples contiguously in
+a page — the **n-ary storage model**, NSM — so one 8 KB read yields every column of every row
+on that page. When you want the whole row, that is exactly right: one random I/O gives you
+the answer. When you want two of two hundred columns, you have still paid for all two
+hundred; the other 198 rode along in the same cache lines and were discarded.
+
+A column store optimizes the second. It splits the relation vertically, storing each
+attribute's values together — the **decomposition storage model**, DSM, named by Copeland and
+Khoshafian in 1985 and made practical by C-Store and MonetDB/X100 twenty years later. A query
+reads only the column files it references, so bytes read scale with *columns touched*, not
+row width.
+
+## Why columns compress and rows don't
+
+The second effect is larger than the first and less obvious. A column is a run of values of
+one type, from one domain, usually correlated with its neighbours — a hundred thousand
+`status` values drawn from six strings, timestamps that increase by a few seconds at a time,
+prices clustered in a narrow band. That is ideal input for dictionary encoding, run-length
+encoding, delta and frame-of-reference encoding, then a general compressor on top (ClickHouse
+defaults to LZ4 per column and will use ZSTD on request). A row is a struct of unrelated
+types; an int next to a UUID next to a timestamp compresses like noise.
+
+So the bytes-read ratio between the two layouts is roughly
+
+```
+row store bytes     rows × row width
+─────────────────  ≈  ───────────────────────────────────────────
+column store bytes  rows × columns touched × column width ÷ CR
+```
+
+with a compression ratio `CR` of 3–10× on real analytic data. Forty columns of 24 bytes,
+three of them touched, compressing 4×: the column store reads roughly 53× fewer bytes for the
+same answer. Drag **columns touched** in the lab from 3 to 40 and that 53× collapses to 4× —
+the compression ratio, all that is left once you are reading every column anyway — exactly as
+the formula predicts.
+
+Three more structures ride on the columnar layout and matter as much as the encoding:
+
+- **Zone maps.** Every block carries min/max (and often null count) per column, so a
+  predicate can skip blocks without decompressing them. ClickHouse's MergeTree keeps one
+  sparse index mark per **granule of 8192 rows**; Parquet keeps statistics per row group
+  (commonly 128 MB) and per page (~1 MB); Snowflake prunes **micro-partitions** of 50–500 MB
+  uncompressed on the same principle. Pruning is only as good as the correlation between the
+  predicate and the physical order, which is why sort keys, clustering keys and partition keys
+  are the tuning surface of every warehouse.
+- **Vectorized execution.** Operators process batches of values rather than one tuple at a
+  time — DuckDB's standard vector is 2048 values — so per-tuple interpreter overhead amortizes
+  and the inner loops become SIMD-friendly. Per-value CPU falls from tens of nanoseconds to
+  low single digits.
+- **Late materialization.** Filters run on the encoded column, producing a selection vector;
+  the remaining columns are only fetched for surviving positions.
+
+The price is symmetric and unavoidable: a column store cannot update a row in place. One row's
+values live in as many places as there are columns, all compressed inside immutable blocks.
+ClickHouse implements `ALTER TABLE … UPDATE` as a *mutation* that rewrites whole parts in the
+background; SQL Server's clustered columnstore takes inserts into a row-oriented **delta
+rowgroup** and only compresses it once it reaches about 1 048 576 rows. That is why the write
+half of the lab flips so hard when you leave the append shape: single-row updates on a column
+store cost hundreds of microseconds of part rewriting against tens of microseconds of B+tree
+maintenance.
+
+## The crossovers you can watch invert
+
+Two crossovers show up in the lab, and both of them show up in real query plans.
+
+**Index scan versus sequential scan, inside one row store.** An index plan costs a tree
+descent plus one random heap fetch per matching row; a sequential scan costs the whole table
+at streaming bandwidth. The index wins while matches are few and loses once they aren't,
+because `matched × random_page_cost` eventually exceeds `table_pages × seq_page_cost` — with
+PostgreSQL's defaults of 4.0 and 1.0, the switch happens at single-digit percent selectivity,
+and a bitmap heap scan occupies the middle ground by sorting the TIDs so the heap is read in
+physical order. Slide selectivity across that point in the lab and the row store's own plan
+label changes under you.
+
+**Row store versus column store, across engines.** Push selectivity down far enough and the
+row store's index plan beats everything, because it reads one page per answer while the column
+store still has to open a granule. Push it up and the column store wins by two to three orders
+of magnitude. The lab prints where the lead changes hands for your current settings; that
+sentence is the entire OLTP/OLAP boundary, and it moves when you change row width, columns
+touched or table size.
+
+:::caution[The numbers in the lab are a model, not a benchmark]
+Every term is real arithmetic over stated constants — one cold random 8 KB read at 25 µs, a
+2 GB/s streaming scan, 2 ns per value in a vectorized loop — but there is no buffer-pool
+warmth, no I/O concurrency and no parallelism in it. Real systems close some of these gaps
+with caching and many cores. The *ordering* and the *crossover positions* are the lesson; the
+absolute times are not.
+:::
+
+## The specialized families
+
+Beyond the two general shapes, several structures exist because a specific access pattern has
+an index that a B+tree cannot provide.
+
+| Family | Structure | Built for | What it cannot do |
+|---|---|---|---|
+| Time-series — Prometheus, InfluxDB, TimescaleDB | Time-partitioned chunks, per-series columnar blocks, delta and XOR encoding (Prometheus cuts head chunks at 120 samples) | Append-only numeric streams; queries over a recent time window with high compression | Arbitrary joins; updating old points means decompressing and rewriting a chunk |
+| Search — Elasticsearch, OpenSearch, Lucene, Postgres GIN | Inverted index: term → posting list of doc ids, plus BKD trees for numeric ranges and columnar **doc values** for sorting and aggregation | Matching text against a query — Postgres spells it `to_tsvector(body) @@ to_tsquery('…')` — plus ranking and faceting | Transactions; read-your-writes (Elasticsearch's default `index.refresh_interval` is 1 s, so a write is invisible to search until the next refresh); cheap updates — a document change is a delete plus a full reindex of every token |
+| Vector — pgvector, Milvus, Qdrant | HNSW proximity graph (pgvector defaults: `m` 16, `ef_construction` 64, `hnsw.ef_search` 40) or IVF lists | Nearest-neighbour search over embeddings in logarithmic-ish hops instead of a full distance scan | Exactness — results are *approximate*, recall is a tuning knob; an insert costs a graph search |
+| Streaming log — Kafka, Redpanda, Pulsar | Append-only partitioned segments, addressed by offset, read with zero-copy sequential I/O | Ordered durable hand-off and replay; fan-out to many independent consumers | Any query at all — no secondary index, no aggregation, no point lookup by key |
+| Cache — Redis, Memcached | In-memory hash table; Redis executes commands on a single thread, Memcached on many | Point reads at network-RTT latency, ahead of any disk-backed engine | Scans and secondary access paths (`SCAN` walks the keyspace); durability is opt-in and bounded |
+| Embedded — SQLite, DuckDB, RocksDB, LMDB | The engine is a library in your process; no server, no network | Zero-latency local access; SQLite for OLTP, DuckDB for OLAP over local Parquet | Multi-writer concurrency across machines — SQLite allows one writer at a time |
+
+Switch the lab's query shape to **Full text** or **Similarity** and the point is stark: the
+row store and the column store are not slightly worse, they are four to six orders of
+magnitude worse, because they have no structure for the predicate and must evaluate it on
+every row. That gap — not vendor preference — is what justifies operating a second system.
+
+## HTAP, and what it actually costs
+
+HTAP ("hybrid transactional/analytical processing", a Gartner coinage from 2014) is the
+attempt to serve both shapes from one system by maintaining both physical layouts:
+
+- **TiDB** keeps the row format in TiKV and adds **TiFlash** columnar replicas that join the
+  Raft group as *learners*, applying the same replicated log. The optimizer costs both and
+  routes per query; analytical reads land on replicas that transactions never touch.
+- **SingleStore** unifies rowstore and columnstore in one table type, with recent rows in a
+  row-oriented segment and older ones compressed columnar behind a seekable index.
+- **Oracle Database In-Memory** is dual-format: the same table exists as row blocks on disk
+  and as an **In-Memory Column Store** in the SGA, populated from those blocks. The column copy
+  is not persisted and is not another durability path — it is a cache with a different layout.
+- **SQL Server** offers columnstore indexes over row tables, including nonclustered
+  columnstore for exactly this hybrid case; **MySQL HeatWave** attaches an in-memory column
+  engine to InnoDB.
+
+All of them pay in the same three places, and you can see the first in the lab. Writes get
+more expensive because every row must be applied to both layouts and, in the distributed
+cases, replicated to extra nodes. Resource isolation becomes the operational problem: a
+runaway analytical query still competes for CPU, memory and network with the transactions
+that fund the business, and the isolation mechanisms are scheduler knobs rather than physics.
+And freshness is a dial, not a guarantee — the columnar side is some distance behind, whether
+that distance is a Raft learner's apply lag or a delta rowgroup waiting to compress.
+
+HTAP is a real answer for a real class of problems: operational analytics on fresh data,
+where a five-minute-old copy would be useless and the analytical volume is moderate. It is not
+the general answer, because it makes the hardest thing about the architecture — isolation
+between a workload with a 5 ms budget and one with a 5 minute budget — an internal concern of
+a single process.
+
+## The deployment nearly everyone converges on
+
+The usual answer is not one system. It is **one system of record plus derived stores**, and
+the connective tissue is the write-ahead log you already have.
+
+The system of record is a row store: PostgreSQL, InnoDB, or a distributed equivalent. It owns
+the constraints, the transactions and the only writable copy of the truth. Its log is then
+read by change data capture — PostgreSQL logical decoding through a replication slot with the
+`pgoutput` plugin, MySQL's row-based binlog, usually via Debezium — and published, typically
+into Kafka. Every other store subscribes: the column store for analytics, the search index for
+text, the vector index for embeddings, the cache for hot reads. The strip under the lab's
+ranking shows where the winning family sits in that picture.
+
+The properties that make this the default are worth stating explicitly:
+
+- **Every derived store is rebuildable.** Drop it, replay the log or re-snapshot the source,
+  and it comes back. That means schema changes, engine upgrades and migrations are routine
+  rather than terrifying, because nothing unique lives there.
+- **There is exactly one writer of truth**, so constraints and transactions have a single
+  place to be enforced. The alternative — the application writing to the database *and* the
+  search index *and* the cache, so-called dual writes — has no atomicity across the two and
+  drifts permanently the first time one call fails. The **transactional outbox** (write the
+  event to a table in the same transaction, publish from the log) is the standard repair.
+- **Each store is chosen per access shape**, which is the lab's whole argument turned into an
+  architecture.
+- **The cost is a consistency window.** Derived stores are eventually consistent, delivery is
+  at-least-once (so consumers must be idempotent), and ordering is per partition, not global.
+  Read-your-own-writes for a freshly indexed document is something you engineer, not something
+  you get.
+
+## Where it bites in production
+
+- **Reporting queries on the OLTP primary.** A 40-minute analytical query holds an open
+  snapshot, which pins the `xmin` horizon, which stops autovacuum from reclaiming *any* dead
+  tuple newer than it. Tables bloat, index scans slow down, and the trigger is invisible in
+  query latency until it isn't. Watch `backend_xmin` in `pg_stat_activity` and the
+  `oldest_xmin` reported by vacuum; InnoDB's equivalent symptom is a growing history list
+  length in `SHOW ENGINE INNODB STATUS`.
+- **Moving those queries to a replica moves the problem.** With `hot_standby_feedback = on`
+  the replica's snapshot pins the primary's horizon anyway; with it off, long queries die with
+  `canceling statement due to conflict with recovery` once `max_standby_streaming_delay` is
+  exceeded. Pick which of the two failures you want.
+- **A replication slot with no consumer fills the primary's disk.** A slot guarantees the WAL
+  is retained until the subscriber acknowledges it. Stop a CDC connector on a Friday and you
+  can be woken by `pg_wal` exhausting the volume. `max_slot_wal_keep_size` bounds it at the
+  cost of invalidating the slot — and re-seeding the derived store.
+- **Row-at-a-time inserts into a column store.** Every small insert creates a part or
+  rowgroup; merges cannot keep up, and ClickHouse eventually refuses writes outright with
+  *Too many parts* once a partition exceeds `parts_to_throw_insert`. The fix is batching —
+  thousands of rows per insert, or asynchronous inserts that batch server-side.
+- **A search index or cache used as the system of record.** No transactions, no constraints,
+  no foreign keys, a refresh delay between write and visibility, and a mapping you cannot
+  change without a full reindex. The day it is the only copy of something is the day you
+  learn which of those matters most.
+- **The "just add an index" reflex on an analytical query.** A report touching six columns
+  over the whole table cannot be fixed with a B+tree; it needs a different layout. Index
+  sprawl instead adds `1 + secondary_indexes` random write amplification to every insert on
+  the hot path — the lab's writes-per-row number — to speed up nothing.
+
+:::note[What to take forward]
+The workload shape decides the engine, and the shape is captured by two numbers: how many rows
+an answer touches, and how much of each row it needs. Few rows and all columns wants a row
+store with a B+tree; all rows and few columns wants a compressed columnar layout with zone
+maps and vectorized execution; predicates a B+tree cannot answer — text, similarity, ordered
+streams — want their own index family. HTAP buys freshness by maintaining both layouts and
+charges you in write cost and isolation; the common alternative is one system of record whose
+log feeds derived stores you can always throw away and rebuild.
+:::

@@ -1,0 +1,285 @@
+---
+title: Dirty pages, write-back and the WAL-before-data rule
+description: The dirty bit, recLSN and pageLSN in a frame descriptor, the XLogFlush that must happen before any page write, InnoDB's flush list as the checkpoint LSN, and who actually does the writing — backends, background writer, checkpointer, page cleaner.
+depth: intermediate
+sidebar:
+  order: 6
+---
+
+import DirtyPageWriteBackLab from '../../../../components/viz/DirtyPageWriteBackLab';
+
+A modified page is the only copy of that change that exists in a form anyone can read, and it
+lives in volatile memory attached to a frame that some other query wants for something else.
+Everything on this page is the bookkeeping that lets the pool hand that frame away safely: one
+bit that says the copy differs from disk, two LSNs that say *how* it differs, and one rule —
+the log must be durable through the page's LSN before the page may be written — that turns
+"evict whatever you like, whenever you like" from a corruption bug into a performance decision.
+
+<DirtyPageWriteBackLab client:visible />
+
+## One bit and two LSNs
+
+The [frame descriptor](/p02-storage-engines/buffer-pool/01-buffer-pool-structure-frames-page-table-and-pins/)
+carries the dirty bit. In PostgreSQL it is `BM_DIRTY`, one flag inside the descriptor's single
+atomic `state` word alongside `BM_VALID`, `BM_IO_IN_PROGRESS`, `BM_CHECKPOINT_NEEDED` and the
+usage count; `MarkBufferDirty()` sets it, and the WAL coding rules in `access/transam/README` require it to
+be set *before* `XLogInsert()`, inside the critical section, with the buffer's content lock held
+in exclusive mode — otherwise a concurrent checkpoint could see the buffer clean and skip a page
+whose change it had already logged past the redo point. InnoDB has
+no separate bit: a page is dirty exactly when its `buf_page_t::oldest_modification` is non-zero,
+and it is on the flush list.
+
+The LSNs are where the real information is.
+
+- **pageLSN** — PostgreSQL's `pd_lsn`, the first 8 bytes of the page; InnoDB's `FIL_PAGE_LSN`
+  at byte 16 — is the **end LSN of the most recent log record applied to this page**. It is
+  stamped into the in-memory page when the change is made, not when the page is written. This
+  is the field the [WAL primer](/p01-foundations/anatomy-of-a-database-engine/07-wal-primer-log-records-lsns-and-log-before-page/)
+  introduced; here it is the thing that gates I/O.
+- **recLSN** — InnoDB's `oldest_modification`; the ARIES literature calls it the recovery LSN —
+  is the LSN at which this page *first* became dirty since it was last written. It is set on the
+  clean→dirty transition and cleared on write-back. PostgreSQL does not store it per buffer at
+  all, which is the single structural difference that the rest of this page keeps returning to.
+
+A hot page updated a thousand times carries a recLSN from an hour ago and a pageLSN from a
+microsecond ago. The first says how far back recovery must start; the second says how far the log
+must be flushed before the page may leave.
+
+:::note[Writing a page does not evict it]
+Write-back and replacement are separate. Flushing a dirty frame makes it *clean*; the page stays
+in the pool, still cached, still hot, and now cheap to evict later because eviction of a clean
+frame is a pure bookkeeping operation with no I/O. Almost all background flushing exists to
+create clean frames, not to free memory.
+:::
+
+## The barrier: XLogFlush inside FlushBuffer
+
+The rule has exactly one enforcement point per engine, and it is worth reading the shape of the
+PostgreSQL one because it is four lines:
+
+```c
+/* Force XLOG flush up to buffer's LSN.  This implements the basic WAL rule... */
+recptr = BufferGetLSN(buf);
+if (buf_state & BM_PERMANENT)
+    XLogFlush(recptr);
+```
+
+`FlushBuffer()` calls this before it hands the block to `smgrwrite()`. `XLogFlush()` returns
+immediately if the WAL is already durable past `recptr`; otherwise the caller waits on the same
+`fdatasync` a committing transaction would wait on. InnoDB's page cleaner does the identical
+thing by a different name: `buf_flush_page()` calls `log_write_up_to()` for the page's
+newest modification LSN before the write is issued.
+
+Three details make this cheaper in practice than it looks.
+
+**Most page writes force nothing.** The log's flushed pointer advances on every commit and on
+the WAL writer's own 200 ms cycle (`wal_writer_delay`), so by the time a background flusher gets
+to a page it was usually dirtied seconds ago and the log passed it long since. Press **Evict a
+dirty frame** in the lab repeatedly: the *most recently* dirtied page costs a forced flush, and
+the very next eviction usually costs nothing, because the flush you were just charged for
+covered every page stamped below that LSN too. `XLogNeedsFlush()` is the cheap predicate for
+exactly this question, and PostgreSQL consults it before deciding whether a nondefault strategy
+should accept a victim at all — which is how the [bulk-read ring](/p02-storage-engines/buffer-pool/05-scan-resistance-sequential-flooding-ring-buffers-and-midpoin/)
+avoids turning a sequential scan into a write-and-flush storm.
+
+**`BM_PERMANENT` is a real exemption.** Unlogged tables and temporary relations generate no WAL,
+so their buffers skip the flush entirely. So does a page dirtied only by hint bits: no WAL record
+was written, the pageLSN did not move, and the write goes out with no log I/O — the reason
+`wal_log_hints` (and `data_checksums`, which implies it) measurably increases WAL volume is that
+it takes this exemption away.
+
+**The flush is amortized across the whole pool.** A forced `XLogFlush` pushes the log to *at
+least* the requested LSN, in practice to the end of whatever is in the WAL buffers: one unlucky
+writer pays, everyone behind it is free.
+
+What the rule buys is the **steal** policy. The pool may evict a page belonging to a transaction
+that has not committed, because the log describing the change is already on disk and recovery
+can undo it. Break the rule and a crash leaves a page on disk carrying a change no log record
+describes: redo has nothing to replay, undo has nothing to roll back, and no checksum or
+consistency check will ever notice, because the page is internally perfectly well-formed.
+
+:::caution[The write itself is still not atomic]
+The barrier orders the log against the page; it says nothing about the page arriving whole. An
+8 KB or 16 KB page write can tear across sector or stripe boundaries, which is why PostgreSQL
+logs a full-page image on the first change to each block after a checkpoint and InnoDB writes
+every page twice — once into the doublewrite files, once into the tablespace. Both taxes exist
+because a page write is not a transaction. See
+[checksums and corruption detection](/p02-storage-engines/pages-tuples-heap-files/06-checksums-corruption-detection-and-on-disk-format-evolution/).
+:::
+
+## Who fsyncs the page? Nobody, yet
+
+`smgrwrite()` is a `pwrite()` into the OS page cache (unless `io_direct` is set, and InnoDB's
+usual `innodb_flush_method = O_DIRECT` skips it). The durability of the *data* file is not the
+writer's problem: PostgreSQL backends and the background writer register a sync request with the
+checkpointer (`RegisterSyncRequest`, absorbed into the checkpointer's `pendingOps` table) and
+walk away. Only the checkpoint fsyncs, at the end, in one pass over the files that were touched.
+If the request queue is full the backend performs the fsync itself — historically counted as
+`buffers_backend_fsync`, and always a sign the checkpointer is behind.
+
+That deferral is why a checkpoint has two phases with very different costs, and why
+`log_checkpoints` (on by default since PostgreSQL 15) prints `write=…s` and `sync=…s`
+separately. A long `write` time is the pacing working as designed. A long `sync` time is the
+kernel dumping several gigabytes of accumulated dirty page cache at the device in one go —
+which is what `checkpoint_flush_after` (256 kB) attacks, by issuing `sync_file_range()` hints as
+the writes go out so writeback trickles rather than arrives.
+
+## The flush list is where recovery starts
+
+Recovery must begin at an LSN before which *every* change is already on disk. That LSN is the
+minimum recLSN over all dirty pages in the pool, and the two engines compute it in structurally
+different ways.
+
+**InnoDB keeps the answer materialized.** The flush list is a list of dirty pages ordered by
+`oldest_modification`; the page cleaner drains it from the old end, so the head of that list is
+the oldest unflushed change in the entire buffer pool and the checkpoint LSN is essentially its
+LSN. Flushing one page from the head moves the checkpoint forward; flushing a hundred pages from
+anywhere else moves it not at all. (MySQL 8.0 relaxed the strict ordering — mini-transactions
+append concurrently — so the checkpoint LSN is bounded by both the oldest modification and the
+LSN up to which dirty-page additions are known complete, the `Added dirty pages up to` line in
+`SHOW ENGINE INNODB STATUS`.) Checkpointing in InnoDB is therefore not an event; it is a number
+that creeps forward continuously, and "taking a checkpoint" is just writing that number into the
+redo log header.
+
+**PostgreSQL computes the answer by scanning.** There is no flush list. A checkpoint records the
+current insert position as the **redo point**, `BufferSync()` walks all of `shared_buffers`
+setting `BM_CHECKPOINT_NEEDED` on every currently-dirty buffer, and that snapshot is written out.
+Recovery starts at the redo point of the last *completed* checkpoint — `pg_controldata`'s
+*Latest checkpoint's REDO location* — so it advances in steps, not continuously. Switch the lab
+to PostgreSQL and watch the recovery-start marker: it sits still while hundreds of pages are
+written, then jumps when the checkpoint finishes.
+
+| | PostgreSQL | InnoDB |
+|---|---|---|
+| Per-frame recLSN | not stored | `oldest_modification` |
+| Dirty set | found by scanning all buffers | the flush list, LSN-ordered |
+| Write order | sorted by tablespace, relation, fork, block (since 9.6), round-robin across tablespaces | flush-list order, from the oldest end |
+| Recovery start | redo point of the last completed checkpoint | checkpoint LSN ≈ head of the flush list |
+| Moves | in steps, at checkpoint completion | continuously, as the cleaner drains |
+| Bound | `max_wal_size` (1 GB), `checkpoint_timeout` (5 min) | `innodb_redo_log_capacity` (100 MB) |
+
+The sorted-write detail matters more than it sounds. Postgres's checkpoint set is in hash-table
+order, which on a spinning disk or a network volume is the worst possible write pattern; sorting
+it by file and block turns thousands of random writes into a sequential sweep per relation. The
+price is that the checkpoint cannot prioritize by age — it has no age to prioritize by.
+
+## Four writers, and you want three of them idle
+
+| Writer | Engine | Writes | Knob | Default |
+|---|---|---|---|---|
+| Checkpointer | PG | the whole dirty snapshot, sorted | `checkpoint_timeout`, `max_wal_size`, `checkpoint_completion_target` | 5 min, 1 GB, 0.9 |
+| Background writer | PG | a few frames just ahead of the clock hand | `bgwriter_delay`, `bgwriter_lru_maxpages`, `bgwriter_lru_multiplier` | 200 ms, 100, 2.0 |
+| Backend | PG | its own victim, inline, on the query's latency | — | — |
+| Page cleaner | InnoDB | flush list (by LSN) and LRU tail (for free frames) | `innodb_page_cleaners`, `innodb_io_capacity`, `innodb_lru_scan_depth` | 4, 200, 1024 |
+| User thread | InnoDB | single-page flush when no free frame is available | — | — |
+
+The two default numbers are worth staring at. PostgreSQL's background writer can emit at most
+`bgwriter_lru_maxpages` per `bgwriter_delay` round — 100 pages five times a second, 4 MB/s.
+InnoDB's `innodb_io_capacity` of 200 pages/s is 3 MB/s at a 16 KB page. Both defaults were set
+for storage that no longer exists. On NVMe they mean the background writers are structurally
+incapable of keeping up, and the shortfall is made up by the two rows you do not want: backends
+and user threads writing pages inline.
+
+That is the number to watch. In the lab, drop the flush budget below the write rate and the
+violet **backend** band in the timeline grows until it dominates: every one of those is a query
+that asked for a page, found no clean frame, and had to write somebody else's dirty page — and
+sometimes flush the WAL — before it could proceed. In production it is `pg_stat_io` (PostgreSQL
+16+, and the only place left after `pg_stat_bgwriter.buffers_backend` was removed in 17) against `buffers_clean` and the checkpointer's
+`buffers_written`, or `Innodb_buffer_pool_wait_free` climbing away from zero.
+
+## Pacing: spread the writes, or take the spike
+
+A checkpoint that writes everything as fast as it can is a self-inflicted I/O storm. Both engines
+solve it by spreading, and both let you turn the spreading off.
+
+PostgreSQL's `checkpoint_completion_target` (0.9 since version 14) says: finish writing the
+checkpoint's buffers by 90% of the way to the next one. `IsCheckpointOnSchedule()` computes
+progress as whichever is further along — elapsed time as a fraction of `checkpoint_timeout`, or
+WAL consumed as a fraction of `max_wal_size` — and the checkpointer sleeps between writes
+(`CheckpointWriteDelay`) to stay on that line. Set the target low in the lab and the timeline
+turns into a periodic wall of checkpointer writes with idle troughs between.
+
+InnoDB's equivalent is adaptive flushing. When the checkpoint age passes
+`innodb_adaptive_flushing_lwm` (10% of redo capacity) or the dirty ratio passes
+`innodb_max_dirty_pages_pct_lwm` (10), the cleaner begins flushing; the rate rises with both,
+smoothed over `innodb_flushing_avg_loops` (30) iterations, up to `innodb_io_capacity` and beyond
+it to `innodb_io_capacity_max` (2000) when it is behind. `innodb_max_dirty_pages_pct` (90) is the
+hard ceiling at which it flushes flat out. Turn adaptive flushing off in the lab and you get the
+pathological shape directly: nothing, nothing, nothing, then a cliff.
+
+One InnoDB knob that used to matter and now usually does not: `innodb_flush_neighbors` writes the
+other dirty pages in the same extent along with the target, to build one sequential write out of
+several. Its default changed to 0 in MySQL 8.0 — on SSDs the extra writes cost more than the
+seeks they save.
+
+## The stall
+
+Redo space is finite and circular. InnoDB cannot overwrite a redo record that the checkpoint LSN
+has not yet passed, so as the **checkpoint age** — `Log sequence number` minus `Last checkpoint
+at` in `SHOW ENGINE INNODB STATUS` — approaches `innodb_redo_log_capacity`, it stops being a
+metric and starts being a brake. Classically, at 7/8 of the maximum age InnoDB begins async
+preflushing; at 15/16 it goes synchronous and user threads are held in `log_free_check()` until
+the cleaners catch up. Drive the lab's write rate above the I/O capacity with a small redo
+capacity and you can watch the whole sequence: age climbs, the bar turns amber, then red, the
+workload rate visibly collapses, and the timeline shows the cleaners flushing at maximum.
+
+The symptom in production is unmistakable once you have seen it: throughput that falls off a
+cliff periodically under a write-heavy load, with no slow query, no lock wait, and idle CPU. The
+error log often says it outright:
+
+```
+InnoDB: page_cleaner: 1000ms intended loop took 4013ms. The settings might not be optimal.
+(flushed=1000 and evicted=0, during the time.)
+```
+
+The fix is almost always a larger `innodb_redo_log_capacity` — more room means the cleaners can
+smooth their work over a longer window — and a realistic `innodb_io_capacity`. A faster disk
+does not help if the engine is only willing to issue 200 writes a second.
+
+PostgreSQL has no writer throttle, and it fails differently. Exceed `max_wal_size` and a
+checkpoint is *requested* rather than waited for, so the pressure comes out as I/O and as
+full-page images: more checkpoints mean more first-touches per block, and WAL volume can double
+or triple. The tell is in the log:
+
+```
+LOG:  checkpoints are occurring too frequently (9 seconds apart)
+HINT:  Consider increasing the configuration parameter "max_wal_size".
+```
+
+Note that `max_wal_size` is a bound on total WAL on disk, not on the checkpoint interval:
+PostgreSQL divides it by roughly `2 + checkpoint_completion_target` to decide when to request a
+checkpoint, so a 1 GB setting triggers at around 350 MB of WAL.
+
+## Where it bites in production
+
+- **Backend writes climbing.** `pg_stat_io` write counts for regular backends, or
+  `Innodb_buffer_pool_wait_free` above zero, mean foreground threads are doing background work.
+  Raise `bgwriter_lru_maxpages` / `innodb_io_capacity` first; if the dirty ratio is the real
+  problem, the pool is too small for the write set.
+- **Checkpoint sync time, not write time.** `checkpoint complete: … write=270.0 s, sync=18.4 s`
+  is a kernel writeback stall at the fsync, not a database problem you can tune away with
+  `checkpoint_completion_target`. Lower `checkpoint_flush_after`, or lower the host's
+  `vm.dirty_background_bytes` so the page cache never accumulates that much.
+- **A dirty-page count that never falls.** `SELECT count(*) FROM pg_buffercache WHERE isdirty`
+  (or `pg_buffercache_summary()` in 16+), or `Innodb_buffer_pool_pages_dirty` pinned near
+  `innodb_max_dirty_pages_pct` of the pool, means flushing is capacity-bound. Every eviction from
+  here is a write.
+- **Recovery that takes far longer than the checkpoint interval suggests.** In PostgreSQL, redo
+  starts at the *last completed* checkpoint's redo point — a checkpoint that takes four minutes
+  of a five-minute cycle leaves you replaying nearly two intervals. In InnoDB the equivalent
+  quantity is the checkpoint age at the moment of the crash, which is visible live.
+- **WAL volume spiking after a tuning change.** Shortening `checkpoint_timeout` or lowering
+  `max_wal_size` to make recovery faster multiplies full-page images. `pg_waldump --stats`
+  reports FPI bytes separately; check it before and after.
+
+:::note[What to take forward]
+A frame's dirty bit says the memory copy differs from disk; its pageLSN says by how much, and no
+writer may issue the page write until the log is durable through that LSN — that single check
+inside `FlushBuffer()` and `log_write_up_to()` is what makes stealing frames from uncommitted
+transactions safe. The oldest recLSN among dirty frames is where recovery would start: InnoDB
+keeps it materialized as the head of the LSN-ordered flush list and advances it continuously,
+while PostgreSQL rediscovers it by scanning the pool each checkpoint and advances it in steps.
+Everything else — completion targets, `innodb_io_capacity`, adaptive flushing — is pacing, and
+the failure mode is always the same shape: the writers fall behind, the checkpoint age grows
+into the redo capacity, and the engine takes back the throughput you were borrowing.
+:::

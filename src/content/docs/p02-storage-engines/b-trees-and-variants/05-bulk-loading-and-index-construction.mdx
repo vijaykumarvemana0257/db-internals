@@ -1,0 +1,215 @@
+---
+title: Bulk loading and index construction
+description: Why CREATE INDEX sorts the whole table first and writes the tree bottom-up, what that costs against N repeated inserts, and why the result is exactly full and physically ordered.
+depth: intermediate
+sidebar:
+  order: 5
+---
+
+import IndexBuildRaceLab from '../../../../components/viz/IndexBuildRaceLab';
+
+There are two ways to get N keys into a B+tree: descend from the root N times and split as you
+go, or sort the keys once and lay the tree down from the leaves up. They produce trees with the
+same search behaviour and almost nothing else in common — different height, different page
+utilization, different physical order, and build times that differ by two orders of magnitude on
+anything larger than memory. Every engine's `CREATE INDEX` takes the second path, and knowing
+exactly what it does is what lets you predict a migration window and explain why an index built
+by inserts is about 30% larger than the same index rebuilt.
+
+<IndexBuildRaceLab client:visible />
+
+## What repeated insertion actually costs
+
+Each insert is an independent descent: read the root, binary-search it, read a level-1 page,
+read the leaf, insert. The internal levels are a rounding error of the index — a two-level
+internal structure over a million leaves is a few thousand pages — so they stay in the buffer
+pool and cost nothing after warm-up. The leaf is the problem. With random keys the leaf you want
+is uniformly distributed over the whole index, so once the index is larger than the pool the hit
+rate collapses to roughly `pool_size / index_size` and every insert pays a random page read, then
+a random page write when that dirty page is eventually evicted. Set the lab's cache control to
+"pool holds 5%" and watch the modeled build time: the CPU work is unchanged and the wall clock
+goes up by nearly two orders of magnitude.
+
+On top of that, the tree keeps reorganizing itself while you insert. A leaf that overflows splits,
+and PostgreSQL's `_bt_findsplitloc` (in `nbtsplitloc.c`) applies a rule that matters here: the
+*rightmost* page of a level splits at that level's fill factor — the index's `fillfactor` for
+leaves, `BTREE_NONLEAF_FILLFACTOR` for internal pages — and every other page splits as close to
+50/50 by space as it can. Random arrival order therefore leaves every page somewhere between half
+full and full, and the steady-state average is a constant that has been known since Yao's 1978
+analysis of random B-trees: **ln 2 ≈ 69%**. Run the lab with random keys at any key width and the
+mean leaf fill settles right around 70% — it is a property of the split rule, not of your data.
+
+Two more costs travel with each split. It allocates a page at the *end* of the file, so the right
+half of a key range lands at a physically unrelated block; after a few hundred thousand inserts the
+correlation between key order and block number is zero, which is what the scatter plot in the lab
+is showing. And the split is WAL-logged as a structural change: the insert itself logs a few dozen
+bytes, but a split logs enough to rebuild both halves. See
+[Insert, split, delete and merge](/p02-storage-engines/b-trees-and-variants/02-insert-split-delete-and-merge/)
+for the split mechanics and
+[Fill factor, fragmentation and splits under load](/p02-storage-engines/b-trees-and-variants/04-fill-factor-fragmentation-and-splits-under-load/)
+for what that utilization does over a workload's lifetime.
+
+The one case that escapes most of this is a strictly ascending key. Every insert lands on the same
+rightmost leaf, which is always in the pool, and every split is a rightmost split that seals the
+left page at `fillfactor` and starts a fresh one. Choose "strictly ascending" in the lab: the fill
+snaps to the `fillfactor` you set, the correlation snaps to 1.00, and the build is CPU- and WAL-bound rather
+than I/O-bound. But it is still N descents and N WAL records — the shape is right, the cost is not.
+And the escape is fragile: switch to "near-ascending", where keys climb but arrive with a small
+window of disorder (`now()` from many concurrent sessions, a sequence read by many writers), and
+the hot page usually is *not* the rightmost one. A plain 50/50 split there is wasted work — the
+insertion point moves past before the right half refills — so utilization can land *below* the
+random-insert figure while the physical ordering stays perfect. This is exactly the case PostgreSQL
+12 added a heuristic for: when `_bt_findsplitloc` detects that inserts into a page are marching
+rightwards, it splits immediately after the newly inserted tuple instead of down the middle, leaving
+the left page packed. The lab models the plain 50/50 rule, so it shows the pathology the heuristic
+exists to remove; how much you actually see depends on how wide the disorder window is relative to
+a page.
+
+## The bottom-up build
+
+`CREATE INDEX` does not insert anything. In PostgreSQL the whole of `src/backend/access/nbtree/nbtsort.c`
+implements one pipeline:
+
+1. **Scan the heap** and form an index tuple per live row, feeding them into a `tuplesort`.
+   The sort key is the index's operator class ordering, and since PostgreSQL 12 the heap TID is a
+   de-facto final key column, so equal keys have a total order rather than an arbitrary one.
+2. **Sort.** If everything fits in `maintenance_work_mem` (default 64 MB) it is one quicksort of an
+   in-memory array and no file is ever created. Otherwise tuplesort fills memory, sorts, and writes
+   that batch out as a **run** to a temp tape under `base/pgsql_tmp`, then starts again. Drag the
+   lab's `maintenance_work_mem` slider and watch the run count move: runs ≈ participants ×
+   ⌈sort bytes ÷ `maintenance_work_mem`⌉.
+3. **Merge.** The runs are merged with a heap. Each run needs a read buffer in memory, so the merge
+   fanout is bounded by `maintenance_work_mem`; when the run count exceeds it the sort needs more
+   than one pass, which is rare at modern settings and expensive when it happens. Because the
+   builder only ever reads forward, the final merge is not materialized — it streams straight into
+   the next step. The full treatment is in
+   [External sort and sort-merge join](/p03-query-processing/physical-operators/03-external-sort-and-sort-merge-join/).
+4. **`_bt_load`.** The builder keeps **one in-progress page per level** — a `BTPageState` stack, so
+   peak memory here is a handful of pages regardless of index size. Sorted tuples are appended to
+   the current leaf until it reaches `fillfactor`; that page is then sealed, given a right-link to
+   its successor, and written. Sealing a child is what produces a parent entry: the child's high
+   key (the separator between its last key and its right sibling's first key, suffix-truncated as
+   described in [Key layout, prefix compression and suffix truncation](/p02-storage-engines/b-trees-and-variants/06-key-layout-prefix-compression-and-suffix-truncation/))
+   is appended to the level above, which fills and seals by the same rule. Non-leaf pages use
+   `BTREE_NONLEAF_FILLFACTOR`, a fixed 70% — downlinks are the pages most likely to need room for a
+   later insert, and they are a tiny fraction of the index.
+5. **Shut down the stack.** When the input is exhausted every level's partial page is flushed, the
+   topmost becomes the root, and the metapage is written to block 0 pointing at it. Then one fsync.
+
+Every page in the finished index is written **exactly once**, in ascending block order, and never
+read back. There is no split, no page ever revisited, no random I/O at all after the heap scan.
+WAL-wise the build emits a full-page record per new page via `log_newpage`, unless `wal_level` is
+`minimal` and the relation was created in the same transaction, in which case the build skips WAL
+entirely and fsyncs the finished relation instead.
+
+## The cost model
+
+| | Repeated inserts | Bottom-up build |
+|---|---|---|
+| CPU | N descents, each O(log<sub>F</sub> N) page searches | N log N comparisons, once |
+| I/O, index > memory | ~N random reads + ~N random writes | ⌈N/B⌉ sequential reads of the heap + 2 sequential passes over the sort per merge pass + N/F sequential page writes |
+| External-memory bound | Θ(N log<sub>F</sub> N) block transfers | Θ((N/B)·log<sub>M/B</sub>(N/B)) for the sort, then Θ(N/F) — see [the external-memory model](/p02-storage-engines/b-trees-and-variants/08-why-fanout-b-the-external-memory-model-optimality-bounds-and/) |
+| Page splits | ~N/(F·ln 2) | none |
+| Leaf utilization | ln 2 ≈ 69% (random), `fillfactor` (strictly ascending) | exactly `fillfactor` |
+| Key order vs block order | uncorrelated | identical |
+| WAL | one record per insert plus a heavy record per split | one full-page record per page, or none at `wal_level = minimal` |
+
+The random-I/O row is where the two orders of magnitude live. The sort touches more bytes than the
+insert path does — it reads the whole heap and may write and re-read the entire key set — but every
+one of those bytes moves sequentially, at a per-page cost roughly fifteen times smaller than a
+random read on NVMe and well over a hundred times smaller on a spinning disk.
+Bulk loading is not a way to do less work; it is a way to convert random work into sequential work,
+the same trade that produces LSM trees.
+
+## Parallelism, and what it does not parallelize
+
+PostgreSQL 11 added parallel B-tree builds, bounded by `max_parallel_maintenance_workers`
+(default 2). Workers take disjoint blocks of a parallel sequential scan, each sorts its own share,
+and the leader — which also participates — merges the workers' tapes and runs `_bt_load` alone.
+Three consequences follow, and the lab's worker slider shows all three:
+
+- `maintenance_work_mem` is **divided among the participants**. Four workers plus the leader means
+  five sorts of a fifth of the data with a fifth of the memory each — the ratio that decides
+  whether you spill is unchanged, but the total number of runs the leader must merge goes up.
+- A parallel build always writes temp files, because each worker materializes its output on a tape
+  for the leader to merge. A build that would have been a single in-memory quicksort becomes an
+  external sort the moment you add a worker.
+- Only the scan and the sort scale. The merge and the leaf-writing phase are single-threaded, so
+  the build has a hard floor at the time it takes to write N/F pages sequentially.
+
+## Other engines
+
+| Engine | Bulk path | Knobs |
+|---|---|---|
+| PostgreSQL | `tuplesort` + `_bt_load`, parallel sort | `maintenance_work_mem`, `max_parallel_maintenance_workers`, `fillfactor` (default 90), `temp_file_limit` |
+| InnoDB | Sorted index build, added in 5.7: rows are scanned, merge-sorted, then written into whole pages — 5.6 also sorted first, but then inserted the sorted rows one at a time through the normal index-insert path | `innodb_fill_factor` (default 100, which still reserves 1/16 of a clustered leaf), `innodb_sort_buffer_size` (1 MB), `innodb_tmpdir`; 8.0.27 added multi-threaded builds via `innodb_ddl_threads` / `innodb_ddl_buffer_size` |
+| SQLite | An external merge sorter, then appends in key order — every insert becomes a rightmost insert | `PRAGMA cache_size`, the sorter's thread/PMA settings |
+| SQL Server | Sort then build; the sort can be redirected off the user database | `SORT_IN_TEMPDB = ON`, `FILLFACTOR`, `MAXDOP` |
+| Oracle | Sort-based build, optionally unlogged and parallel | `PCTFREE` (default 10), `NOLOGGING`, `PARALLEL`, `ALTER INDEX … REBUILD` |
+
+InnoDB's default of `innodb_fill_factor = 100` is worth pausing on next to PostgreSQL's `fillfactor`
+of 90. InnoDB's clustered index *is* the table, so a sorted rebuild that packs leaves to 100% is
+packing your rows, and the first update that grows a row splits a page. The knob is the same bet in
+both engines: how much of tomorrow's insert traffic do you expect to land in the middle of the key
+space.
+
+## What the shape buys you afterwards
+
+The build hands you three properties that repeated insertion never does.
+
+**Exactly `fillfactor`, by construction.** Nothing splits, so nothing is left at 50%. At the default
+90 the same keys occupy 0.69/0.90 of the pages — a bottom-up index is about 23% smaller than one
+built by random inserts — fewer pages to cache, fewer to scan, and occasionally one level less to
+descend.
+
+**Key order is block order.** Leaves are appended as they are sealed, so a full index scan or a wide
+range scan reads the file front to back (parent pages are interleaved as they are sealed, but they
+are a percent or two of the file). Sequential readahead works, and in the lab the modeled full-index
+scan for the bottom-up tree is the sequential-transfer cost while the insert-built tree pays a random
+read per leaf. Note that the planner does not see *this* correlation: `pg_stats.correlation` is the
+key's order against **heap** block order, which an index build does not change. A freshly restored
+database gets a high correlation from the restore having written the heap in key order, which is a
+different effect with the same flavour — and the reason the same query picks a different plan six
+months later.
+
+**No structural WAL.** The build logs page images, not a stream of inserts and splits, so recovery
+of a build is replaying a file write rather than replaying a tree.
+
+The cost of all three is that the index is a photograph of one moment. A 100%-full index is one
+insert away from splitting every page it touches; see page 4 for choosing `fillfactor` against a
+real write mix.
+
+## Where it bites in production
+
+- **Loading into a table that already has its indexes.** Every row pays the insert path once per
+  index, with random I/O per index. The standard fix — drop the secondary indexes, `COPY`/`LOAD DATA`,
+  rebuild — is exactly the trade this page models, and `pg_restore` bakes it in: data first, then the
+  post-data section, with `--jobs` building several indexes at once.
+- **Temp space, not memory, is the limit.** An external build writes roughly the size of the sorted
+  key set to `base/pgsql_tmp` (or InnoDB's `tmpdir`). `log_temp_files = 0` tells you how much;
+  `temp_file_limit` will abort the build rather than fill the filesystem. A 500 GB table's index
+  build that dies at 90% because `/tmp` is a 10 GB volume is a very common outage.
+- **WAL volume.** A build that produces a 50 GB index writes ~50 GB of WAL. That is 50 GB through
+  archiving, through every replica, and through any change-data pipeline, at sequential-write speed
+  — replica lag during a big `REINDEX` is not a bug, it is arithmetic.
+- **The lock.** `CREATE INDEX` takes a `ShareLock`: reads continue, writes block for the whole build.
+  If that window is unacceptable, the answer is
+  [CREATE INDEX CONCURRENTLY](/p02-storage-engines/indexes-beyond-the-b-tree/09-building-indexes-online-create-index-concurrently-internals/),
+  which trades two heap scans and a far slower build for not blocking writers.
+- **`maintenance_work_mem` is per build, not per server.** Four concurrent `REINDEX`es at 2 GB each is
+  8 GB of anonymous memory. Raise it in the session that does the restore, not in `postgresql.conf`.
+- **Measuring the result.** `pg_stat_progress_create_index` reports which phase a running build is in
+  (scanning, sorting, loading tuples in the tree), and `pgstatindex()` from the `pgstattuple`
+  extension reports `avg_leaf_density` and `leaf_fragmentation` on a finished one. A freshly built
+  index reads back at the density you asked for; the same index a quarter later tells you what your
+  write pattern actually did to it.
+
+:::note[What to take forward]
+A bottom-up build replaces N random descents with one sort and one sequential write of every page,
+which is why `CREATE INDEX` on a cold 100 M-row table finishes in minutes while inserting the same
+rows one at a time takes hours. The pipeline is always the same — sort by the index's key, fill
+leaves left to right to `fillfactor`, promote each sealed page's high key into the level above, write
+the metapage last — and it is the only way to get an index whose pages are exactly as full as you
+asked and whose key order is its physical order. Every knob that matters (`maintenance_work_mem`,
+worker count, temp space, `fillfactor`) is a knob on one of those four steps.
+:::

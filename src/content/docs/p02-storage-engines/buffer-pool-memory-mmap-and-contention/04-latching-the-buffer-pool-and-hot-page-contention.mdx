@@ -1,0 +1,263 @@
+---
+title: Latching the buffer pool and hot-page contention
+description: Why a single hot page caps a whole engine's throughput, what the pin CAS, the content LWLock and the 128 BufMappingLocks each cost, and why optimistic version-based latching is the only fix that is not more partitions.
+depth: deep
+sidebar:
+  order: 4
+---
+
+import HotPageLatchContentionLab from '../../../../components/viz/HotPageLatchContentionLab';
+
+Reading a page that is already in the buffer pool is not a read. It is at least six atomic
+read-modify-writes on shared memory, and four of them land on the one cache line that belongs
+to the *page*, not to the thread. A modified cache line can live in exactly one core's cache at a time,
+so when enough sessions want the same page, the engine runs at the speed of that one line being
+passed around — and every sharding knob the engine offers is a function of the page identity,
+which means none of them can move a single page anywhere.
+
+<HotPageLatchContentionLab client:visible />
+
+## Six shared writes on the way into one cached page
+
+The hit path is the one [buffer pool structure](/p02-storage-engines/buffer-pool/01-buffer-pool-structure-frames-page-table-and-pins/)
+walks: hash the tag, take the partition lock, find the frame, pin it, lock its contents, read,
+unlock, unpin. Counted as memory traffic rather than as steps, a PostgreSQL hit looks like this:
+
+| Step | Structure | Atomic ops | Cache line | Wait event if it blocks |
+|---|---|---|---|---|
+| Probe the page table | one of 128 `BufMappingLock`s, shared | acquire + release | the partition's `LWLock.state` | `LWLock:BufferMapping` |
+| Pin | `BufferDesc.state`, CAS loop | 1 CAS, plus retries | **the frame's own line** | none — retries are CPU |
+| Lock contents | `BufferDesc.content_lock`, S or X | acquire + release | **the same line** | `LWLock:BufferContent` |
+| Unpin | `BufferDesc.state`, CAS loop | 1 CAS, plus retries | the frame's own line | none |
+
+The last three rows are the important ones, and they get more interesting once you know that
+`BufferDescPadded` pads each descriptor to 64 bytes — one cache line — so that two different
+frames can never false-share. The corollary is that one frame's pin counter and its content lock
+deliberately *do* share a line: pin traffic and latch traffic on the same page are the same
+coherence traffic.
+
+The cost of an atomic RMW is entirely a question of who owns the line. If this core already has
+it exclusively, a `lock cmpxchg` costs a few tens of cycles and never leaves the core. If another
+core has it dirty, the line has to be invalidated there and shipped here — low hundreds of
+cycles on one socket, worse across sockets — and the operation is *serialized*: the hardware is
+already doing a tiny mutual exclusion for you, and it does not scale. Drag the lab's thread
+slider with one page selected and watch the throughput line refuse to rise. That flat line is
+not a modelling artifact; it is what a cache line does.
+
+## Why 128 partitions cannot help, and what they are actually for
+
+PostgreSQL's `NUM_BUFFER_PARTITIONS` is 128, and InnoDB shards the entire pool into
+`innodb_buffer_pool_instances` (default 8 on a 64-bit build with a pool of at least 1 GB), each
+with its own page hash, free list, LRU list and flush list. The page hash is not itself one mutex:
+it is covered by an array of rw-locks, so a lookup takes one of them in shared mode and only an
+insert or removal takes one exclusively — the same shape as `BufMappingLock`, arrived at
+independently. Both numbers are chosen from the same
+hash code: the partition is `hashcode % 128`, the instance is a fold of the `page_id`. One page
+therefore has exactly one partition and exactly one instance, forever. Raise either knob to its
+maximum and the lab's shard label does not change, because the page did not change.
+
+This is not a design flaw. Those knobs exist for a different contention, which the lab will also
+show you: set the workload to touch 64 pages and drop the shard count to 1. Now unrelated pages
+collide on one lock word, `LWLock:BufferMapping` becomes the top wait, and raising the shard count
+makes it vanish. Mapping-lock contention is a symptom of *lookup volume over too few locks* —
+in practice, a pool small enough that it is constantly swapping tags, since a tag swap takes two
+partition locks exclusively rather than one shared. The honest fix for `BufferMapping` is nearly
+always more `shared_buffers`, not more partitions.
+
+InnoDB's instances behave the same way with one extra wrinkle. The per-instance mutexes —
+`LRU_list_mutex`, `free_list_mutex`, `flush_list_mutex` — are not on the hit path at all, because
+a hit does not allocate or evict anything. The only hit that touches them is one InnoDB decides
+to relink, and `buf_page_make_young_if_needed` deliberately skips that for pages already young
+enough. Push the instances slider around in the lab: it moves a sliver of the bar and nothing
+else, which is exactly what it does on a real server with a resident working set.
+
+:::caution[The knob that looks like it helped]
+Raising `innodb_buffer_pool_instances` on a box with contention often *does* improve a benchmark —
+because 8 instances of 1 GB have 8 free lists and 8 clock/LRU chains, so the *eviction* path
+scales. If your pool is large enough that eviction is rare, the same change does nothing, and if
+your contention is one hot index leaf it does nothing in either case.
+:::
+
+## Inside the LWLock, and why shared mode still writes
+
+A PostgreSQL LWLock is a 32-bit atomic state word plus a wait list. The low bits count shared
+holders; one high bit (`LW_VAL_EXCLUSIVE`) means somebody holds it exclusively; two more flags
+cover whether anyone is queued and who owns the wait list. `LWLockAcquire` attempts the state
+change with an atomic op, and on failure queues the process, re-attempts (to close the race
+against a release), and finally sleeps on its own semaphore until a releaser wakes it.
+
+The consequence people miss: **acquiring in shared mode is a write.** Ten backends descending to
+the same B-tree root do not quietly read a lock; they each perform a read-modify-write on one
+32-bit word, then another on release. They never block each other — there is no queue, no wait
+event, no `pg_stat_activity` row to find — and they still serialize on the cache line. In the
+lab, choose the point-read workload on one page: the content lock's exclusive time drops to zero
+and throughput barely moves, because the pin CAS and the shared acquires are still fighting over
+the same line. The dominant cost tile reads *none — CAS retries burn CPU*, which is precisely
+the shape that makes this pathology hard to diagnose.
+
+The buffer header has a second, rarer mechanism: paths that need the whole state word atomically
+(the clock sweep examining a candidate, `TerminateBufferIO`) set `BM_LOCKED` and spin with the
+`s_lock` exponential-backoff machinery, the same one that PANICs with `stuck spinlock` if it
+spins absurdly long. Spinning is invisible to every wait-event view and shows up only as system
+CPU.
+
+## What PostgreSQL already made lock-free — and what it structurally could not
+
+It is worth seeing where the scalability work went, because it draws the line this page is about.
+
+- **The free list and the clock hand.** PostgreSQL 9.5 deleted `BufFreelistLock`, the single lock
+  every buffer allocation took. The clock hand is now a `pg_atomic_uint32` advanced by fetch-add
+  in `ClockSweepTick()`, so concurrent sweepers simply get different victims; a much smaller
+  spinlock (`buffer_strategy_lock`) covers only the free list and the completed-passes counter.
+- **The I/O-in-progress lock.** The per-buffer LWLock that waiters took while another backend
+  read the block was replaced by a condition variable; a backend that finds `BM_IO_IN_PROGRESS`
+  sleeps on it and is broadcast awake by `TerminateBufferIO`. It shows up as the `BufferIO` wait.
+
+Both of those were *global* bottlenecks — one object shared by the whole pool — and both were
+fixable by sharding or by choosing a cheaper primitive. The pin counter and the content lock are
+not global; there is one of each per page, and the workload has decided to put every thread on
+one page. No amount of engineering below the page can shard something the workload will not.
+
+## The four pages that actually get hot
+
+**The rightmost leaf.** Insert `bigserial`, an identity column, a timestamp, a Snowflake id or a
+UUIDv7 and every row in the table goes into the same leaf page until it splits, whereupon every
+row goes into the *new* rightmost leaf. Each insert takes that one page's content lock
+exclusively for the duration of the insert, so the table's insert rate is bounded by one
+serialized critical section no matter how many cores you own. Both engines optimize the *shape*
+of this and neither removes the serialization: PostgreSQL's nbtree splits an interior page 50/50
+but splits the rightmost leaf at the fillfactor (90% by default) because it knows the left half
+will never be inserted into again, and since PostgreSQL 11 a monotonic inserter can reuse a
+cached rightmost leaf and skip the descent entirely — which saves the shared-mode traffic on the
+root and internal pages and does exactly nothing for the leaf's exclusive lock. InnoDB reaches
+the same conclusion from the `PAGE_DIRECTION` and `PAGE_N_DIRECTION` fields in the page header:
+when it sees a run of inserts to the right it splits at the insertion point rather than in the
+middle.
+
+Random keys (UUIDv4) do remove the hot leaf — by dirtying a different page per insert,
+inflating the working set and destroying insert locality. The fixes that keep locality create
+*several* rightmost leaves instead: hash partitioning, a leading shard column in the index key,
+or per-session sequence ranges (`CACHE n`) so concurrent sessions insert into different parts of
+the key space at once.
+
+**Upper index levels.** Every descent of every index reads the root. It is read-mostly — the root
+changes only when the tree grows a level — so it is never *blocked* on, and in a pin-based engine
+it is still a write-heavy cache line, for the reason above. Note that the latch *coupling* problem
+is already solved: Lehman and Yao's B-link tree, which both PostgreSQL's nbtree and InnoDB
+follow, adds right-links and high keys so a descent can release the parent before it takes the
+child and never holds two page latches at once. What remains is pure coherence traffic on the
+shared-acquire path, and that is the thing optimistic latching removes.
+
+**Sequences and counters.** `nextval()` pins and exclusively locks the sequence relation's single
+page for the increment; with `CACHE 1` it also WAL-logs, though only every `SEQ_LOG_VALS` = 32
+values, since one record reserves the next 32. A sequence hammered by hundreds of sessions is a
+one-page hot spot with an obvious fix — `ALTER SEQUENCE … CACHE 1000` hands each session a private
+block. InnoDB's `AUTO_INCREMENT` is a different mechanism with the same symptom:
+`innodb_autoinc_lock_mode = 0` takes a table-level AUTO-INC lock held to the end of every
+inserting statement; mode `1` keeps that lock only for bulk inserts whose row count is not known in
+advance and uses a short mutex for ordinary `INSERT`s; mode `2` (interleaved, the default since
+MySQL 8.0) never takes the table lock at all.
+
+**Application counter rows.** `UPDATE counters SET n = n + 1 WHERE id = 1` looks identical from
+the outside and is a completely different problem: that is a *row lock*, held until commit, so
+throughput is capped at one update per commit round trip — microseconds of latch versus
+milliseconds of transaction. Telling these two apart is the next section, and getting it wrong
+sends people tuning buffer-pool knobs at a problem that needs a sharded counter.
+
+## Reading it off a running system
+
+```sql
+SELECT wait_event_type, wait_event, count(*)
+FROM pg_stat_activity
+WHERE state = 'active'
+GROUP BY 1, 2 ORDER BY 3 DESC;
+```
+
+| What you see | What it means | What to change |
+|---|---|---|
+| `LWLock` / `BufferContent` | A genuinely hot page: writers queued on one frame's content lock | The key, the partitioning, the sequence cache — never the partition count |
+| `LWLock` / `BufferMapping` | Page-table shard contention: high lookup or tag-swap volume | `shared_buffers`, or fewer distinct pages touched |
+| `BufferPin` / `BufferPin` | Someone wants a cleanup lock (usually VACUUM) and a pin will not drop | Find the idle cursor holding it |
+| `IO` / `DataFileRead` | Plain misses, not contention | Pool size, prefetching |
+| `Lock` / `transactionid` \| `tuple` | A row lock held to commit — transactional, not a latch | The application |
+| Nothing, but CPU is pinned and throughput is flat | CAS retries and shared-mode acquires on a hot line | The same fixes as `BufferContent` |
+
+Two practical notes. The event names were lower-case in PostgreSQL 12 and earlier
+(`buffer_content`, `buffer_mapping`) and capitalized from 13 on, so old runbooks and new ones
+disagree on spelling. And a single query is one sample of a microsecond-scale event: use a
+sampler — `pg_wait_sampling`, or a managed service's equivalent — before believing any ranking.
+When the answer is the bottom row of that table, `perf top` names it directly: `PinBuffer`,
+`LWLockAttemptLock`, `LWLockAcquire` at the top of the profile with the server making no
+progress.
+
+InnoDB's equivalents are the `SEMAPHORES` section of `SHOW ENGINE INNODB STATUS` (spin waits,
+spin rounds and OS waits per mutex and rw-lock) and the `wait/synch/%` instruments in
+`performance_schema`, which are *disabled by default* and must be enabled in `setup_instruments`
+before they measure anything. Row locks live somewhere else entirely — `performance_schema.data_locks`
+and `data_lock_waits`, surfaced by `sys.innodb_lock_waits` — which is the query that settles the
+latch-versus-lock question. And InnoDB has a spectacular failure mode at the end of this road:
+a semaphore wait that lasts longer than 600 seconds makes the server deliberately crash itself,
+on the theory that it is hung rather than slow.
+
+## The fix that is not more partitions
+
+If the problem is that readers write to shared state, the fix is readers that do not write.
+**Optimistic, version-based latching** replaces the latch with a word holding a version counter
+and a lock bit. A reader reads the version, reads the page, re-reads the version, and restarts
+if it changed or was locked; a writer takes the lock bit and bumps the version on release.
+Readers never modify the line, so it sits in the Shared state in every core's cache at once and
+the coherence traffic is zero — the read path scales linearly with cores, which is the whole
+point.
+
+This is not new: OLFIT (Cha et al., VLDB 2001) built main-memory index nodes this way, the
+Bw-tree made the node itself immutable and CAS'd a mapping table instead, Leis et al.'s
+optimistic lock coupling (DaMoN 2016) turned it into a general recipe for tree descent, and
+LeanStore put versioned optimistic latches into the *buffer frames* — which is what makes the
+buffer manager in
+[Beyond the page table](/p02-storage-engines/buffer-pool-memory-mmap-and-contention/03-beyond-the-page-table-pointer-swizzling-in-memory-engines-an/)
+viable. Set the lab to point reads with optimistic
+latching and the pin and latch bars disappear entirely; what is left is the page-table lookup,
+which pointer swizzling removes as well.
+
+The costs are real. A reader can observe a torn page mid-write, so it must tolerate garbage and
+re-check before acting on it, and memory it followed a pointer into cannot be freed while any
+optimistic reader might still be inside — so the design drags in epoch-based or RCU-style
+reclamation. Restarts also grow with the write rate: take the lab to the mixed workload and watch
+the restart percentage climb until optimism loses more work than it saves. And most importantly,
+**optimism does not fix a write-hot page at all**: choose the insert workload with optimistic
+latching on and the throughput curve does not move —
+the rightmost leaf is a logical serialization, and only a different key or a different structure
+removes it.
+
+PostgreSQL cannot simply adopt this for buffers, because its pin is not an optimization — it is
+the [pin contract](/p02-storage-engines/buffer-pool/01-buffer-pool-structure-frames-page-table-and-pins/):
+a non-zero pin count is the *only* thing that stops the clock sweep from replacing the bytes
+under a live pointer. Making the read path pinless means replacing
+that contract with a deferred-reclamation scheme, which is a different buffer manager, not a
+patch to this one.
+
+## Where it bites in production
+
+- **Throughput flat from 8 clients to 200, CPU high, latency linear in client count.** A hot page
+  under a closed-loop workload turns added concurrency directly into queueing. `BufferContent` on
+  top, or no wait event at all and a profile full of `PinBuffer`.
+- **The benchmark that only measures one leaf.** A default sysbench-style table with a monotonic
+  primary key and no partitioning measures the rightmost-leaf ceiling, and every knob you turn
+  will appear not to matter — because none of them can.
+- **A p99 spike confined to one table.** Usually its sequence or its AUTO-INC, not its data.
+- **VACUUM that never finishes on a busy table.** `BufferPin` waits: the cleanup lock needs the
+  pin count down to one, and a long-lived cursor keeps it above that.
+- **InnoDB dying with a long semaphore wait.** The 600-second self-crash is the visible end of a
+  latch convoy that was measurable for hours beforehand in the `SEMAPHORES` section.
+
+:::note[What to take forward]
+A cached page read is a handful of atomic writes to shared lock words, four of them on the one
+64-byte descriptor line that belongs to the page, and a modified cache line serializes by
+construction — so a single hot page caps the whole engine.
+`NUM_BUFFER_PARTITIONS` and `innodb_buffer_pool_instances` shard by page identity, which makes
+them powerless against one page and exactly right against many; `BufferContent` versus
+`BufferMapping` is how you tell which situation you are in, and a flat throughput curve with no
+wait event at all is the third case, CAS retries burning CPU. The only synchronization-side fix
+is to stop writing on the read path — optimistic version-based latching — and even that leaves a
+write-hot page exactly as serialized as it was.
+:::

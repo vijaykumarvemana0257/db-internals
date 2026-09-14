@@ -1,0 +1,237 @@
+---
+title: "Cache warm-up: cold pools, dump/load and prewarming"
+description: Why a restarted, failed-over or resized buffer pool serves every read from the device, and what InnoDB's dump/load, pg_prewarm and a replay-warm standby actually do about it.
+depth: basics
+sidebar:
+  order: 2
+---
+
+import ColdPoolWarmupRace from '../../../../components/viz/ColdPoolWarmupRace';
+
+A buffer pool is the only reason a database that stores terabytes can answer in microseconds, and
+it is built entirely out of state that does not survive the process. The moment `mysqld` or the
+postmaster restarts, every frame is empty, every read is a miss, and the p99 you have been
+reporting to the business is replaced by the latency of your block device — for as long as it
+takes to pull the working set back through it. That interval is measured in minutes on cloud
+storage, and almost nobody budgets for it.
+
+<ColdPoolWarmupRace client:visible />
+
+## The cold pool is an arithmetic problem
+
+Nothing subtle happens when a pool is empty. Each logical read checks the page table, finds no
+frame ([page 1](/p02-storage-engines/buffer-pool/01-buffer-pool-structure-frames-page-table-and-pins/)),
+allocates a victim frame, issues a physical read and blocks the caller on it. Two things follow
+immediately, and they are the two things your monitoring will show.
+
+**Latency jumps to the device curve, all at once.** The p99 of a point read is a property of the
+*miss rate*, not the mean: as long as more than 1% of reads miss, the 99th percentile *is* a disk
+read. A pool that is 97% warm still has a p99 on the device. That is why latency graphs after a
+restart look like a step function that stays flat for a long time and then falls off a cliff —
+nothing improves until the miss rate crosses 1%.
+
+**Throughput is capped by IOPS ÷ miss rate.** With a closed-loop workload, every miss holds its
+request for the duration of a physical read, so the system can only sustain `device_iops /
+miss_rate` requests per second. At a 100% miss rate on an EBS gp3 volume at its 3,000-IOPS
+baseline, that is 3,000 queries per second, no matter how many cores or connections you have.
+Applications discover this as connection-pool exhaustion and queueing, not as slow queries.
+
+The warm-up time itself is a division:
+
+```
+warm-up ≈ working set ÷ device read throughput
+        = working set ÷ (IOPS × page size)     if the reads are random
+        = working set ÷ sequential bandwidth   if you can read in file order
+```
+
+A 48 GB working set of 8 KB pages is about 6.3 million pages. Faulted in one at a time at 3,000
+IOPS, that is roughly 35 minutes of degraded service. Streamed at gp3's 125 MB/s baseline, it is
+about seven minutes. **The gap between those two numbers is the entire reason prewarming machinery
+exists**, and it is why the first question about any warm-up scheme is whether it reads randomly
+or in file order.
+
+Demand paging has a second, sneakier cost: the tail. The pool warms only as fast as the workload
+touches *distinct* pages, so the last few percent of the working set arrives at whatever rate your
+traffic happens to reach it — a coupon-collector problem, not a bandwidth problem. On fast local
+NVMe the device is not the limit at all; your own request rate is. Drag the working set past the
+pool size in the visual and watch the curve flatten early at `pool ÷ working set`: a pool that
+cannot hold the working set never "finishes" warming, it just reaches its steady miss rate.
+
+## Four ways a pool goes cold
+
+| Event | What the pool starts with | What else eats the budget |
+|---|---|---|
+| Clean restart (deploy, config change, minor version upgrade) | nothing | shutdown + startup |
+| Crash, OOM-kill, host failure | nothing | redo/WAL replay before the first query |
+| Failover or replica promotion | the pages *replay* touched — the write set | detection + promotion |
+| Pool resize | nothing on Postgres; the old contents on InnoDB | restart, on engines that need one |
+
+The resize row surprises people. `shared_buffers` is a shared-memory sizing decision made by the
+postmaster at startup, so changing it requires a restart, and a restart means a cold pool: **you
+cannot give Postgres more cache without first taking away all of it.** InnoDB is friendlier —
+`innodb_buffer_pool_size` is dynamic, resized online in `innodb_buffer_pool_chunk_size` units with
+progress in `Innodb_buffer_pool_resize_status` — but a shrink still withdraws pages, and any dump
+file you saved describes the pool you used to have.
+
+One layer softens all of this on PostgreSQL and not on InnoDB: the **OS page cache**. Postgres
+reads through the filesystem, so a postmaster restart leaves the kernel's copy of those 8 KB
+blocks intact; the pool is cold but the misses are satisfied in microseconds from memory rather
+than from the device. Only a reboot, a container replacement or a new VM takes that second tier
+away — which is exactly what a failover or an autoscaling event does. InnoDB with the usual
+`innodb_flush_method = O_DIRECT` has no second tier by design; a cold InnoDB pool really does mean
+the drive.
+
+Aurora attacks the same problem differently: its page cache lives in a process separate from the
+database engine, so restarting the database process — including the restart that follows a crash —
+leaves the cache populated. The buffer pool becomes state the database process does not own, which
+is a good summary of why the technique works and why ordinary engines cannot copy it.
+
+:::caution[Warm pool, cold everything else]
+The buffer pool is not the only cache that empties. Plan caches, the catalog and relcache/dictionary
+caches, prepared statements, connection pools and the CPU's own branch predictors all start from
+zero, and on InnoDB the adaptive hash index has to be rebuilt from access patterns. Prewarming pages
+fixes the largest term, not every term.
+:::
+
+## Dump and load: persist the identifiers, not the pages
+
+The insight behind every production warm-up feature is that you do not need to save the pages. You
+need to save their **names**. A list of `(tablespace id, page number)` pairs is a few bytes per
+page; the pool's contents are the pages themselves. So the engine writes the list on the way out
+and re-reads the pages from their normal home on the way in.
+
+**InnoDB** does this by default. `innodb_buffer_pool_dump_at_shutdown` and
+`innodb_buffer_pool_load_at_startup` are both `ON`, and the list lands in the data directory as
+`ib_buffer_pool` (`innodb_buffer_pool_filename`). Three details decide whether it helps you:
+
+- `innodb_buffer_pool_dump_pct` defaults to **25**. The dump records only the most recently used
+  quarter of each buffer pool instance, so a default installation reloads a quarter of its pool and
+  demand-pages the rest. Push the slider in the visual from 25 to 100 and watch the warm-up
+  shorten as the list covers more of the pool it is trying to rebuild.
+- The load runs in a **background thread**. The server accepts connections immediately, and the
+  loader competes with live queries for the same IOPS — which is the right trade, but it means your
+  first minutes are slower than an idle warm-up benchmark suggests. `Innodb_buffer_pool_load_status`
+  reports progress; setting `innodb_buffer_pool_load_abort = ON` stops it.
+- The dump happens at **clean shutdown only**. A crash, an OOM-kill or a terminated instance leaves
+  whatever `ib_buffer_pool` was there from the last clean stop — possibly weeks old, possibly
+  nothing. If restarts in your environment are mostly *not* clean, schedule
+  `SET GLOBAL innodb_buffer_pool_dump_now = ON` on a timer.
+
+**PostgreSQL** ships the same idea in the `pg_prewarm` contrib module, as the *autoprewarm* worker.
+Put `pg_prewarm` in `shared_preload_libraries` and a background worker writes
+`$PGDATA/autoprewarm.blocks` — one line per buffer, identifying database, tablespace, relation, fork
+and block number — every `pg_prewarm.autoprewarm_interval` (default 300 seconds) and again at
+shutdown. At startup the worker reads that file, sorts it, and loads the blocks per database in
+relation and block order, so the re-read walks each file forward instead of seeking. The periodic
+dump is the important difference from InnoDB: a crash costs you at most one interval of list
+freshness rather than the whole list.
+
+:::tip[Check that it is actually configured]
+`SHOW STATUS LIKE 'Innodb_buffer_pool_load_status'` after a MySQL restart, and
+`SELECT backend_type FROM pg_stat_activity WHERE backend_type LIKE 'autoprewarm%'` (or simply the presence
+of `autoprewarm.blocks`) on Postgres. Autoprewarm needs a `shared_preload_libraries` entry and a
+restart to switch on; `CREATE EXTENSION pg_prewarm` alone gives you the functions, not the worker.
+:::
+
+## Prewarming by hand: pg_prewarm's three modes
+
+When you know which relations matter, you can load them directly. `pg_prewarm(regclass, mode, fork,
+first_block, last_block)` returns the number of blocks it touched, and the mode chooses *which*
+cache you are filling:
+
+| Mode | Mechanism | Fills | Cost |
+|---|---|---|---|
+| `prefetch` | asynchronous hints to the kernel | OS page cache | returns immediately; the kernel may ignore or throttle it |
+| `read` | an ordinary sequential read, results discarded | OS page cache | streams at bandwidth; does not disturb `shared_buffers` |
+| `buffer` | reads through the buffer manager | `shared_buffers` | streams at bandwidth; **evicts** whatever was there |
+
+`read` is the polite one — it fills the kernel's cache without evicting a single Postgres frame, and
+on a restarted postmaster that is often all you need. `buffer` is the one that puts pages where the
+hit-rate counters can see them, and the one that can hurt: prewarming a relation larger than the
+pool does not warm the pool, it *churns* it, and the last blocks you read evict the first ones. Set
+the working set small and the pool large in the visual and the sequential sweep wins easily; make
+the relation bigger than the pool and the same command actively slows warm-up down. Real usage is
+therefore narrow and deliberate:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pg_prewarm;
+-- the hot index first: it is small and every point read goes through it
+SELECT pg_prewarm('orders_pkey');
+-- then a bounded range of the heap, not the whole 400 GB table
+SELECT pg_prewarm('orders', 'buffer', 'main', 0, 2000000);
+```
+
+MySQL's equivalent hand-tool is a query that forces the pages through the pool —
+`SELECT COUNT(*) FROM t FORCE INDEX (PRIMARY)` — which is cruder, competes with live traffic, and
+ignores [scan resistance](/p02-storage-engines/buffer-pool/05-scan-resistance-sequential-flooding-ring-buffers-and-midpoin/)
+machinery at your peril.
+
+## Standbys: warm for the wrong pages
+
+A streaming replica applies WAL continuously, and applying a record means reading the page it
+modifies into the pool. So a standby's buffer pool is warm for the **write set** — the pages
+recently updated — and cold for everything a read workload is about to ask for. A promoted standby
+is not a warm primary; it is a machine whose cache was trained on a different workload.
+
+Two things change that. A standby that has been *serving reads* (Postgres hot standby, a MySQL read
+replica behind the same query mix) is genuinely warm for the read set, which is the strongest
+argument for routing real traffic to the node you intend to promote. And autoprewarm runs on a
+standby exactly as it does on a primary, so a standby that restarts comes back with its own list.
+
+In the visual, choose "Failover to a standby": the curve starts partway up rather than at zero, the
+dump/load curve collapses onto no-prewarm because there is no list to load — the pool is already
+loaded, with the wrong pages — and detection plus promotion appear in the RTO bar before the warm-up
+term even begins.
+
+## Warm-up is an RTO term
+
+Failover runbooks budget detection and promotion, because those are the numbers the tooling reports.
+Both are usually tens of seconds. Warm-up is frequently the largest term in the budget and the only
+one nobody measures, because "the database is up" and "the database serves its normal p99" are
+different events:
+
+| Term | Typical | Where it comes from |
+|---|---|---|
+| Failure detection | 5–30 s | health-check interval × failure threshold |
+| Promotion / redo replay | seconds to minutes | checkpoint distance, replica lag |
+| **Warm-up** | **minutes to hours** | **working set ÷ device throughput** |
+
+If your recovery objective is "sixty seconds", the honest version is "sixty seconds to accept
+connections and twenty-five minutes to stop timing out". Two consequences follow. First, warm-up
+cost scales with the working set and *inversely* with device throughput, so the cheapest fix is
+often provisioning IOPS or bandwidth you only need during recovery — on gp3, IOPS and throughput
+are independently provisionable. Second, a gradual traffic ramp after promotion is not superstition:
+admitting 10% of traffic warms the pool at the same page rate while exposing a tenth of your users
+to the device latency.
+
+## Where it bites in production
+
+- **The deploy that looks fine and pages you ten minutes later.** A rolling restart of every
+  database in a cluster, one at a time, with no prewarm and no ramp. Each node returns cold,
+  accepts full traffic, saturates its volume and trips latency alarms while the next node restarts.
+- **`Innodb_buffer_pool_reads` climbing for an hour after a restart.** The physical-read counter, not
+  `Innodb_buffer_pool_read_requests` (logical). On Postgres the pair is `blks_read` and `blks_hit` in
+  `pg_stat_database`, remembering that a `blks_read` may still be an OS page-cache hit; `pg_buffercache`
+  shows what is actually resident.
+- **Volume throttling as the real symptom.** Read IOPS pinned flat at exactly the provisioned limit
+  with queue depth climbing is a warming pool, not a query regression. On burst-credit volumes the
+  warm-up drains the balance and the *next* hour is slow too.
+- **A default `innodb_buffer_pool_dump_pct = 25` on a host whose restarts are never clean.** The
+  feature is enabled, the dashboards say it ran, and it reloads a quarter of a stale list.
+- **Prewarming the whole table.** `pg_prewarm('big_table')` on a relation larger than `shared_buffers`
+  evicts the pages it just loaded, burns the same IOPS the live workload needs, and leaves the pool
+  holding the tail of a table nobody queries.
+- **An autoscaler that replaces instances.** Every scale-out event adds a cold node to the load
+  balancer. Without a warm-up period in the health check, the new node absorbs its share of traffic
+  at device latency.
+
+:::note[What to take forward]
+A restarted, failed-over or resized pool is empty, and until the miss rate falls under about 1% your
+p99 *is* your device latency — for `working set ÷ device throughput` seconds. The machinery that
+shortens it saves page identifiers, never page contents: InnoDB's `ib_buffer_pool` list (a quarter of
+the pool by default, written only at clean shutdown) and Postgres's `autoprewarm.blocks` (written
+every `autoprewarm_interval`, reloaded in file order). Reading in file order beats faulting pages in
+one at a time, which is why `pg_prewarm` on a hot relation can beat a load of a scattered list — and
+why prewarming a relation bigger than the pool makes things worse. Count warm-up as a first-class RTO
+term; it is usually the largest one.
+:::

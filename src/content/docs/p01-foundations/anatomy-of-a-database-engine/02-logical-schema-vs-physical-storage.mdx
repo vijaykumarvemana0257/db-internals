@@ -1,0 +1,229 @@
+---
+title: Logical schema vs physical storage
+description: How CREATE TABLE becomes catalog rows and files — relfilenodes and forks, .ibd clustered trees, one SQLite file of pages — and why one ALTER edits a row while the next one rewrites a terabyte.
+depth: basics
+sidebar:
+  order: 2
+---
+
+import SchemaToFilesMapper from '../../../../components/viz/SchemaToFilesMapper';
+
+Nothing in your schema exists on disk under the name you gave it. `orders` is a row in a table
+of tables, and that row holds a number that names a file; the join between the name and the
+bytes is made at query time, by the engine, from data it stores the same way it stores yours.
+That indirection is what Codd meant by physical data independence, and it is also why one
+`ALTER TABLE` finishes in three milliseconds and the next one rewrites 800 GB while holding a
+lock that stops the world.
+
+<SchemaToFilesMapper client:visible />
+
+## A table is a row in a table
+
+PostgreSQL's catalog is the clearest version of the idea because it is unapologetic about it.
+Every relation — ordinary table, index, sequence, view, materialized view, TOAST table,
+partitioned parent — gets one row in `pg_class`, keyed by an OID, carrying `relkind`
+(`r`, `i`, `S`, `v`, `m`, `t`, `p`), `relnamespace`, `reltablespace`, and `relfilenode`. Its
+columns are rows in `pg_attribute` (`attnum`, `atttypid`, `attlen`, `attalign`, `attnotnull`);
+the fact that an index belongs to a table is a row in `pg_index`; foreign keys are rows in
+`pg_constraint` enforced by system triggers in `pg_trigger`; a view's body is a parse tree in
+`pg_rewrite`. `relfilenode = 0` is the interesting value — it means *this relation has no file*:
+views, partitioned parents, and relations whose storage is named some other way.
+
+InnoDB used to split this badly. Through MySQL 5.7, table definitions lived in `.frm` files
+that the server maintained and InnoDB duplicated in its own `SYS_TABLES`/`SYS_COLUMNS`
+internal tables, and the two could disagree after a crash mid-DDL. MySQL 8.0 deleted `.frm`
+entirely and put the data dictionary into InnoDB tables inside a single tablespace,
+`mysql.ibd`. That is not a tidiness change: because the dictionary is now transactional
+storage, DDL became atomic and crash-safe — the dictionary update, the storage-engine change,
+and the binlog write commit or roll back together.
+
+SQLite's whole catalog is one table with five columns — `sqlite_schema` (still accepting the
+old name `sqlite_master`): `type`, `name`, `tbl_name`, `rootpage`, `sql`. `rootpage` is the
+page number where that b-tree starts, and `sql` is the literal text of the `CREATE` statement
+you typed, re-parsed every time a connection first reads the schema.
+
+If the catalog is tables, how do you read the catalog? You cannot look up `pg_class` in
+`pg_class` — that is the bootstrap problem, and each engine answers it with a small set of
+hard-wired relations. PostgreSQL "nails" a handful of catalogs (`pg_class`, `pg_attribute`,
+`pg_proc`, `pg_type`) whose OIDs are compile-time constants (1259, 1249, 1255, 1247) and whose
+filenodes come not from `pg_class` but from a tiny flat file, `base/<dboid>/pg_filenode.map`,
+read directly at startup. InnoDB reserves fixed table IDs for the dictionary tables that
+describe the dictionary. SQLite hard-codes the one fact that unlocks everything else:
+`sqlite_schema` is always rooted at page 1, so a reader can parse the 100-byte file header,
+walk to page 1, and discover the rest.
+
+:::note[Why this indirection earns its cost]
+Every lookup is a join you did not write. But it is what makes `ALTER TABLE` possible at all,
+lets an index be added and dropped without the table noticing, lets `REINDEX` swap storage
+under a live relation, and lets the planner choose between two physical paths to the same
+logical answer. Systems that hard-code layout — a struct written straight to a file — have to
+stop the world to change anything.
+:::
+
+## Three ways to be a table on disk
+
+The catalog row points at a physical object, and the three engines mean three genuinely
+different things by that.
+
+**PostgreSQL: a heap, and indexes as separate relations.** The table's rows live in an
+unordered heap file; every index is its own relation with its own `pg_class` row, its own
+filenode, and its own file. Index leaf entries hold a `ctid` — the physical (block, offset)
+address of the heap tuple — which is why *any* operation that moves tuples must rebuild every
+index. Each relation has up to four **forks**, stored as sibling files: the main fork (the
+data), `_fsm` (the free space map, a three-level tree of one byte per page recording free
+space in 1/256ths), `_vm` (the visibility map, two bits per page — all-visible and all-frozen —
+which is what makes index-only scans and freeze skipping possible), and `_init` for unlogged
+relations. Past 1 GB the main fork continues into `<relfilenode>.1`, `.2`, and so on.
+Wide values get a fifth object: any table with a varlena column gets a **TOAST** table plus its
+index, and a tuple that exceeds ~2 KB (`TOAST_TUPLE_THRESHOLD`, 2032 bytes on an 8 KB page) has
+its widest attributes compressed and, if still too big, sliced into 1996-byte chunks stored
+there, leaving an 18-byte pointer in the heap. Toggle "notes are 8 KB documents" in the lab:
+the heap gets *smaller* while a multi-gigabyte TOAST relation appears beside it.
+
+**InnoDB: the table is its primary-key B+tree.** There is no heap. The clustered index's leaf
+pages *are* the rows, stored in primary-key order, and every secondary index leaf holds
+`(key, primary key)` rather than a physical address. Two consequences fall straight out of
+that: a secondary-index lookup costs a second descent of the clustered tree to fetch the row,
+and a full table rebuild does not invalidate secondary indexes the way a Postgres rewrite
+invalidates `ctid`s. With `innodb_file_per_table` on (the default since 5.6.6) each table is one
+`.ibd` file under the schema directory, containing all of its trees as file segments. A fresh
+`.ibd` is 112 KB: the first 32 pages of a segment are allocated one at a time, and only past
+that does InnoDB hand out whole 1 MB extents, so a large table's file grows a megabyte at a
+time. If you never declare a primary key, InnoDB uses the first non-null unique index, and
+failing that synthesizes a hidden 6-byte `DB_ROW_ID`; either way every clustered row also carries a 6-byte
+`DB_TRX_ID` and a 7-byte `DB_ROLL_PTR` pointing into undo.
+
+**SQLite: one file, all pages.** Tables, indexes, the catalog, freelist and overflow chains are
+all pages in `shop.db` (4096 bytes by default since 3.12.0, `PRAGMA page_size`). A normal table
+is a b-tree keyed by a hidden 64-bit **rowid**; a `WITHOUT ROWID` table is a b-tree keyed by the
+declared primary key, clustered exactly like InnoDB, with secondary indexes storing the primary
+key. Flip that checkbox in the lab and the `sqlite_autoindex_orders_1` b-tree disappears —
+because in a rowid table, a primary key that is not the rowid must be enforced by a separate
+unique index. Which brings up the sharpest trap in SQLite: a column is an alias for the rowid
+only if its declared type is *exactly* `INTEGER`. `id BIGINT PRIMARY KEY` has integer affinity
+and behaves identically in every query, but it buys you a whole extra b-tree.
+
+| | PostgreSQL | InnoDB | SQLite |
+|---|---|---|---|
+| Catalog | `pg_class`, `pg_attribute`, `pg_index` (real tables) | DD tables inside `mysql.ibd` | `sqlite_schema`, 5 columns |
+| Table storage | unordered heap file | clustered PK B+tree | rowid b-tree (or PK b-tree) |
+| Index storage | separate relation, separate file | another tree in the same `.ibd` | another b-tree in the same file |
+| Index → row | `ctid` (block, offset) | primary key | rowid (or primary key) |
+| Big values | TOAST table, 1996-byte chunks | off-page LOB pages | overflow page chains |
+| Unit of file | relation fork, 1 GB segments | one `.ibd` per table | one file per database |
+
+## Resolving a name to a path
+
+PostgreSQL's path has three levels of indirection, and you can print it:
+`SELECT pg_relation_filepath('orders')` returns something like `base/16384/16391`. Read it
+right to left: `16391` is the **relfilenode**, `16384` is the database OID, and `base` is the
+default tablespace. Put the table in its own tablespace and the same query returns
+`pg_tblspc/16450/PG_17_<catversion>/16384/16391` — a symlink in `pg_tblspc` named for the
+tablespace OID, then a version-stamped directory (so two clusters can share a mount point),
+then database, then filenode.
+
+The trap is that **relfilenode is not the OID and does not stay put**. They start equal, but
+`CLUSTER`, `VACUUM FULL`, `REINDEX`, `TRUNCATE` and rewriting forms of `ALTER TABLE` all
+allocate a fresh filenode and leave the old file to be unlinked at commit. So a file on disk
+cannot be identified by staring at it; you ask the catalog, with
+`pg_filenode_relation(0, 16391)` or the `oid2name` utility. And a full-disk incident where you
+need to know which of 40 000 files is eating the volume is exactly when that lookup matters.
+
+InnoDB's path is shorter — `<datadir>/<schema>/<table>.ibd` — with the schema directory doing
+the job of the database OID and the filename doing the job of the filenode, which is why
+InnoDB has to do real work to rename a table and why file-level tricks are more tempting and
+more dangerous there. A general tablespace (`CREATE TABLESPACE fast ADD DATAFILE …`) collapses
+many tables into one file, and `DATA DIRECTORY` puts an `.ibd` elsewhere — MySQL 5.7 recorded
+that with an `.isl` link file, which 8.0 removed: the path now lives in the data dictionary,
+and `--innodb-directories` is how you tell a restarted server where files have moved to.
+SQLite's answer is that there is no indirection at all: the database is the path you opened,
+and a table's "location" is a page number in it. The provisioning, locking and backup
+consequences of tablespace placement — `SET TABLESPACE` takes an ACCESS
+EXCLUSIVE lock and physically copies the relation, and your PITR restore has to recreate every
+tablespace symlink — belong to the operations part; what matters here is that the path is
+derived, never stored in your schema.
+
+## DDL is either a catalog edit or a rewrite
+
+This is the distinction worth internalizing, because the two differ by five orders of
+magnitude and the SQL looks nearly identical. Walk steps 4 through 9 in the lab.
+
+`ADD COLUMN status text` is a single `pg_attribute` row. Existing heap tuples have five
+attributes and the new one has six; a tuple that is "too short" is simply read as having NULL
+in the missing position. Nothing on disk is touched, at any table size.
+
+`ADD COLUMN created_at timestamptz NOT NULL DEFAULT now()` is also free — since PostgreSQL 11.
+`now()` is `STABLE`, not `VOLATILE`, so the server evaluates it once, stores the resulting datum
+in **`pg_attribute.attmissingval`**, sets `atthasmissing`, and hands that value back for every
+row too short to contain the column. Before 11, this rewrote the table. Watch the stat tile:
+the catalog says the row is wider than the bytes on disk actually are, and `attmissingval` is
+what closes the gap.
+
+`ADD COLUMN token uuid NOT NULL DEFAULT gen_random_uuid()` cannot use that trick, because
+`gen_random_uuid()` is `VOLATILE` and every row needs a *different* value. There is no single
+missing value to record, so PostgreSQL rewrites the entire heap into a new relfilenode and
+rebuilds every index. The user-visible difference between this statement and the previous one
+is one word in a function's volatility classification.
+
+Type changes split the same way. PostgreSQL skips the rewrite when the old type is binary
+coercible to the new one and the transformation is a no-op relabel — `varchar(32)` to
+`varchar(64)`, `varchar` to `text`, an unconstrained domain to its base type. `int` to `bigint`
+changes the bytes, so it is a full rewrite plus a rebuild of every index that references the
+column. `CLUSTER` is an honest rewrite by definition: it rebuilds the heap in index order into
+a new filenode and reindexes, and nothing maintains that order afterwards — the first `UPDATE`
+starts to undo it.
+
+InnoDB classifies the same statements with an explicit vocabulary you can assert in the
+statement itself: `ALGORITHM=INSTANT` (dictionary only), `INPLACE` (the table is modified but
+not copied; concurrent DML is buffered in an online row log and replayed), or `COPY` (full
+rebuild). Instant `ADD COLUMN` arrived in 8.0.12 and was generalized in 8.0.29 to adding or
+dropping a column anywhere in the row, tracked by row versions; `INNODB_TABLES.INSTANT_COLS`
+records how many columns the pre-existing rows have, and short records are extended on read.
+The famous inversion is the one PostgreSQL treats as free: widening `VARCHAR(32)` to
+`VARCHAR(64)` in `utf8mb4` takes the maximum byte length from 128 to 256, and InnoDB uses a
+1-byte length prefix below 256 bytes and 2 bytes at or above it. The record format changes, so
+the "harmless" widening is `ALGORITHM=COPY` — a full table rebuild, on the statement everyone
+assumes is instant.
+
+SQLite is the strictest, and states its rule out loud: `ADD COLUMN` is metadata-only or it is
+refused. The column may not be `PRIMARY KEY` or `UNIQUE`, may not default to `CURRENT_TIME`,
+`CURRENT_DATE`, `CURRENT_TIMESTAMP` or any parenthesized expression, and if it is `NOT NULL` it
+needs a constant default — otherwise you get *"Cannot add a column with non-constant default"*.
+Anything beyond `RENAME TO`, `RENAME COLUMN`, `ADD COLUMN` and `DROP COLUMN` does not exist as
+syntax; the documented alternative is the 12-step procedure — create a new table, `INSERT …
+SELECT`, drop, rename — which is a rewrite you schedule and write yourself, with the schema
+cookie forcing every other connection to re-parse.
+
+## Where it bites in production
+
+- **The lock queue, not the lock.** A rewriting `ALTER TABLE` holds `ACCESS EXCLUSIVE` for the
+  whole scan, and in PostgreSQL a waiting exclusive request blocks every *later* request behind
+  it, including plain `SELECT`s. An `ALTER` that waits 90 seconds for one long-running query
+  takes the table down for 90 seconds. The habit that prevents it: `SET lock_timeout = '2s'`
+  before DDL, and retry.
+- **Disk doubling.** During a rewrite both copies exist. `CLUSTER`, `VACUUM FULL` and a
+  rewriting `ALTER` need free space of roughly the relation's size plus its indexes; SQLite's
+  `VACUUM` needs twice the whole database. The lab's peak-disk tile is the number to check
+  against `df` before you run it.
+- **Replication and WAL.** A rewrite writes the entire relation to the WAL, so a 400 GB table
+  rewrite is a 400 GB WAL burst: archive backlog, replica lag, and a filling `pg_wal`. The
+  binlog equivalent is a single enormous DDL event, which is why online-schema-change tools
+  (gh-ost, pt-online-schema-change) chunk the copy instead.
+- **`ALGORITHM=INPLACE` silently downgrading.** MySQL only errors if you *demand* the
+  algorithm. Always write `ALTER TABLE … , ALGORITHM=INSTANT` (or `INPLACE`) so the server
+  refuses rather than quietly rebuilding a billion rows. Watch for
+  `ER_INNODB_ONLINE_LOG_TOO_BIG` too: an online DDL whose row log exceeds
+  `innodb_online_alter_log_max_size` (128 MB by default) fails after hours of work.
+- **Watching it run.** `pg_stat_progress_cluster` and `pg_stat_progress_create_index` report
+  phase and blocks done; MySQL exposes `stage/innodb/alter table%` events in
+  `performance_schema`. If neither shows progress, the statement is still waiting for the lock.
+
+:::note[What to take forward]
+A table name resolves through catalog rows to a physical object — `pg_class.relfilenode` under
+tablespace/database, one `.ibd` whose clustered tree *is* the table, or a root page number in a
+single SQLite file — and that indirection is physical data independence in working form. It
+also draws the only line that matters in DDL: a statement that can be satisfied by editing a
+catalog row (`attmissingval`, `INSTANT_COLS`, a rewritten `sqlite_schema.sql`) is instant at any
+table size, and a statement that changes the bytes of existing rows rewrites the relation into
+new storage, doubling disk and holding a lock for as long as the scan takes.
+:::

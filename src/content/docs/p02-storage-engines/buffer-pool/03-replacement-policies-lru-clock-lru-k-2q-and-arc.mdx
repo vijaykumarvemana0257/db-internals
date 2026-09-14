@@ -1,0 +1,241 @@
+---
+title: 'Replacement policies: LRU, CLOCK, LRU-K, 2Q and ARC'
+description: Why exact LRU is too expensive to run on every hit, how CLOCK approximates it with one counter per frame, and how LRU-K, 2Q and ARC learn to tell a page touched once from a page touched a thousand times.
+depth: intermediate
+sidebar:
+  order: 3
+---
+
+import ReplacementPolicyPlayground from '../../../../components/viz/ReplacementPolicyPlayground';
+
+Every miss in the buffer pool forces a decision the engine cannot take back: which resident page
+loses its frame. That decision is made millions of times a second, on the same data structure every
+backend is touching, and it is wrong in two directions at once — a policy that is too dumb evicts
+the page you are about to read, and a policy that is too clever spends more on bookkeeping per hit
+than it saves in avoided I/O. Every real replacement policy is a point on that trade.
+
+<ReplacementPolicyPlayground client:visible />
+
+Set the loop longer than the frame count and step through it: under LRU the hot pages are evicted by
+loop pages that will never be read again before they too are evicted, and the hot-set hit rate
+collapses. Switch to ARC on the same trace and watch the hot pages sit in T2 while the loop churns
+through T1.
+
+## The cost of being exactly right
+
+Textbook LRU is a doubly linked list of frames ordered by last touch. A hit unlinks the entry and
+relinks it at the head; a miss takes the tail. Both are O(1), which makes the algorithm look free —
+and it is not, for three reasons that only show up at database scale.
+
+First, **the work is on the hit path**. A healthy pool runs at a 99% hit rate, so the list splice is
+paid 99 times for every eviction it informs. Second, the splice writes to *shared* memory — pointer
+stores into nodes other cores are reading — so a cache line bounces between sockets on every buffer
+access. Third, the list needs a lock, and it is one lock for the whole pool; a per-frame latch does
+not help, because the mutation spans three nodes. The list move is the only reason that lock exists.
+(What the contention does to a many-core machine belongs to a later module; here the point is just
+that exact recency has a per-hit price.)
+
+Engines that keep an LRU list therefore cheat on precision to buy back the hit path. InnoDB keeps a
+real LRU list, but skips the move-to-head when the block is already near the head: the eviction order
+would not change, so the list operation and its lock are simply not taken.
+
+## CLOCK: one bit instead of one list
+
+CLOCK keeps the frames in a fixed circular array — the same array of frames and descriptors the pool
+already has, described in [buffer pool structure](/p02-storage-engines/buffer-pool/01-buffer-pool-structure-frames-page-table-and-pins/) — plus a
+**reference bit** per frame and a **hand** that points at the next candidate. A hit sets the bit and
+does nothing else: no list, no shared ordering, no global lock. On a miss the hand advances; if the
+frame under it has its bit set, the bit is cleared (a second chance) and the hand moves on; the first
+frame found with a clear bit is the victim.
+
+The invariant is worth stating precisely, because it is what makes the approximation acceptable:
+**CLOCK never evicts a page that has been referenced since the hand last passed it.** Within that
+resolution the victim is an old page; it just is not guaranteed to be *the* oldest.
+
+PostgreSQL runs a generalized version — a counter instead of a bit, which makes it frequency-aware,
+not just recency-aware. Each buffer descriptor carries a `usage_count` inside its atomic state word.
+Pinning a buffer increments it, capped at `BM_MAX_USAGE_COUNT`, which is **5**; a newly read page
+starts at 1. `StrategyGetBuffer` takes a frame from the freelist if one is there, and otherwise
+sweeps: at each frame, if `usage_count > 0` it decrements and advances, and the first frame with
+`usage_count == 0` and no pins becomes the victim. The hit path is a compare-and-swap on the buffer's
+own state word, not a mutation of a structure shared with every other buffer.
+
+Two consequences follow directly from the cap and the decrement:
+
+- A page must be passed over **at most five times** before it becomes evictable, so the sweep is
+  bounded — but in the worst case, where every frame is at 5, a single allocation walks up to five
+  full revolutions of the pool. A 32 GB `shared_buffers` is four million 8 KB frames, so that worst
+  case is on the order of twenty million descriptor visits for one page read. Watch the "frames per
+  sweep" statistic in the lab climb as you shrink the pool relative to the hot set.
+- Because the counter saturates at 5, CLOCK cannot distinguish a page read 6 times from one read
+  6000 times. The frequency signal is deliberately coarse; it exists to protect the hot set from a
+  single pass, not to rank it.
+
+You can see the counter distribution directly:
+
+```sql
+SELECT usagecount, count(*), count(*) FILTER (WHERE isdirty) AS dirty
+FROM pg_buffercache GROUP BY usagecount ORDER BY usagecount;
+```
+
+A pool where almost every buffer sits at 5 is a pool whose sweep is doing five passes of work per
+allocation, and it is telling you the working set no longer fits.
+
+## The flaw both of them share
+
+LRU and CLOCK rank pages by *when*, never by *how often*. A page read once by a `COPY` and a page
+read on every index descent enter the pool at the same priority, and the one-touch page is by
+definition the more recent. That is the whole weakness, and it shows up as two named pathologies:
+
+- **Sequential flooding** — one large scan evicts the entire working set, because every scanned page
+  is newer than everything it displaces. The engine-level defenses are their own subject; see
+  [scan resistance](/p02-storage-engines/buffer-pool/05-scan-resistance-sequential-flooding-ring-buffers-and-midpoin/).
+- **The looping cliff** — a cyclic access pattern over *N* pages in a pool of *N−1* frames. Under
+  pure recency the next page needed is always the page just evicted, and the hit rate is **exactly
+  zero**. Not degraded: zero; one more frame takes it to 100%. Set the loop one page longer than the
+  frame count in the lab. That discontinuity is why buffer pool capacity planning is not a linear
+  extrapolation.
+
+The policies that follow all answer the same question: how do you recognize a second reference
+cheaply enough to act on it?
+
+## LRU-K: measure the K-th reference back
+
+O'Neil, O'Neil and Weikum's LRU-K (SIGMOD 1993) replaces "time of last reference" with the
+**backward K-distance** b(p, K): how far back you have to look to find the K-th most recent reference
+to page p. Evict the page with the largest backward K-distance; a page referenced fewer than K times
+has distance infinity and goes first. With K = 1 this is exactly LRU. With **K = 2** — which the paper
+argues captures nearly all the available benefit — a page touched once is instantly distinguishable
+from a page touched twice, no matter how recently the single touch happened.
+
+Two details make it work in practice, and both are in the paper:
+
+- **The retained information period.** History must outlive residency. If you forget a page's
+  reference times the moment you evict it, you can never observe its second reference, and LRU-2
+  degenerates to LRU. So the algorithm keeps reference history for pages that are no longer in the
+  pool — the `history` row in the lab under the LRU-K policy — for some period longer than a typical
+  reuse interval.
+- **The correlated reference period.** A page touched five times inside one transaction is not five
+  times hotter than one touched once; those references are *correlated*. LRU-K collapses references
+  that arrive within a short window into a single one, so a burst cannot fake a hot page. (The lab
+  omits this window; real implementations must not.)
+
+LRU-K is the reference point for "does this policy know about frequency", and it is essentially never
+implemented in a buffer pool hot path. Choosing a victim means finding a maximum over all resident
+pages — a priority queue with an O(log n) update on every single access — and you must maintain
+history for pages you are not even caching. That is the exact cost profile the hit path cannot
+afford. Its value is as a specification: the policies below are constant-time approximations of it.
+
+## 2Q: LRU-K's answer in O(1)
+
+Johnson and Shasha's 2Q (VLDB 1994) gets the LRU-2 effect out of three simple queues:
+
+| Structure | Contents | Discipline | Default size |
+|---|---|---|---|
+| `A1in` | pages seen once, resident | FIFO | Kin ≈ 25% of the pool |
+| `A1out` | *identifiers only* of pages evicted from `A1in`, not resident | FIFO | Kout ≈ 50% of the pool |
+| `Am` | pages seen at least twice, resident | LRU | the remainder |
+
+A page nobody remembers enters `A1in` and is never promoted by a hit there — a second touch while the
+page is still in the FIFO is treated as a correlated reference, exactly the LRU-K idea. It ages out of
+`A1in`, drops its frame, and leaves its *identifier* in `A1out`. Only when the page is requested again
+while its id is still in `A1out` — proof of a genuinely independent second reference, with the first
+one far enough back to have fallen out of the FIFO — does it enter `Am`. One-touch pages therefore
+live and die in a quarter of the pool and never displace anything hot.
+
+`A1out` is the crucial half: it is a **ghost list**, holding page identifiers (in Postgres terms, a
+`BufferTag` — relation, fork, block) and no page data. Remembering 50% more pages than you cache costs
+a few tens of bytes each rather than 8 KB each.
+
+This is, in slightly different clothing, what MySQL ships. InnoDB splits its single LRU list into a
+**young sublist** and an **old sublist**, inserts every newly read page at the *midpoint* between
+them rather than at the head, and promotes a page into the young sublist only on a *later* access —
+`A1in` and `Am` with one list and a pointer instead of two lists. It even has the correlated-reference
+window, expressed in the time domain by `innodb_old_blocks_time`: a page re-read too soon after
+entering the old sublist is not promoted, which is exactly the "a scan touches every row on the page
+it just read" case. The knobs, their defaults and the monitoring belong to
+[scan resistance](/p02-storage-engines/buffer-pool/05-scan-resistance-sequential-flooding-ring-buffers-and-midpoin/).
+
+## ARC: let the workload set the knob
+
+Megiddo and Modha's ARC (FAST 2003) keeps the same idea but removes the tuning. The pool of c frames
+is split between two resident lists, each with its own ghost list:
+
+- **T1** — pages referenced exactly once recently (recency). Ghost: **B1**.
+- **T2** — pages referenced at least twice (frequency). Ghost: **B2**.
+
+The invariants: `|T1| + |T2| ≤ c` (they share the pool), `|T1| + |B1| ≤ c`, and the four lists
+together hold at most 2c entries. A hit in T1 promotes the page to T2. A miss on a page nobody
+remembers enters T1.
+
+The adaptation is the whole trick, and it is one number, `p`, the target size of T1. A hit in **B1**
+means "I evicted a recency page and immediately needed it again", so `p` increases and T1 grows; a hit
+in **B2** means a frequently-used page was dropped too soon, so `p` decreases and T2 grows. The ghost
+lists are how the policy learns from mistakes it has already made: every ghost hit is a correction
+applied to `p`, so the split follows the workload as it changes shape. There is no knob for an
+operator to get wrong, every operation is constant time, and the self-tuning costs only the ghost
+entries. In the lab, watch `p`
+move in the narration line as you shift the trace between loop-dominated and hot-set-dominated.
+
+ARC's absence from open-source relational engines is a legal story rather than a technical one: IBM
+holds a patent on it. PostgreSQL shipped ARC in 8.0 and ripped it out in a *minor* release — 8.0.2,
+April 2005 — when the patent surfaced, substituting a 2Q variant; the buffer manager rewrite in 8.1
+later replaced that with the clock sweep and `usage_count` that Postgres still runs today. Where you
+do meet ARC in production is ZFS, whose adaptive cache is a modified ARC — the same MRU/MFU lists and
+ghost lists, extended to handle buffers that cannot be evicted on demand.
+
+## LIRS, CLOCK-Pro, TinyLFU, and OPT
+
+Two more families are worth knowing by name. **LIRS** (Jiang and Zhang, SIGMETRICS 2002) ranks pages
+by *reuse distance* — distinct pages touched between two consecutive references to the same page —
+rather than by recency, which handles the looping cliff in a way LRU-K and ARC only approximate;
+H2's MVStore ships a LIRS cache, and **CLOCK-Pro** does for LIRS what CLOCK does for LRU. **TinyLFU**
+and its windowed variant W-TinyLFU instead keep an approximate frequency sketch (a count-min sketch
+with periodic halving) over far more keys than fit in the cache, and admit a new page only if the
+sketch says it is hotter than the page it would evict — the design behind Caffeine.
+
+Above all of them sits **OPT** — Belady's MIN, 1966 — which evicts the resident page whose next
+reference is furthest in the future. It needs the future, so it cannot be implemented, but it can be
+computed from a trace afterwards, which makes it the only honest yardstick: the OPT curve in the lab
+is the hit rate no online policy can beat on that trace with those frames. Note that OPT minimizes
+*total* misses and will sacrifice a hot page to save two others, so its hot-set hit rate is sometimes
+lower than ARC's. How close an online policy can get in the worst case is
+[the next page](/p02-storage-engines/buffer-pool/04-how-good-can-a-cache-policy-be-opt-competitive-ratios-and-th/).
+
+## Where it bites in production
+
+- **The hit rate is fine and the latency is not.** In PostgreSQL, a pool whose `pg_buffercache`
+  `usagecount` histogram is piled up at 5 makes every allocation walk a long sweep while holding
+  buffer mapping locks. The symptom is `BufferMapping` wait events and rising `buffers_alloc` in
+  `pg_stat_bgwriter` with no change in query plans; `pg_stat_io` breaks the same story down into
+  `evictions` and `reuses`.
+- **A nightly job that wrecks the morning.** A scan, a `pg_dump` or a backup reads the whole table,
+  and under a recency policy the working set is gone by the time traffic arrives; the pool then
+  spends hours re-reading it, with the same cold-pool arithmetic as
+  [cache warm-up](/p02-storage-engines/buffer-pool/02-cache-warm-up-cold-pools-dump-load-and-prewarming/).
+- **A burst of references is not frequency.** Every frequency-aware policy on this page can be
+  fooled by correlated references: a scan that touches all ~200 tuples on one heap page, or a nested
+  loop that re-probes the same index leaf a thousand times inside one statement, looks like a very hot
+  page to a naive counter. That is what LRU-K's correlated-reference period, 2Q's refusal to promote
+  on an `A1in` hit and InnoDB's `innodb_old_blocks_time` all exist to suppress, and it is why
+  PostgreSQL's `usage_count` saturates at 5 rather than counting freely. A policy that skips this
+  step evicts the real working set in favour of whatever the last big statement walked over.
+- **The cliff, in a graph.** A workload whose loop just outgrew the pool shows a hit rate that falls
+  much faster than the data grew, and no policy on this page repairs it. More memory does.
+
+:::caution[Do not benchmark a policy on a random trace]
+Uniform-random access makes every policy here identical: no page is hotter than another and no
+reference predicts the next, so there is nothing to learn. Policies separate only on traces with
+structure — a skewed hot set, a loop, a scan mixed into an OLTP workload. If ARC and LRU land within
+noise of each other, check the trace before concluding the policy does not matter.
+:::
+
+:::note[What to take forward]
+Exact LRU is rejected for its cost on the *hit* path, not for its accuracy, and CLOCK buys that cost
+back by replacing an ordered list with one counter per frame — PostgreSQL's `usage_count`, capped at
+5 and decremented by the sweep. Everything past CLOCK is an attempt to separate a page touched once
+from a page touched repeatedly: LRU-K measures the K-th reference back and is too expensive to ship,
+while 2Q and ARC get most of the effect in constant time by remembering the *identifiers* of pages
+they have already evicted. And no policy rescues a working set that has outgrown the pool: the
+looping cliff goes from 100% to 0% for one page of growth.
+:::

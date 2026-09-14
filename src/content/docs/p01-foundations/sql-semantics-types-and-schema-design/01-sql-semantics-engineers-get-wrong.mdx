@@ -1,0 +1,257 @@
+---
+title: SQL semantics engineers get wrong
+description: Three-valued logic, NOT IN against a NULL, aggregates with different denominators, join fan-out that double-counts money, and the type rules that change a result set without raising an error.
+depth: intermediate
+sidebar:
+  order: 1
+---
+
+import NullFanoutTrapSandbox from '../../../../components/viz/NullFanoutTrapSandbox';
+
+A SQL bug that throws an error is cheap: you see it in CI. The expensive ones return a
+number — a slightly smaller revenue figure, an alert list that is empty, a page of results
+with one row on it twice — and nothing anywhere says so. Every trap below has the same
+shape: SQL is doing precisely what the standard says, and what the standard says is not
+what the query looks like it says.
+
+<NullFanoutTrapSandbox client:visible />
+
+## NULL is a marker, so logic has three values
+
+`NULL` is not a value. It is a marker in a tuple slot meaning *no value is present*, and
+because there is no value there, no comparison against it can produce a truth value.
+`region = NULL`, `region <> NULL` and `NULL = NULL` all evaluate to UNKNOWN, SQL's third
+truth value; arithmetic and most functions propagate the marker instead, so `NULL + 1` is
+NULL. UNKNOWN then spreads through the connectives:
+
+| `a` | `b` | `a AND b` | `a OR b` | `NOT a` |
+|---|---|---|---|---|
+| TRUE | UNKNOWN | UNKNOWN | TRUE | FALSE |
+| FALSE | UNKNOWN | FALSE | UNKNOWN | TRUE |
+| UNKNOWN | UNKNOWN | UNKNOWN | UNKNOWN | UNKNOWN |
+
+Two rows of that table carry most of the damage. `FALSE AND UNKNOWN` is FALSE — so a
+conjunction can still reject cleanly. `FALSE OR UNKNOWN` is UNKNOWN — so a single unknown
+disjunct poisons an entire OR chain, and `NOT UNKNOWN` is still UNKNOWN, which is why no
+amount of negation rescues it.
+
+What each clause *does* with UNKNOWN is where engineers are caught, because the clauses do
+not agree:
+
+- **`WHERE` and `ON` keep only TRUE.** UNKNOWN rows are discarded exactly like FALSE ones.
+  This is why `region <> 'west'` and `region = 'west'` do not partition the table: run trap
+  1 with a NULL region and the two "opposite" queries return four rows out of five between
+  them.
+- **`CHECK` rejects only FALSE.** UNKNOWN satisfies the constraint. `CHECK (amount > 0)`
+  cheerfully accepts a row with `amount IS NULL`; only `NOT NULL` stops it.
+- **`GROUP BY`, `DISTINCT`, `UNION` and `INTERSECT` treat NULLs as *equal* to each other.**
+  All NULL regions collapse into one group even though `NULL = NULL` is UNKNOWN, because
+  grouping is defined on "not distinct from", not on `=`.
+- **`UNIQUE` treats NULLs as *distinct*.** PostgreSQL, MySQL/InnoDB and SQLite all let you
+  insert unlimited NULLs into a unique column; SQL Server allows exactly one. PostgreSQL 15
+  added `UNIQUE NULLS NOT DISTINCT` to opt into the other reading.
+- **`ORDER BY` has to put them somewhere, and the engines disagree.** PostgreSQL sorts NULL
+  as larger than every value, so `ASC` puts NULLs last; MySQL and SQLite sort it as smaller,
+  so `ASC` puts them first. PostgreSQL and SQLite accept `NULLS FIRST`/`NULLS LAST`; MySQL 8
+  does not, and the idiom there is `ORDER BY col IS NULL, col`.
+
+Four different semantics for the same marker, sometimes inside one query. The tools that
+compare NULL *as a value* are `IS NULL`, `IS DISTINCT FROM` (PostgreSQL, SQLite) and MySQL's
+NULL-safe `<=>`; each is two-valued and can never yield UNKNOWN.
+
+:::caution[The three-valued trap that looks like validation]
+`CHECK (status IN ('new','paid','void'))` does not prevent `status` from being NULL, and
+`CHECK (a <> b)` does not prevent `a` and `b` from both being NULL. A constraint is
+satisfied unless it evaluates to FALSE. Every column you believe is constrained needs
+`NOT NULL` as well, or the predicate is advisory.
+:::
+
+## The anti-join trio: only two of them work
+
+"Customers with no orders" has three standard spellings, and one of them is a trap:
+
+```sql
+WHERE c.id NOT IN (SELECT customer_id FROM orders)              -- breaks on a NULL
+WHERE NOT EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = c.id)
+LEFT JOIN orders o ON o.customer_id = c.id WHERE o.id IS NULL
+```
+
+`NOT IN` is defined as `NOT (x = ANY (…))`, which expands to a negated OR chain. For a
+customer with no matching order, every equality is FALSE except the comparison against the
+NULL, which is UNKNOWN; `FALSE OR UNKNOWN` is UNKNOWN; `NOT UNKNOWN` is UNKNOWN; `WHERE`
+drops the row. The failure is *total*: one NULL anywhere in the subquery result makes the
+anti-join return the empty set, forever, for every row. Toggle the NULL in trap 2 and watch
+five candidate rows go from two survivors to none while the query text never changes.
+
+`NOT EXISTS` is immune because `EXISTS` asks only whether a row was produced — a question
+with two answers. The `LEFT JOIN … IS NULL` form is immune because `IS NULL` is two-valued.
+
+There is a performance tail to this too. Because the planner must preserve the NULL
+semantics, `NOT IN` over a subquery whose column is not provably `NOT NULL` cannot be turned
+into a hash anti-join; PostgreSQL typically falls back to a hashed `SubPlan` evaluated per
+outer row, while the `NOT EXISTS` spelling plans as a `Hash Anti Join`. The correct form is
+also the fast one.
+
+## Aggregates do not share a denominator
+
+`COUNT(*)` counts rows. Every other aggregate counts *values*, and NULL is not a value, so
+`SUM`, `AVG`, `MIN`, `MAX` and `COUNT(col)` skip those rows entirely. Run trap 3 with a
+NULL amount and one five-row table yields `COUNT(*) = 5`, `COUNT(customer_id) = 4` and an
+`AVG(amount)` divided by 4, not 5 — an order with no price silently *raises* the average
+instead of lowering it. Whether that is right depends on the question, and the query does
+not record which question you asked. `AVG(COALESCE(amount, 0))` and `SUM(amount) / COUNT(*)`
+are both defensible; `AVG(amount)` on data with NULLs is usually neither.
+
+Two empty-input rules matter more than they should:
+
+- **`SUM` over zero rows returns NULL, `COUNT` returns 0.** So `COALESCE(SUM(amount), 0)`
+  belongs on the outside. `SUM(COALESCE(amount, 0))` is a different query — it also rewrites
+  the NULLs *inside* the data.
+- **A whole-table aggregate over zero rows returns one row of NULLs; the same aggregate with
+  `GROUP BY` returns zero rows.** This is the source of the dashboard tile that reads "—"
+  instead of "0", and of the API handler that crashes dereferencing a result set it assumed
+  had a row.
+
+## The columns you did not group by
+
+```sql
+SELECT c.region, c.name, COUNT(*) FROM customers c GROUP BY c.region;
+```
+
+`c.name` is neither grouped nor aggregated, and there are three names in the `west` group. The
+standard rejects the query; the dialects diverge:
+
+| Engine | Behaviour |
+|---|---|
+| PostgreSQL | `ERROR: column "c.name" must appear in the GROUP BY clause or be used in an aggregate function` — unless the grouping columns include the table's primary key, in which case SQL:1999's functional-dependency rule (T301) lets every column of that table through |
+| MySQL 8, default `sql_mode` | `ERROR 1055 … not functionally dependent on columns in GROUP BY clause; this is incompatible with sql_mode=only_full_group_by`. `ONLY_FULL_GROUP_BY` has been on by default since 5.7.5, and MySQL recognizes functional dependence on a primary or unique-not-null key too |
+| MySQL with `ONLY_FULL_GROUP_BY` removed | Runs, and returns a value from an unspecified row of each group. `ANY_VALUE(c.name)` is the way to say you meant that |
+| SQLite | Runs, picks an arbitrary row — with one documented exception: in a query using `min()` or `max()`, bare columns come from the row that produced the extreme |
+
+The dangerous case is not the error, it is the permissive one: the answer is correct-looking
+and unstable. Add an index, change the join order, insert a row, and a different name wins.
+Trap 5 makes that concrete — "re-plan" reshuffles which row inside each group supplies the
+bare column, which is exactly the freedom the engine has.
+
+## Fan-out: the bug that moves money
+
+A join to a one-to-many child multiplies the parent row by the number of children. If you
+then aggregate a *parent* column, every copy contributes again:
+
+```sql
+SELECT c.name, SUM(o.amount)
+FROM customers c
+JOIN orders o      ON o.customer_id = c.id
+JOIN order_lines l ON l.order_id    = o.id   -- ← fan-out
+GROUP BY c.name;
+```
+
+`o.amount` is a property of the order, not of the line item, so an order with three lines
+adds its total three times. Drag the line-items slider in trap 4 and watch each customer's
+revenue scale by *its own* fan-out — the error is not a constant factor you could divide out,
+because the child counts differ per parent. Two child tables are worse: joining orders to
+both `order_lines` and `payments` produces the cross product of the two, and a three-line,
+two-payment order is counted six times.
+
+The same join also *deletes* rows. Set the slider to zero: an inner join to a child table
+drops every order that has no line items, so the total is now too low. One query, two
+opposite errors, no warning for either.
+
+:::danger[DISTINCT is how this survives code review]
+`SELECT DISTINCT` in front of the fan-out removes duplicate *output rows*, which makes the
+row count look right while every aggregate stays inflated. `SUM(DISTINCT o.amount)` is worse:
+it deduplicates by value, so two separate $250.00 orders from the same customer become one,
+and the number is now wrong in the other direction. `COUNT(DISTINCT o.id)` genuinely is
+correct — ids are unique — which is what makes the pattern so convincing. Turn on DISTINCT in
+trap 4 and compare the two bars.
+:::
+
+The fix is structural, not cosmetic: aggregate each one-to-many side *before* joining it to
+anything else — a subquery per child, a `LATERAL`/`CROSS APPLY`, or a window function — so
+that each join sees one row per key.
+
+## Ordering you did not actually specify
+
+`ORDER BY` defines a total order only when its key is unique. With ties, the engine may emit
+the tied rows in any order it likes, and it will: in PostgreSQL an `UPDATE` writes a new
+tuple version at the end of the heap so the row physically moves, `synchronize_seqscans` (on
+by default) lets a sequential scan start wherever another scan already is, and a parallel
+plan interleaves workers non-deterministically. In InnoDB the order depends on which index
+the optimizer chose this time.
+
+Trap 6 paginates `ORDER BY amount DESC LIMIT 2` across a tie group that straddles the page
+boundary, and runs the two requests against different physical orders — which is what a
+concurrent write does to a paginated API. Press "re-plan" until you get the classic outcome:
+one order served on both pages and another served on neither. No error, no duplicate-key
+violation, just an export with a row missing.
+
+Two rules follow. Add a unique tiebreaker to every `ORDER BY` that feeds pagination
+(`ORDER BY amount DESC, id DESC`), and prefer **keyset pagination** —
+`WHERE (amount, id) < (:last_amount, :last_id) ORDER BY amount DESC, id DESC LIMIT 20` — which
+is stable under concurrent writes and does not re-scan `OFFSET` rows on every page. And
+`LIMIT` without any `ORDER BY` returns an arbitrary subset, not "the first ones"; whatever
+order you observed in development is the plan, not a promise.
+
+## Types that change the answer without saying so
+
+**Integer division.** `SUM(...) / COUNT(*)` with two integer operands truncates toward zero
+in PostgreSQL and SQLite, so every rate, percentage and per-capita metric computed that way
+is `0` — trap 8, and a flat zero line on a dashboard that nobody reads as a bug. MySQL's `/`
+on integer or decimal operands yields a DECIMAL (scale = dividend scale +
+`div_precision_increment`, 4 by default),
+so the identical SQL behaves differently there; MySQL's truncating operator is the separate
+`DIV`. Cast explicitly (`::numeric`, `CAST(… AS DECIMAL)`) rather than relying on either.
+
+**`BETWEEN` is closed at both ends.** `placed_at BETWEEN DATE '2026-03-01' AND DATE
+'2026-03-31'` promotes the upper bound to `2026-03-31 00:00:00`, so it covers 30 days and
+zero seconds of March and drops every order placed on the last day — in trap 7 that is one
+order of four, and the revenue with it. The half-open form
+`>= start AND < next_start` is correct at every resolution, survives a column being widened
+from `date` to `timestamptz`, and is equally index-friendly.
+
+**Implicit casts and collation.** These are the quiet ones, because they change *which rows
+match*:
+
+| Predicate | PostgreSQL | MySQL 8 | SQLite |
+|---|---|---|---|
+| `varchar_col = 904` | `ERROR: operator does not exist: character varying = integer` | Both sides converted to DOUBLE, so `'0904'` matches — and the index on the column is unusable, giving a full scan | The literal takes the column's TEXT affinity, becomes `'904'`, and matches nothing |
+| `code = 'acme'` vs stored `'ACME'` | No match — deterministic collation | Matches: the default `utf8mb4_0900_ai_ci` is accent- and case-insensitive | No match, unless the column was declared `COLLATE NOCASE` |
+| Joining `utf8mb4_general_ci` to `utf8mb4_0900_ai_ci` | n/a | "Illegal mix of collations" or a silent conversion that drops the index on one side | n/a |
+
+Trap 9 runs both predicates under each engine. The lesson is not "MySQL is lax" — it is that
+case sensitivity is a property of a *column's collation*, not of the language, so the same
+schema moved between engines silently changes which rows a lookup finds. And an implicit
+cast is not only a semantics problem: once the engine converts the *column* side, the
+predicate is no longer sargable and the B-tree on it goes unused — the identical shape as
+`WHERE date(created_at) = '2026-03-01'`.
+
+## Where it bites in production
+
+- **A reconciliation report drifts by a factor nobody can reproduce.** Two one-to-many joins
+  in one query; the multiplier is the product of two child counts, so it varies per customer
+  and looks like data quality rather than SQL.
+- **An alert goes permanently silent after a backfill.** The import wrote one NULL into the
+  column feeding a `NOT IN` subquery. The job still runs, still succeeds, and returns zero
+  rows forever.
+- **A paginated export contains duplicates and holes.** `ORDER BY created_at` with
+  second-resolution timestamps and a busy writer; the duplicates are rows whose sort key ties.
+- **Averages that exclude exactly the rows you care about.** `AVG(response_ms)` over rows
+  where timed-out requests stored NULL reports the latency of the requests that succeeded.
+- **A login lookup stops matching after a MySQL→PostgreSQL migration.** The old column was
+  case-insensitive by collation; the new one is not.
+
+:::tip[Two cheap audits]
+For fan-out, compare `COUNT(*)` with `COUNT(DISTINCT <parent pk>)` in the joined query: if
+they differ, every aggregate over a parent column is wrong. For NULL traps, run the predicate
+and its negation and check that the two row counts add up to the table's — if they do not,
+some rows evaluated to UNKNOWN and are in neither answer.
+:::
+
+:::note[What to take forward]
+`WHERE` keeps TRUE, `CHECK` rejects only FALSE, `GROUP BY` treats NULLs as equal and `UNIQUE`
+treats them as distinct — the same marker, four rules, and the gaps between them are where
+silent wrong answers live. Never write `NOT IN` against a nullable subquery; never aggregate
+a parent column through a one-to-many join; never paginate without a unique tiebreaker. And
+treat an implicit cast or a collation mismatch as a correctness bug first and a performance
+bug second, because it is both.
+:::

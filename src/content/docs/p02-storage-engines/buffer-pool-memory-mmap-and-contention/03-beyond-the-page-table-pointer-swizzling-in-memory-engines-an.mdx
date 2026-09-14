@@ -1,0 +1,246 @@
+---
+title: "Beyond the page table: pointer swizzling, in-memory engines and anti-caching"
+description: Engines that take the hash lookup off the hot path or delete the buffer pool entirely — Hekaton, VoltDB and Redis versus LeanStore's swizzled swips, Umbra's variable-size frames and H-Store's abort-and-restart anti-caching.
+depth: deep
+sidebar:
+  order: 3
+---
+
+import SwizzledPointerRaceLab from '../../../../components/viz/SwizzledPointerRaceLab';
+import SwizzleEvictionWalk from '../../../../components/viz/SwizzleEvictionWalk';
+
+A buffer pool charges a translation fee on every single page access: hash the page identity,
+take a partition latch, probe, pin. That fee buys the ability to be larger than memory — and if
+your working set fits in RAM anyway, you are paying it for nothing, forever. Three families of
+engine have attacked that fee from different directions, and the differences between them are
+not micro-optimizations; they decide what happens on the day the data stops fitting.
+
+<SwizzledPointerRaceLab client:visible />
+
+## What the translation actually costs
+
+The [structure](/p02-storage-engines/buffer-pool/01-buffer-pool-structure-frames-page-table-and-pins/)
+is already familiar: a frame array, a descriptor per frame, and a hash table from page identity
+to frame index. What is easy to underestimate is the per-access cost of using it. A PostgreSQL
+buffer access hashes the `BufferTag`, takes one of the 128 `BufMappingLock` partitions in shared
+mode, walks a bucket chain of `BufferLookupEnt` entries, and then does a compare-and-swap on the
+target buffer's header state word to increment the pin count — with a matching CAS to unpin. The
+arithmetic is trivial; the *memory* is not. The bucket chain is a pointer chase through cache
+lines that no other part of the query touched, and the latch word and the pin counter are shared
+lines that every core in the machine is writing to.
+
+This is why "OLTP Through the Looking Glass" (Harizopoulos, Abadi, Madden and Stonebraker,
+SIGMOD 2008) is still quoted nearly twenty years later. Stripping a Shore-derived engine down component
+by component on a TPC-C-like workload, buffer management was the single largest line item — about
+a third of the instructions — and under 7% of instructions were doing what anyone would call
+useful work. Latching, locking and logging accounted for most of the rest. If the whole database
+is resident, every one of those buffer-manager instructions is pure ceremony.
+
+## Delete the pool
+
+The first family simply removes it. In a memory-resident engine the index entry *is* the address:
+you follow a pointer to the record and read it. There is no page identity to translate, no pin to
+take, no descriptor to update, and the unit of access is a cache line rather than an 8 KB page.
+
+- **SQL Server's Hekaton** stores memory-optimized tables as rows linked by pointers, reached
+  through lock-free hash indexes or a Bw-tree for range access. Row versions carry begin and end
+  timestamps in their header; there are no latches anywhere in the engine. Durability comes from
+  the transaction log plus data/delta checkpoint file pairs in a `MEMORY_OPTIMIZED_DATA` filegroup
+  — and the indexes are not persisted at all, they are rebuilt at startup from those files. The
+  hard edge is the bound resource pool: when it is exhausted, the DML fails outright.
+- **H-Store / VoltDB** partition the data across single-threaded executors. One thread owns a
+  partition, so transactions need neither locks nor latches — and nothing is ever allowed to
+  block, because blocking one transaction blocks the whole partition. Recovery is snapshots plus
+  a command log.
+- **Redis** keeps values in C structures reached from a hash table, served by a single command
+  loop. Its memory ceiling is `maxmemory`, and its default `maxmemory-policy` is `noeviction`:
+  past the limit, writes are rejected with
+  `OOM command not allowed when used memory > 'maxmemory'`.
+
+Set the lab to **OOM** and drag memory below the working set. Nothing degrades. The engine runs
+at four nanoseconds an access and then stops serving, which is the honest summary of the whole
+design: capacity planning is a cliff, not a curve.
+
+:::caution[The default is a correctness decision]
+`maxmemory-policy noeviction` looks like the conservative choice because it refuses writes.
+The alternatives — `allkeys-lru`, `volatile-ttl`, `allkeys-random` — *delete committed data* to
+make room, silently, and are only safe if every key in the instance is genuinely a cache entry.
+If you run Redis as a system of record, changing this knob to stop the OOM errors converts an
+availability incident into a data-loss incident.
+:::
+
+## Anti-caching: evict tuples, abort transactions
+
+The second family keeps the in-memory architecture and inverts the classic storage hierarchy.
+In "Anti-Caching: A New Approach to Database Management System Architecture" (DeBrabant, Pavlo,
+Tu, Stonebraker and Zdonik, VLDB 2013), memory is *primary* storage and disk is the overflow. No
+pages are copied in; cold **tuples** are moved out.
+
+The mechanism has three parts. Each table carries an LRU chain threaded through the tuple headers
+themselves, so tracking recency costs bytes per tuple and no separate structure. When memory runs
+short, an eviction pass walks the cold end of that chain, packs those tuples into a block, writes
+the block, and replaces each evicted tuple with an entry in an **Evicted Table** mapping tuple id
+to block id and offset. Crucially, **indexes stay in memory** — an index scan has to be able to
+find that a row exists, and which block it went to, without doing any I/O.
+
+Then a transaction touches an evicted tuple mid-execution. A buffer-pool engine would block on
+the read; H-Store cannot, because one thread owns the partition and blocking it stalls every
+other transaction queued behind it. So the transaction is **aborted and rolled back**, the block
+is fetched and merged asynchronously, and the transaction is **re-executed from the start**.
+(The paper adds a pre-pass: the aborting transaction first records *all* the evicted tuples it
+will need, so the restart does not immediately abort again on the second one.) Merging comes in
+two flavours: **block-merge** brings the whole block back into memory, which is simple and
+re-imports tuples nobody asked for; **tuple-merge** splices back only the tuples that were needed
+and leaves the block on disk.
+
+Switch the lab to **anti-cache** and shrink memory. The engine survives — but watch the abort
+counter and the per-access time. Each miss now costs a rollback, an I/O, a merge and a second
+execution, which is strictly more than the single I/O a buffer pool would have paid. Anti-caching
+is a bet that misses are *rare*, not that they are cheap.
+
+The same shape reappears in **Redis Enterprise's Auto Tiering** (formerly Redis on Flash): keys
+and the dictionary stay in RAM, cold *values* live on flash behind an embedded key-value store.
+There is no abort — the access simply blocks — but the invariant is identical, and it is the one
+to remember from this whole family: **the index must be resident**. Every design here is bounded
+by the size of its index, not the size of its data.
+
+:::caution[The cold-scan pathology]
+Anti-caching has the same weakness as an LRU buffer pool under a
+[sequential scan](/p02-storage-engines/buffer-pool/05-scan-resistance-sequential-flooding-ring-buffers-and-midpoin/),
+only louder. A nightly report that reads cold rows aborts and restarts a transaction per block,
+drags every one of those tuples into memory, and evicts the hot set to make room for them.
+The symptom is a restart rate that climbs while throughput falls off a cliff, and a working set
+that is still cold an hour after the report finished.
+:::
+
+## Pointer swizzling: keep the pool, delete the lookup
+
+The third family keeps pages, keeps the buffer manager, keeps the ability to be much larger than
+memory — and removes the hash probe from the hot path. The idea is old: object databases called
+it **pointer swizzling** (J. Eliot B. Moss, "Working with persistent objects: to swizzle or not
+to swizzle", 1992), and Graefe et al. brought it back to a page-based buffer pool in Shore-MT
+("In-memory performance for big data", VLDB 2014). **LeanStore** (Leis, Haubenschild, Kemper and
+Neumann, ICDE 2018) made it the centre of a storage engine.
+
+A **swip** is the single word that a parent page uses to refer to a child. It holds either the
+child's **page id** (unswizzled) or the **address of the frame** the child currently occupies
+(swizzled), distinguished by a tag bit. Descending from a parent to a resident child is therefore
+a tag test and a dereference — no hash, no partition latch, no pin. Descending to a
+non-resident child reads the page id straight out of the swip, so even the miss path needs no
+lookup to discover *where* the page lives.
+
+Reads are validated **optimistically**: each page carries a version counter, a reader reads the
+version, reads the data, then re-reads the version and restarts if it moved. A read writes
+nothing to shared memory, so there is no cache line for readers to fight over — the mechanics of
+that fight are [page 4's subject](/p02-storage-engines/buffer-pool-memory-mmap-and-contention/04-latching-the-buffer-pool-and-hot-page-contention/).
+
+The invariant that makes any of this possible is severe: **every page is referenced by exactly
+one swip**. That is what makes "find the reference to this page" a bounded operation instead of a
+search of the entire pool. It also forbids the structures a classic B-tree takes for granted —
+LeanStore's leaves have no sibling pointers, because a second reference to a page would be a
+second swip to find and rewrite.
+
+<SwizzleEvictionWalk client:visible />
+
+Eviction is where the bill arrives, and the walkthrough above is the protocol:
+
+1. **Sample.** There is no LRU list and no per-access counter — that bookkeeping is exactly the
+   cost being avoided — so candidates are picked by sampling frames at random.
+2. **Refuse and descend.** A candidate whose children are still swizzled cannot be evicted: its
+   child slots hold RAM addresses, which are meaningless on disk, and writing it out would leave
+   those children unreachable. LeanStore considers one of those children instead, which biases
+   replacement towards leaves — inner pages are the hot ones anyway.
+3. **Unswizzle from the parent.** Find the one page that references this one (a parent pointer
+   hint, with a top-down traversal as the fallback), latch it exclusively, and rewrite its swip
+   from an address back into a page id. This is a write to *another page*, and it is the entire
+   cost of distributing the mapping.
+4. **Cool.** The page has not moved and has not been written; it goes into a FIFO plus a hash
+   table, together holding roughly a tenth of the pool. A reader that arrives now finds it
+   through the **cooling hash table**, unlinks it from the FIFO and swizzles it straight back into
+   the parent — no I/O. Press **Touch this page** mid-protocol and watch that happen. Cooling is
+   what keeps the eviction decision revocable right up until the frame is actually reused.
+5. **Write and evict.** A page that reaches the end of the FIFO is written if dirty (WAL first,
+   unchanged by any of this) and its frame returns to the free list. Because optimistic readers
+   leave no pin behind, the frame cannot simply be handed out again: LeanStore reclaims it
+   **epoch-based**, publishing a global epoch that each worker copies while it holds a page
+   reference, and reusing the frame only once every worker has moved past the epoch in which the
+   page was still reachable. A reader that was mid-access when the page left finds the version
+   counter changed and restarts. No dangling reference is
+   possible, because the parent stopped pointing at that frame in step 3 — which is precisely why
+   unswizzling happens before the eviction and not after.
+
+**Umbra** (Neumann and Freitag, CIDR 2020) carries the design forward with **variable-size pages**
+in power-of-two size classes, so a large string or an oversized key does not need a separate
+allocator or an overflow chain. Each size class gets its own anonymous `mmap` reservation as large
+as the whole buffer pool, with `MAP_NORESERVE`, so the total *virtual* reservation is several
+times RAM while the *resident* set stays capped by the buffer manager's own accounting; the
+physical pages behind an evicted frame are handed back with `madvise(MADV_DONTNEED)`. That is
+virtual memory used as an allocator, not as an I/O path —
+[the argument against mmap as a storage interface](/p02-storage-engines/buffer-pool-memory-mmap-and-contention/02-buffer-pool-vs-os-page-cache-vs-mmap/)
+is untouched: Umbra still issues its own reads and writes and still decides its own eviction.
+
+## The trade, stated plainly
+
+| | Unit moved | Per-access lookup | Cost of invalidating one reference | When RAM runs out |
+|---|---|---|---|---|
+| No buffer pool (Hekaton, VoltDB, Redis) | nothing | none — the index entry is the address | n/a | writes fail |
+| Anti-caching (H-Store, Redis Auto Tiering) | tuple, packed into blocks | none, plus an evicted-table check on a miss | one Evicted Table entry | abort, fetch, merge, re-execute |
+| Hash-table pool (PostgreSQL, InnoDB) | page | hash probe under a partition latch, plus a pin, **every access** | delete one hash entry | hit rate falls, smoothly |
+| Swizzling pool (LeanStore, Umbra) | page | pointer dereference for resident pages | latch the one parent and rewrite its swip | hit rate falls, smoothly |
+
+The two right-hand columns are the same trade seen from both ends. A **centralized** mapping is
+cheap to invalidate and expensive to consult; a **distributed** mapping — references embedded in
+the pages that use them — is free to consult and expensive to invalidate, and only works at all
+when the number of references to a page is known to be one.
+
+Which one pays is decided by the ratio of working set to RAM, and by whether that working set
+*drifts*:
+
+- **Fits comfortably, and will keep fitting.** No pool wins outright; every alternative is paying
+  for a spill path it never uses.
+- **Hot set is a stable fraction of a much larger dataset.** Anti-caching is excellent — the hot
+  tuples run at pointer speed and cold data costs nothing until it is touched. A swizzling pool
+  is close behind, with the advantage that it degrades instead of aborting.
+- **Working set is near RAM and moves.** The swizzling pool is the only design here that stays
+  well-behaved: misses cost one I/O, evictions cost one parent latch, and nothing thrashes on
+  restarts.
+- **Working set is many times RAM.** Everything converges on I/O cost and the page table stops
+  mattering; buy a better replacement policy, not a better lookup.
+
+The LeanStore result worth internalizing is that these are no longer exclusive: a buffer-managed
+engine can reach in-memory speed on in-memory workloads, so "we chose an in-memory engine for the
+performance" stopped being a complete argument in 2018.
+
+## Where it bites in production
+
+- **You will not run LeanStore, but you will meet its ideas.** Umbra's commercial descendant
+  (CedarDB) ships this design, and swizzling plus optimistic version latches have become the
+  standard reference architecture for new storage engines. Read a modern engine's buffer manager
+  and count how many of these five steps you recognize.
+- **Redis capacity is a cliff.** Alert on `used_memory` against `maxmemory` with real headroom,
+  not on latency — p99 stays flat right up to the first rejected write. Watch `evicted_keys` if
+  the policy is not `noeviction`, and remember that `mem_fragmentation_ratio` means the allocator
+  can be short of memory the kernel thinks is free.
+- **Anti-caching pathologies show up as restarts, not as I/O waits.** Monitor transaction restart
+  rate per partition. A rising restart rate with flat disk utilization means the working set has
+  outgrown memory and the engine is spending its time re-executing.
+- **In PostgreSQL and InnoDB, you cannot swizzle — so reduce the number of lookups.** Each row
+  fetched through a four-level B-tree costs four buffer lookups plus one for the heap page;
+  covering and index-only scans remove the last one, and a larger `innodb_page_size` removes a
+  level. PostgreSQL does have a keyhole version of swizzling in `ReadRecentBuffer()`, which
+  re-pins a remembered buffer id and re-checks its tag under the buffer header lock instead of
+  probing `SharedBufHash` — the same idea (cache the translation at the reference site), applied
+  in one place rather than everywhere.
+- **Beware benchmarks that only prove the data fits.** A comparison of an in-memory engine against
+  a buffer-managed one at 100% residency is measuring exactly the ceremony described here. The
+  interesting number is what each does at 70% residency, and whether it is still serving at 40%.
+
+:::note[What to take forward]
+The page table is a *translation*, and translation is only worth paying for when it buys
+something — being larger than memory. In-memory engines delete it and accept a hard wall;
+anti-caching keeps memory as primary storage and moves cold *tuples* out, paying an abort and a
+restart when a transaction guesses wrong, with the index pinned in RAM forever. Pointer swizzling
+keeps the pool and moves the mapping into the referencing pages, so a resident child costs a
+dereference — at the price of an invariant (one swip per page) and an eviction protocol that must
+walk to the parent and rewrite the reference before the frame can be reused.
+:::

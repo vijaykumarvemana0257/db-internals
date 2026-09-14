@@ -1,0 +1,287 @@
+---
+title: How good can a cache policy be? OPT, competitive ratios and the stack property
+description: Belady's MIN as the offline optimum, the k-competitive lower bound that caps what any online policy can win, and the stack property that turns one pass over a trace into a whole miss-ratio curve.
+depth: deep
+sidebar:
+  order: 4
+---
+
+import OptCompetitiveReplay from '../../../../components/viz/OptCompetitiveReplay';
+import ReuseDistanceMrcLab from '../../../../components/viz/ReuseDistanceMrcLab';
+
+Every argument about whether to run LRU, CLOCK, ARC or LIRS is an argument about a number
+that has a known ceiling. There is a provable best any policy could do on a given trace,
+there is a proof that no online policy can be more than a bounded factor worse than it, and
+there is a one-pass measurement that tells you exactly what more memory would buy. Those
+three facts together decide whether your next move is a smarter eviction algorithm or a
+bigger `shared_buffers` — and it is almost always the second one.
+
+<OptCompetitiveReplay client:visible />
+
+## Belady's MIN: the yardstick you cannot run
+
+Belady's 1966 algorithm, usually written OPT or MIN, is simple enough to state in one line:
+**on a miss, evict the resident page whose next reference is furthest in the future** (a
+page never referenced again counts as infinitely far). It is optimal for demand paging — no
+sequence of eviction choices produces fewer misses on the same reference string — and the
+proof is a standard exchange argument: take any optimal schedule that disagrees with MIN at
+the first eviction, swap that eviction for MIN's choice, and show the swapped schedule
+faults no more often, then induct.
+
+It is also unimplementable, because it reads the trace forward. That is the entire point of
+having it. OPT is not a policy, it is a **measuring instrument**: it converts "our hit rate
+is 94%" — a number with no scale — into "our hit rate is 94% and the best achievable on this
+exact workload at this exact size is 97%", which is a number you can act on. Hover the OPT
+row in the lab and each frame shows `→n`, the step at which that page is next needed; the
+victim is always the largest one.
+
+Select the 9-page looping scan and set the pool to 6 frames. LRU, CLOCK and ARC all miss
+**every single reference** — each page is evicted exactly one step before it is needed
+again — while OPT misses 40% of them, because it holds most of the loop pinned and spends
+the same one or two frames over and over. A 2.5× gap, and it is the largest gap you will see
+from any non-adversarial string.
+
+:::caution[MIN is optimal for demand paging only]
+OPT assumes the cache fetches a page only when it is referenced. Once you add prefetching,
+a policy that fetches *before* the reference can beat MIN, which is exactly why read-ahead
+is a separate lever from replacement — see [prefetching and asynchronous
+reads](/p02-storage-engines/buffer-pool/07-prefetching-and-asynchronous-reads/). MIN is also
+optimal in *fault count*, not in *time*: two schedules with equal misses can differ wildly if
+one's misses are sequential and the other's are random seeks.
+:::
+
+## The competitive ratio, and why it bottoms out at k
+
+Sleator and Tarjan's 1985 paper on amortized efficiency of paging rules gave the framework
+that is still the standard one. An online algorithm `A` is **c-competitive** if there is a
+constant `b` such that for every request sequence σ,
+
+```
+cost_A(σ)  ≤  c · cost_OPT(σ)  +  b
+```
+
+The constant `b` absorbs start-up effects (a cold cache); `c` is what matters. Two results
+do all the work:
+
+**No deterministic online policy is better than k-competitive**, where `k` is the number of
+frames. The adversary argument is three lines. Restrict the universe to `k + 1` pages. Since
+`A` is deterministic, the adversary knows which page `A` does not currently hold, and
+requests precisely that one, every time — so `A` misses on 100% of references. OPT, on the
+same sequence, evicts the page whose next request is furthest away, which guarantees it
+faults at most once in every `k` consecutive requests. Ratio: `k`. No cleverness escapes
+this, because the cleverness is public and the adversary reads it.
+
+**LRU and FIFO achieve k**, and so does every *conservative* policy — one that never faults
+more than `k` times on any window of requests touching at most `k` distinct pages. CLOCK and
+second-chance are in that class. So the online policies real engines ship are already
+optimal in the worst case; there is nothing left to win there.
+
+Randomization moves the bound, and only randomization does. The **marking algorithm** — mark
+a page on reference, evict a uniformly random *unmarked* page, and when everything is marked
+start a new phase with all marks cleared — is `2H_k`-competitive against an oblivious
+adversary, where `H_k = 1 + 1/2 + ... + 1/k ≈ ln k`. Fiat, Karp, Luby, McGeoch, Sleator and
+Young proved both that bound and a matching `H_k` lower bound for any randomized policy. At
+`k` = 131 072 frames (a 1 GB pool of 8 KB pages) that is the difference between a worst-case
+factor of 131 072 and a worst-case factor of about 25.
+
+:::note[Why nobody ships marking]
+The `O(log k)` bound is real and the algorithm is not used, because worst-case competitive
+ratio is not what a buffer pool optimizes. Random eviction destroys the sequential locality
+of writeback, the mark bit is one more word of contended state per frame, and on real traces
+the measured gap between CLOCK and anything smarter is a few percentage points — while the
+gap between one atomic increment and a list-head mutex on every hit is the difference
+between scaling to 64 cores and not. That trade is [page 3's
+subject](/p02-storage-engines/buffer-pool/03-replacement-policies-lru-clock-lru-k-2q-and-arc/).
+:::
+
+## The sentence to actually use: resource augmentation
+
+The `k`-competitive result compares two caches of the same size. The more useful form
+compares different sizes. LRU with `k` frames is `k / (k − h + 1)`-competitive against OPT
+running with `h` frames. Set `h = k/2` and the ratio collapses to just under **2**:
+
+> Double the buffer pool and plain LRU is guaranteed to be within a factor of two of a
+> clairvoyant policy running in the pool you had.
+
+No policy change carries a guarantee like that, and no policy change can, because the
+`k`-competitive lower bound says the worst case is fixed once the size is. This is why the
+honest sizing conversation is about bytes, and why the interesting question stops being
+"which policy" and becomes "what does the curve look like at the sizes I can afford".
+
+Measured, non-adversarial numbers back this up. In the lab's 80/20 hot-set trace at 6
+frames, LRU misses 1.71× as often as OPT and ARC 1.40× — ARC's ghost lists are worth
+something real, a cut from 72 misses to 59. Now leave the policy alone and drag the frame
+count from 6 to 10 instead: LRU goes from 72 misses to 44, more than twice the improvement.
+One of those moves is a config change with a monotone, predictable effect; the other is a
+rewrite of the eviction path with a contention cost and a worst case you now have to reason
+about.
+
+## The stack property: one pass, every size
+
+If policies are bounded, sizing is everything — and sizing has a beautiful measurement.
+
+A replacement policy has the **inclusion property** (Mattson, Gecsei, Slutz and Traiger,
+1970) if for every trace and every instant, the contents of a cache of size `k` are a subset
+of the contents of a cache of size `k + 1`. Policies with it are called **stack algorithms**,
+and they have two consequences that look like they should cost work and do not:
+
+1. **The miss ratio is monotone non-increasing in cache size.** More memory never produces
+   more misses. This is not a general truth about caches — see Belady's anomaly below.
+2. **One pass over the trace yields the entire miss-ratio curve.** For each reference,
+   record its **stack distance** (also called reuse distance): the number of *distinct*
+   pages referenced since the last reference to this page. A reference with distance `d` is
+   a hit in an LRU cache of exactly the sizes `k > d`, and a miss at every `k ≤ d`. So the
+   histogram of distances, reverse-cumulated, *is* the curve — no simulation, no repeated
+   passes, no guessing which sizes to test.
+
+A first-ever reference has distance infinity. Those are the compulsory misses, the floor
+under every size and every policy.
+
+<ReuseDistanceMrcLab client:visible />
+
+The readout labelled "LRU prediction error" is the claim made testable: across all 48 sizes,
+the one-pass prediction and the per-size LRU simulation differ by exactly zero, on every
+workload. Then look at the CLOCK and ARC lines, which had to be simulated 48 separate times
+and still do not lie on the curve.
+
+## Which policies have it, and which must be simulated
+
+The test is mechanical: **does the policy induce a priority order over pages that does not
+depend on the cache size?** If yes, it is a stack algorithm; the size only decides where the
+cut falls.
+
+| Policy | Stack algorithm? | Why |
+|---|---|---|
+| LRU | Yes | Priority is recency order, computed without reference to `k` |
+| LFU | Yes | Priority is the frequency count, likewise |
+| OPT / MIN | Yes | Priority is next-use time; it has its own one-pass distance metric |
+| FIFO | **No** | Insertion order interacts with size; the original Belady anomaly |
+| CLOCK / second chance | **No** | The hand's position and the sweep length depend on the number of frames |
+| 2Q | **No** | `A1in` and `A1out` are sized as fractions of the cache |
+| LRU-K | **In practice, no** | The idealised order — the time of the K-th most recent reference — does not depend on `k`, but implementations keep history only for resident pages plus a retained-information period, which puts `k` back in |
+| ARC | **No** | The adaptive target `p` and the ghost lists `B1`/`B2` are all sized in `k` |
+| LIRS, W-TinyLFU | **No** | LIRS partitions into LIR/HIR by cache size; TinyLFU's sketch and admission threshold are sized to the cache |
+| Random | **No** | No consistent order at all |
+
+**Belady's anomaly** is the visible consequence of not being a stack algorithm: Belady,
+Nelson and Shedler showed in 1969 that FIFO can take *more* page faults with *more* frames.
+It is not a curiosity. The lab's "Non-monotone points" tile counts the sizes at which CLOCK
+or ARC got worse with one extra frame on the current trace: on the default hot-set-plus-loop
+workload ARC posts three of them, and stretching the loop to 30 pages produces one worth about
+5 percentage points. Operationally
+this means: for a non-stack policy you may not extrapolate. You measured 32 GB and 64 GB; you
+know nothing rigorous about 48 GB.
+
+This is also the practical case for reporting an LRU MRC even when your engine runs CLOCK.
+The LRU curve is cheap, exact, monotone and a good approximation of what CLOCK does — CLOCK
+exists precisely because it approximates LRU — so it is the right shape to size against, with
+the caveat that the number at any specific size is off by a point or two.
+
+## Getting an MRC out of a real system
+
+The naive stack-distance computation is `O(n · m)` for `n` references over `m` distinct
+pages, which is fine for a captured sample and hopeless for a production stream. Three
+generations of fixes:
+
+- **Exact, faster.** Bennett and Kruskal's 1975 LRU-stack processing, and Olken's
+  balanced-tree refinement, bring stack distance down to a logarithmic factor by counting the
+  distinct pages in a range with an order-statistic tree instead of walking a list.
+- **Sampled.** SHARDS (Waldspurger et al., FAST 2015) hashes each reference and tracks only
+  those whose hash falls below a threshold, then rescales; the sampling rate is a knob, the
+  memory footprint can be fixed, and the resulting MRCs track the exact ones closely enough
+  to size with.
+- **Streaming.** Counter Stacks (Wires et al., OSDI 2014) maintains HyperLogLog cardinality
+  sketches over sliding windows, computing MRCs continuously in bounded memory — designed
+  for exactly the case where you cannot store the trace. AET later did it with a kinetic
+  model of eviction time.
+
+What you can capture per engine:
+
+| Engine | What to capture | What it gives you |
+|---|---|---|
+| PostgreSQL | `pg_stat_database.blks_hit` / `blks_read`, `pg_statio_user_tables`, `pg_stat_statements.shared_blks_read` | Hit rate over time and per statement — a point on the curve, not the curve |
+| PostgreSQL | `pg_buffercache` (`relfilenode`, `relblocknumber`, `usagecount`, `isdirty`) sampled repeatedly | What is resident, how hot, and how much of the pool one relation owns |
+| PostgreSQL | `auto_explain` with `log_buffers`, or `EXPLAIN (ANALYZE, BUFFERS)` | Per-plan-node block references — the closest thing to a trace the server hands you |
+| MySQL / InnoDB | `innodb_buffer_pool_read_requests` vs `innodb_buffer_pool_reads` | Logical reads vs reads that went to storage |
+| MySQL / InnoDB | `information_schema.INNODB_BUFFER_PAGE`, `INNODB_BUFFER_POOL_STATS` | Resident page inventory per table and per index |
+| Redis | `INFO stats`: `keyspace_hits` / `keyspace_misses`; `MONITOR` or a client-side sample for a key trace | A key-level MRC; the unit is the key, not the page |
+| Any | `blktrace` / `blkparse` on the data device, or a bpftrace probe on the engine's read path | A true block-level trace you can run through a stack-distance pass offline |
+
+None of these engines ships an MRC tool. You capture a trace — an hour of the workload you
+care about is usually enough, and SHARDS-style sampling makes that cheap — and run the single
+pass yourself.
+
+:::caution[Two pools, one curve]
+An MRC computed from an engine-level trace describes the engine's cache only. PostgreSQL
+reads through the OS page cache as well, so a `shared_buffers` miss frequently costs a memcpy
+rather than an I/O, and the curve's steep region overstates the real latency penalty; this is
+the actual reason the usual guidance caps `shared_buffers` near 25% of RAM rather than 75%.
+InnoDB run with `innodb_flush_method=O_DIRECT` avoids the double-buffering and is therefore
+usually sized at 50–75% of RAM — but it splits the pool into `innodb_buffer_pool_instances`, each with its own LRU
+list, so a single-pool MRC is optimistic: pages hash to one instance and cannot borrow a
+neighbour's frames.
+:::
+
+## The working set, and the cliff the curve predicts
+
+Denning's working-set model names the thing the MRC's knee measures: `W(t, τ)` is the set of
+pages referenced in the window `(t − τ, t]`, and a process runs smoothly while its working
+set is resident and thrashes when it is not. The MRC is what that model looks like when you
+plot it.
+
+For workloads with skewed reuse, the curve bends: there are diminishing returns, and the knee
+tells you where to stop buying memory. For workloads with a **loop**, the curve does not bend,
+it *falls off a cliff* — and the reason is visible in the histogram. A cyclic scan over `L`
+pages puts every one of its references at exactly the same reuse distance, `L − 1`. The
+histogram becomes a single spike, and the reverse cumulative sum of a spike is a step
+function: 100% misses at every size below `L`, near zero at `L` and above.
+
+Set the second lab to the pure looping scan and drag the loop length across the pool marker.
+Nothing gradual happens. One extra page in the loop, or one frame fewer in the pool, moves a
+workload from a perfect hit rate to a perfect miss rate. This is the same cliff as the
+[memory-hierarchy page's](/p01-foundations/hardware-os-durability/01-memory-hierarchy-and-latency-numbers/)
+working-set cliff, now with an exact cause and an exact location.
+
+Two lessons fall out of it. First, **the cliff is not a policy failure**, because OPT sits on
+the same trace: at 6 frames on a 9-page loop, perfect foresight still misses 40% of
+references. No eviction algorithm can hold nine pages in six frames. Second, the cliff is
+where the special-case machinery lives: rather than let a scan own the pool it cannot fit in,
+engines route it through a small ring buffer and protect the hot set instead — the subject of
+[scan resistance](/p02-storage-engines/buffer-pool/05-scan-resistance-sequential-flooding-ring-buffers-and-midpoin/).
+
+## Where it bites in production
+
+- **A hit-ratio target is the wrong metric; the slope is the right one.** "99% is healthy" is
+  meaningless without the curve: 99% on 10 M logical reads per minute is 100 000 physical
+  reads per minute. What you want to know is what the next 10% of memory buys — flat means
+  you are done, steep means you are one table's growth away from an incident.
+- **Swapping the policy while sitting on the cliff.** The most common wasted quarter in this
+  area is replacing LRU with ARC or LIRS for a workload whose reuse distances all sit above
+  the pool size. Compute the MRC first. If the curve is flat at your size, no policy will move
+  it; if there is a cliff just past your size, buy the memory.
+- **The pool resize that made things worse.** Under CLOCK, ARC or 2Q this is not necessarily a
+  measurement error — it is Belady's anomaly, and it is why a resize should be measured rather
+  than assumed. If a 50% pool increase moves the hit rate by less than the noise band, that
+  is the curve telling you the working set was already resident.
+- **Warm-up costs scale with the curve too.** The area between the cold-start hit rate and the
+  steady-state hit rate is the work a restart has to redo, which is why an accurate MRC is
+  also an estimate of how long a failover runs slow — see [cache
+  warm-up](/p02-storage-engines/buffer-pool/02-cache-warm-up-cold-pools-dump-load-and-prewarming/).
+- **A Redis tier is the same calculation with a different unit.** `keyspace_hits` and
+  `keyspace_misses` give the operating point; `maxmemory-policy allkeys-lru` is itself an
+  approximation — Redis samples `maxmemory-samples` keys (5 by default) and evicts the best of
+  the sample rather than the true LRU victim, so raising it to 10 buys accuracy for CPU.
+  `allkeys-lfu` swaps in a counter with `lfu-log-factor` and `lfu-decay-time`. None of those
+  are stack algorithms either; the key-level MRC still sizes the tier.
+
+:::note[What to take forward]
+OPT tells you the ceiling for a given trace and size, and the `k`-competitive bound says no
+deterministic online policy can be beaten by more than a factor the size already fixed — so
+the reachable win from a smarter policy is small and bounded, while the win from more memory
+is described exactly by the miss-ratio curve. Get the curve from one reuse-distance pass over
+a captured trace: it is exact for LRU because LRU is a stack algorithm, close enough for the
+CLOCK variants engines actually run, and wrong in detail for ARC, 2Q, LIRS and TinyLFU, which
+must be simulated or measured at the size you plan to deploy. And when the curve shows a cliff
+rather than a knee, the workload is a loop, and no policy — not even a clairvoyant one — will
+save a pool smaller than the loop.
+:::

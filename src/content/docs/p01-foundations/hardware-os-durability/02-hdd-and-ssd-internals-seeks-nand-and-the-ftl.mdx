@@ -1,0 +1,283 @@
+---
+title: "HDD and SSD internals: seeks, NAND and the FTL"
+description: Why a spinning platter makes sequential I/O ~100x faster than random, why flash can write a page but only erase a block, and what the FTL does with that mismatch.
+depth: basics
+sidebar:
+  order: 2
+---
+
+import PlatterSeekScheduler from '../../../../components/viz/PlatterSeekScheduler';
+import FlashTranslationLab from '../../../../components/viz/FlashTranslationLab';
+
+Both kinds of drive lie to you, and they lie in different ways. A hard disk pretends to be a
+flat array of sectors while charging you for arm movement and rotation you cannot see. A
+solid-state drive pretends to be the same flat array while running a log-structured
+filesystem in firmware, quietly copying your data around to make room. Page size, sequential
+logs, LSM compaction and where you put `fsync` are all answers to one of those two lies.
+
+## The mechanical drive: seek, rotate, transfer
+
+<PlatterSeekScheduler client:visible />
+
+A read on a hard disk is three costs in series, and only the last one moves data:
+
+1. **Seek** — the voice-coil actuator swings the arm to the right cylinder: about 0.5–1 ms
+   track-to-track, 8–9 ms average on a 7200 rpm 3.5-inch drive, 15–17 ms full stroke. It is a
+   settle-limited mechanical motion, so seek time grows roughly with the *square root* of the
+   distance, not linearly.
+2. **Rotational latency** — you then wait for the sector to come round under the head. At
+   7200 rpm a revolution is 8.33 ms, so the average wait is **4.17 ms**; 10 000 rpm buys 3 ms
+   and 15 000 rpm buys 2 ms. This is the entire reason 15k SAS drives existed and cost four
+   times as much per gigabyte.
+3. **Transfer** — data streams under the head at 150–260 MB/s on a modern drive's outer
+   tracks. An 8 KB page takes about 40 µs.
+
+Add them up: a random 8 KB read costs roughly `8.5 + 4.2 + 0.04 ≈ 12.7 ms`, which is where
+the famous **80–120 IOPS per spindle** comes from. That number has not improved meaningfully
+since 2005, because it is bounded by the mass of an actuator arm and the tensile strength of
+an aluminium platter, not by lithography.
+
+Now make the next request land on the *adjacent* sector. Seek is zero, rotational latency is
+zero — the sector is already arriving under the head — and you pay only transfer. In the
+visual above, sequential service time is about 1.4 ms per request against 13.6 ms for uniform
+random, and the fraction of the drive's time that actually moved data rises from 5% to 48%.
+
+:::note[Where "sequential is 100× faster" comes from]
+The ratio depends entirely on request size, so quote it carefully. Per *request* at database
+page sizes it is roughly 10×. In delivered *bandwidth* it is worse than 100×: 100 random 8 KB
+reads per second is 800 KB/s against 200 MB/s streaming, a factor of 250. Push the request up
+to 1 MB and the 12.7 ms access is amortized over 5 ms of transfer — 57 MB/s, within about 4× of
+streaming, and shrinking further with every doubling of the request. That collapse is the design
+rule: make far accesses few and large.
+:::
+
+### Elevator scheduling
+
+Because the arm is one shared resource, servicing requests in the order the host issued them
+is close to the worst possible order. The fix is older than SQL: buffer a window of pending
+requests and service them in **track order**, sweeping the arm in one direction. SCAN reverses
+at each end; C-SCAN (the "elevator" proper) sweeps one way and snaps back, which keeps latency
+fairer for the tracks it just left; LOOK and C-LOOK are the variants that turn around at the
+last request rather than the last track.
+
+Drag the elevator window in the visual. On the uniform-random workload, total arm travel falls
+from 758 tracks to 221 and average service time from 13.6 ms to 6.8 ms — the drive got twice
+as fast because the *host* stopped asking for things in a stupid order. On the sequential
+workload the elevator changes nothing, because there is nothing left to reorder.
+
+This is what the Linux block layer still does. `cat /sys/block/sda/queue/scheduler` shows
+`mq-deadline` or `bfq` on a rotational device — both sort by sector with a deadline escape
+hatch so a starved request eventually jumps the queue. SATA's NCQ lets the drive itself
+reorder up to 32 outstanding commands, which it does better than you can because only the
+firmware knows the current head position. The relevant hint is
+`/sys/block/sdX/queue/rotational`.
+
+:::caution[The scheduler is a liability on NVMe]
+Sorting costs CPU and adds latency, and an SSD has no arm to save. The right scheduler for
+NVMe is `none`: `echo none > /sys/block/nvme0n1/queue/scheduler`. Distros usually get this
+right through udev rules, but virtualised and containerised hosts frequently do not, and
+`mq-deadline` on NVMe is a measurable tax on every I/O plus a serialisation point at high
+queue depth.
+:::
+
+The same geometry explains two engine knobs. InnoDB's `innodb_flush_neighbors=1` flushes dirty
+pages that are physically adjacent to the page it was going to flush anyway, because on a
+platter their write is nearly free; on an SSD it is pure write amplification and the
+recommended setting is `0`. Postgres's `effective_io_concurrency` and InnoDB's
+`innodb_io_capacity` are both, underneath, a statement about how many independent far accesses
+the device can absorb at once — one for a spindle, hundreds for NVMe.
+
+## NAND: you write pages, you erase blocks
+
+<FlashTranslationLab client:visible />
+
+Flash stores bits as charge trapped on a floating gate, or in a charge-trap layer in 3D NAND.
+Three asymmetries follow, and they are the whole story:
+
+- **Read** is fast and fine-grained: one page, 50–90 µs (`tR`).
+- **Program** writes a page — 4 KB on older parts, **16 KB** on modern TLC and QLC — and takes
+  650–2500 µs (`tPROG`), because multi-level cells are programmed in several passes to place
+  the charge precisely.
+- **Erase** is the problem. A cell cannot be flipped back from programmed to erased
+  individually. You can only erase an entire **block**: hundreds to a couple of thousand pages,
+  so **4–24 MB**, in 3–10 ms (`tBERS`).
+
+And a page must be erased before it can be programmed. So the smallest thing the media lets
+you overwrite is 4–24 MB, while the smallest thing the host asks you to overwrite is 512 bytes.
+
+Cells also wear out. Each program/erase cycle damages the oxide, and endurance falls hard with
+bits per cell: SLC 50 000–100 000 P/E cycles, MLC 3 000–10 000, TLC 1 000–3 000, QLC often a
+few hundred to about 1 000. Firmware that erased a block on every 8 KB overwrite would destroy
+a QLC drive in days.
+
+## The FTL: a log-structured filesystem in firmware
+
+The **flash translation layer** resolves the mismatch the only way it can. It never overwrites
+in place. Every host write goes to the **next free page of the currently open block**, and the
+FTL updates a logical-to-physical map so the LBA now points at the new location. The previous
+physical page is marked **invalid** — garbage that still occupies space and cannot be reused
+until its whole block is erased.
+
+That is why the same overwrite is cheap logically and expensive physically.
+`UPDATE t SET c = c + 1 WHERE id = 42` rewrites 8 KB from the host's point of view. Inside the
+drive it programmed a fresh 16 KB page, left 16 KB of garbage behind, dirtied a mapping entry,
+and moved the device one step closer to the moment it must stop and collect.
+
+A page-level map is not small. At 4 KB granularity with 4-byte entries, a 1 TB drive needs
+about **1 GB of map**, which is where the "1 GB of DRAM per TB of capacity" rule of thumb comes
+from. DRAM-less consumer drives use coarser hybrid or block-level mapping — cheap, but a small
+random write can force a whole block's worth of relocation — or borrow host RAM through NVMe's
+**Host Memory Buffer**, typically 32–64 MB. That is one concrete reason a cheap drive falls
+apart on a random-write database workload while looking fine in a sequential benchmark.
+
+## Garbage collection, and where write amplification comes from
+
+Eventually the free-page pool runs low and the drive must reclaim. Garbage collection picks a
+**victim block**, copies whatever pages in it are still live into the open block, then erases
+it. Greedy selection takes the block with the most invalid pages, which is what the simulator
+above does; production firmware uses cost-benefit variants that also weight how long a block
+has been idle, because a cold block full of garbage is a better victim than a hot one that is
+about to become garbage anyway.
+
+Those relocation copies are writes the host never asked for. The ratio
+
+```
+write amplification = NAND pages programmed / host pages written
+```
+
+determines both how fast the drive is under sustained write load and how long it lives. Watch
+the latency trace in the visual: while free pages exist, a write is about 25 µs. The moment a
+write arrives and no erased page is waiting for it, that write blocks behind several page
+relocations and a block erase, and you see a millisecond spike. This is the origin of SSD
+tail latency — p50 stays flat and beautiful while p99.9 walks off into the milliseconds.
+
+Three mitigations, all of which you can move in the visual:
+
+**Over-provisioning.** Physical NAND the host cannot address gives GC room to find blocks that
+are mostly garbage. Every drive gets 7.37% for free from the GB-versus-GiB difference: 1024 GiB
+of NAND sold as "1024 GB". Enterprise parts ship 960 GB or 800 GB out of that same 1024 GiB,
+which the datasheets quote as 7% and 28% of extra over-provisioning on top of that inherent
+7.37%. For small over-provisioning the steady-state rule of thumb under random
+writes is roughly `WA ≈ 1 / (2 × OP)`. In the simulator the uniform-random workload goes from
+**4.1× at 8% over-provisioning to 1.2× at 67%** — same workload, same firmware, four times the
+NAND wear. You can buy this on any drive by never partitioning the last 20%: unwritten LBAs are
+free space as far as the FTL is concerned.
+
+**TRIM / discard.** When a file is deleted, the filesystem knows those LBAs are dead but the
+drive does not — the map still points at live pages, and GC will faithfully relocate data
+nobody will ever read again. `TRIM` (SATA) and `DEALLOCATE` (NVMe) tell the drive to drop the
+mapping. Turn TRIM off in the visual on the uniform-random workload and write amplification
+goes from 4.1× to 6.2× at identical over-provisioning, because the drive's idea of "live" is
+now 95 pages instead of 82. In practice: prefer the weekly `fstrim.timer` to the synchronous
+`discard` mount option, confirm with `lsblk --discard` that `DISC-GRAN` is non-zero, and know
+that discards stop dead at any layer that does not forward them — `dm-crypt` without
+`allow_discards`, LVM without `issue_discards=1`, and plenty of thin-provisioned SAN and
+hypervisor stacks.
+
+**Wear levelling.** GC must also equalise erase counts, or the blocks holding your hottest
+table would burn out while blocks holding a static archive sit at cycle zero. Dynamic wear
+levelling only balances among blocks being rewritten; static wear levelling periodically *moves
+cold data* out of low-cycle blocks so they can rejoin the rotation — relocations that cost write
+amplification for no host benefit at all. The P/E column in the "show the numbers" table under
+the visual is what wear levelling exists to keep flat.
+
+:::caution[Fresh-out-of-box benchmarks are worthless]
+A new or freshly-TRIMmed drive has every block erased, so GC never runs and write amplification
+is 1.0. Numbers from that state describe a device that will not exist ten minutes into
+production. Precondition the drive — write the full capacity twice with the workload's own
+access pattern — before believing any sustained-write figure. The shape you are looking for is
+the one in the latency trace: a flat region, then a cliff when the free pool runs out.
+:::
+
+In monitoring, the ground truth is SMART. `nvme smart-log /dev/nvme0` gives `data_units_written`
+(host) and `percentage_used` (the controller's own wear estimate against its rated endurance);
+`data_units_written` counts 1000 × 512-byte units, so multiply by 512 000 for bytes and compare
+it against the rated TBW or DWPD on the datasheet. On SATA, attribute 241
+`Total_LBAs_Written` against the vendor's NAND-writes attribute is the same ratio measured end
+to end. If host writes are
+2 TB and the drive says it wore as if 8 TB were written, your write amplification is 4 and your
+five-year drive is a fifteen-month drive.
+
+## Why enterprise drives have capacitors
+
+Every drive has a volatile write cache — DRAM, or an SLC-mode region of the NAND — because
+acknowledging a write at DRAM speed is the only way to hit 20 µs. That cache is not durable. A
+`FLUSH CACHE` (SATA) or `nvme flush` forces it out, and that is what `fsync()` ultimately turns
+into.
+
+An **enterprise drive adds power-loss protection**: a bank of capacitors holding enough energy
+for the controller to finish programming everything in flight and write out the FTL map when the
+rail drops. Such a drive can honour a flush almost instantly, because its cache is already
+effectively non-volatile. A consumer drive without capacitors must actually push the data into
+NAND, so a flush costs hundreds of microseconds to milliseconds. This is why the same Postgres
+commit benchmark runs an order of magnitude faster on a Samsung PM9A3 or Solidigm D7 than on a
+990 Pro with the same nominal IOPS — the benchmark is measuring flush cost, not read or write
+cost.
+
+:::danger[The failure mode is silent data loss, not slowness]
+Some consumer SSDs and many USB enclosures acknowledge a flush without performing one, and some
+FTLs lose the *mapping table* on power cut, taking out data written minutes earlier. Check
+`nvme id-ctrl /dev/nvme0 | grep vwc` and `hdparm -W /dev/sda` to see whether a volatile cache is
+even declared, and never disable the flush — `hdparm -W0` is a hammer, not a fix, and
+XFS removed its `nobarrier` mount option outright in Linux 4.19 for exactly this reason. The
+precise promise `fsync` makes, and the places it does not make it, is the next page in this
+module.
+:::
+
+## ZNS: giving the placement decision back to the engine
+
+The deep absurdity of the FTL is that a log-structured storage engine — RocksDB, or anything
+LSM — is already writing large immutable segments in append order, and then a second
+log-structured system inside the drive shuffles them again, with less information and its own
+garbage collection. Two garbage collectors fighting is where a great deal of real-world write
+amplification comes from.
+
+**Zoned Namespaces** (NVMe TP 4053) removes the second one. The drive exposes its media as
+**zones** the size of an erase-block group — typically hundreds of MB to a couple of GB — each
+with a write pointer. The rules: writes to a zone must be sequential from that pointer, and to
+rewrite a zone you must `RESET` it wholesale. That is the raw NAND contract, made visible.
+
+What the engine gets for accepting it: it chooses which data shares a zone, so it can put one
+LSM level, or one SSTable, or one table's data in its own zone and reset the whole zone when
+that file is dropped. There is then nothing to relocate and device write amplification goes to
+approximately 1. It also needs far less over-provisioning and far less map DRAM, since a zone
+map is thousands of entries rather than hundreds of millions. RocksDB's **ZenFS** backend does
+exactly this: the ZNS paper (Bjørling et al., USENIX ATC 2021) measured roughly 2× the RocksDB
+throughput and about 4× lower 99.99th-percentile read latency against a conventional SSD on the
+same media. `blkzone report /dev/nvme0n1` prints the zone table; `f2fs` and `btrfs` speak the
+protocol, and so do host-managed **SMR** hard drives, whose shingled tracks have the identical
+"append-only, reset to rewrite" shape. The two halves of this page converge there.
+
+NVMe **Flexible Data Placement** (TP 4146) is the pragmatic successor: the host tags each write
+with a placement handle so data with similar lifetime lands in the same erase blocks, while
+ordinary random-write semantics keep working. It gives up most of ZNS's DRAM and
+over-provisioning savings and keeps most of the write-amplification win, which is why it is
+reaching cloud fleets faster than ZNS did.
+
+## Where it bites in production
+
+| Symptom | What is actually happening | Knob |
+|---|---|---|
+| Write p99.9 in milliseconds, p50 fine | Host writes blocking behind GC relocation and erase | Raise over-provisioning, lower write rate, check TRIM reaches the device |
+| "Fast for 20 minutes, then fell off a cliff" | SLC write cache exhausted; drive folding to TLC/QLC and collecting | Measure after preconditioning; size for steady state |
+| Wearing 4× faster than the write volume implies | Write amplification: small random writes, no discard, nearly-full drive | `nvme smart-log`; leave 20% unpartitioned; batch writes in the engine |
+| SSD as slow as a disk under `fsync`-heavy load | No power-loss protection, so every flush reaches NAND | A drive with PLP, or at least move the WAL onto one |
+| Random reads fine, random writes terrible, cheap drive | DRAM-less FTL with block-level mapping thrashing | A page-mapped drive with real DRAM |
+| HDD array stuck at ~100 IOPS regardless of tuning | One arm per spindle: you are buying actuators, not terabytes | More spindles, larger requests, `mq-deadline`, sequential layout |
+
+And the design consequence the rest of this site keeps returning to: an engine that converts
+random writes into large sequential appends is not merely being polite to a disk arm. On flash
+it is aligning its write pattern with the erase-block granularity, which lowers device write
+amplification, shrinks the FTL's work, and flattens the latency tail. That is the strongest
+single argument for a write-ahead log, and for LSM trees over update-in-place B-trees on
+write-heavy workloads.
+
+:::note[What to take forward]
+A hard disk charges you for arm movement and rotation, so sequential access is worth
+restructuring an engine around. Flash charges you for the mismatch between the 16 KB page it
+programs and the 4–24 MB block it erases: the FTL turns every overwrite into an append plus
+garbage, and garbage collection pays for it later in write amplification and millisecond
+latency spikes. Over-provisioning, TRIM and large sequential writes are the three levers you
+actually control — and ZNS is the hardware conceding that the storage engine knew better all
+along.
+:::

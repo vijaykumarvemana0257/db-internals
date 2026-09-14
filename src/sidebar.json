@@ -1,0 +1,113 @@
+[
+  {
+    "label": "Part 1 — Foundations: Machines, Data and the Shape of an Engine",
+    "collapsed": true,
+    "items": [
+      {
+        "label": "1.2 Data Models and a Hands-On SQL Primer",
+        "collapsed": true,
+        "items": [
+          {
+            "autogenerate": {
+              "directory": "p01-foundations/data-models-and-sql-primer"
+            }
+          }
+        ]
+      },
+      {
+        "label": "1.3 SQL Semantics, Types and Schema Design",
+        "collapsed": true,
+        "items": [
+          {
+            "autogenerate": {
+              "directory": "p01-foundations/sql-semantics-types-and-schema-design"
+            }
+          }
+        ]
+      },
+      {
+        "label": "1.4 Hardware, the OS and What Durable Means",
+        "collapsed": true,
+        "items": [
+          {
+            "autogenerate": {
+              "directory": "p01-foundations/hardware-os-durability"
+            }
+          }
+        ]
+      },
+      {
+        "label": "1.5 Anatomy of a Database Engine",
+        "collapsed": true,
+        "items": [
+          {
+            "autogenerate": {
+              "directory": "p01-foundations/anatomy-of-a-database-engine"
+            }
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "label": "Part 2 — Storage Engines: Pages, Trees, Logs and Columns",
+    "collapsed": true,
+    "items": [
+      {
+        "label": "2.1 Pages, Tuples and Heap Files",
+        "collapsed": true,
+        "items": [
+          {
+            "autogenerate": {
+              "directory": "p02-storage-engines/pages-tuples-heap-files"
+            }
+          }
+        ]
+      },
+      {
+        "label": "2.2 The Buffer Pool",
+        "collapsed": true,
+        "items": [
+          {
+            "autogenerate": {
+              "directory": "p02-storage-engines/buffer-pool"
+            }
+          }
+        ]
+      },
+      {
+        "label": "2.3 Buffer Pool Memory, mmap and Contention",
+        "collapsed": true,
+        "items": [
+          {
+            "autogenerate": {
+              "directory": "p02-storage-engines/buffer-pool-memory-mmap-and-contention"
+            }
+          }
+        ]
+      },
+      {
+        "label": "2.4 B-Trees: Structure, Maintenance and Key Encoding",
+        "collapsed": true,
+        "items": [
+          {
+            "autogenerate": {
+              "directory": "p02-storage-engines/b-trees-and-variants"
+            }
+          }
+        ]
+      },
+      {
+        "label": "2.6 Log-Structured Merge Trees",
+        "collapsed": true,
+        "items": [
+          {
+            "autogenerate": {
+              "directory": "p02-storage-engines/lsm-trees"
+            }
+          }
+        ]
+      }
+    ]
+  }
+]

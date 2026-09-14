@@ -1,0 +1,270 @@
+---
+title: "Temporal types: instants, civil time and DST"
+description: Why timestamptz stores an instant and timestamp stores a string, what happens to a local time that occurs twice or never, and the interval arithmetic that makes a day 25 hours long.
+depth: intermediate
+sidebar:
+  order: 2
+---
+
+import InstantCivilTimeLab from '../../../../components/viz/InstantCivilTimeLab';
+
+There are two incompatible things people call "a time": an **instant** — a point on the
+monotonic physical timeline, the same for everyone — and a **civil time**, a reading on a
+wall clock in some jurisdiction, which is a *function* of an instant and a political rule
+set that changes by decree. Every temporal bug worth the name comes from storing one and
+reading it as the other. The bugs are silent: no engine raises an error when a local time
+occurs twice, when it never occurs at all, or when a "daily" report sums 25 hours.
+
+<InstantCivilTimeLab client:visible />
+
+## Neither type stores a time zone
+
+In PostgreSQL, `timestamptz` and `timestamp` have the *same* on-disk representation: an
+8-byte signed integer of microseconds relative to 2000-01-01 00:00:00 (Postgres uses its
+own epoch, not the Unix one). The difference is entirely in what that integer means.
+
+- `timestamp with time zone` — the integer is an **instant**, normalized to UTC. On input,
+  a literal with no offset is interpreted in the session's `TimeZone`; on output it is
+  rendered in the session's `TimeZone`. The zone is never stored, and the `+05:30` you see
+  in psql output is computed at render time.
+- `timestamp without time zone` — the integer is a **civil time**: a year-month-day and a
+  wall clock, packed into an integer for convenience. No conversion happens on input or
+  output. It denotes no instant until someone supplies a zone.
+
+`SET TimeZone = 'Asia/Kolkata'` therefore changes nothing on disk. It changes how instants
+are parsed from zone-less text and how they are printed — that is the whole of the GUC's
+power, and it is why two clients querying the same row can disagree about what day it is.
+
+:::caution[The DDL default is the wrong one]
+`CREATE TABLE e (created_at timestamp)` gives you the zone-less type: the SQL standard says
+bare `TIMESTAMP` means `TIMESTAMP WITHOUT TIME ZONE`. For an event that actually happened,
+you almost always want `timestamptz`. Changing it later is an `ALTER TABLE ... TYPE` that
+rewrites the table and reinterprets every existing value in whatever zone you name — a
+migration that can silently shift years of history by hours.
+:::
+
+## `AT TIME ZONE` is a conversion in both directions
+
+The same operator does opposite things depending on what you hand it, which is the single
+most common source of "I converted it twice and it's still wrong":
+
+| Expression | Input type | Result type | Meaning |
+|---|---|---|---|
+| `ts AT TIME ZONE 'America/Los_Angeles'` | `timestamp` | `timestamptz` | *Interpret* this wall clock as local in LA; produce the instant |
+| `tstz AT TIME ZONE 'America/Los_Angeles'` | `timestamptz` | `timestamp` | *Render* this instant as an LA wall clock; throw the zone away |
+
+Read it as "attach a zone" versus "read through a zone". The escape hatch from all of the
+ambiguity below is to skip the zone name entirely and write the offset into the literal —
+`timestamptz '2026-11-01 01:30:00-07'` denotes exactly one instant and needs no rule.
+
+## The two discontinuities
+
+A zone's offset is a step function of the instant. Where it steps, the civil timeline is
+not a bijection, and the mapping breaks in two different ways. In `America/Los_Angeles` in
+2026 the steps are at 2026-03-08 10:00 UTC and 2026-11-01 09:00 UTC.
+
+**The spring-forward gap.** Clocks jump 02:00 PST → 03:00 PDT. The local times 02:00:00
+through 02:59:59 on 2026-03-08 name no instant. A user can still type one, a form can still
+submit one, a CSV can still contain one — and no database rejects it.
+
+**The fall-back overlap.** Clocks jump 02:00 PDT → 01:00 PST. The local times 01:00:00
+through 01:59:59 on 2026-11-01 name *two* instants, an hour apart. An "01:30 daily job" runs
+twice; a pair of rows an hour apart are indistinguishable once you drop the offset.
+
+Drag the lab's event into each region. Nothing errors; an offset simply gets picked:
+
+| Stack | Nonexistent local time | Ambiguous local time |
+|---|---|---|
+| PostgreSQL | Applies the pre-transition offset, so the value lands *after* the gap | Applies the pre-transition offset: the first of the two occurrences |
+| `java.time` | `ZonedDateTime.of` shifts the result later by the length of the gap | Documented to choose the earlier (pre-transition) offset; `withLaterOffsetAtOverlap()` opts out |
+| Python `zoneinfo` | Resolved via PEP 495 `fold`, no exception | `fold=0` (default) is the first occurrence, `fold=1` the second |
+| Rust `chrono` | `MappedLocalTime::None` (aliased as `LocalResult`) — the only stack here that refuses | `MappedLocalTime::Ambiguous(a, b)` — forces you to choose |
+| MySQL | Converted on write against the session `time_zone`, no error; using a named zone at all requires the `mysql` tz tables to be populated (`mysql_tzinfo_to_sql`), or you get `ERROR 1298 (HY000): Unknown or incorrect time zone` | Same — one of the two instants is stored, silently |
+
+Verify your own build rather than trusting a table: `SELECT timestamp '2026-03-08 02:30' AT
+TIME ZONE 'America/Los_Angeles';` prints an instant that reads back as **03:30** local, an
+hour from what was typed. That is a value the user never entered, stored without complaint.
+
+The consequence for ingestion is blunt: **a civil timestamp plus a zone name is not enough
+information to reconstruct an instant**. If the producer can emit an offset (`-07:00`
+versus `-08:00`), demand it. If it cannot, you are choosing a disambiguation rule whether
+you write one down or not.
+
+## Future events are civil times, not instants
+
+"Standup at 09:00 Europe/Berlin every weekday, forever" is not a set of instants. It becomes
+instants only when you apply the zone's rules — and those rules are political and change
+with weeks of notice. Brazil abolished DST outright in 2019. Egypt reinstated it in 2023
+with days of warning. Mexico dropped it for most of the country in 2022. The IANA tz
+database ships several releases a year precisely because of this churn.
+
+If you materialize a 2028 meeting as a `timestamptz` today, you have frozen today's guess
+about 2028's offset. When the rule changes, the instant stays fixed and the *meeting moves*
+— the calendar now says 08:00, and nobody edited anything. The correct schema is:
+
+```sql
+CREATE TABLE scheduled_event (
+  id            bigint PRIMARY KEY,
+  local_at      timestamp   NOT NULL,   -- civil time, as the user typed it
+  tz            text        NOT NULL,   -- IANA id: 'Europe/Berlin', never 'CET', never '+01:00'
+  -- a derived cache, recomputed whenever tzdata is upgraded:
+  next_fire_at  timestamptz
+);
+```
+
+The civil pair is the source of truth; the instant is a materialization you invalidate on
+every tzdata bump. Store the **IANA identifier**, not an abbreviation: `CST` alone means US
+Central (-06:00), China Standard (+08:00) or Cuba Standard (-05:00), and `+01:00` is not a
+zone — it is one of that zone's two answers.
+
+Past events are the mirror image. They happened; store the instant, in `timestamptz`. If
+you also need the local rendering for reports ("what hour of the *store's* day was this
+sale?"), keep the zone id alongside the instant — that fact, too, is not recoverable from
+UTC.
+
+## `interval` arithmetic is deliberately not associative
+
+A Postgres `interval` is 16 bytes with three independent fields: `months` (int32), `days`
+(int32), and `microseconds` (int64). They are separate because they are not convertible: a
+month is 28–31 days, and — this is the part people miss — **a day is not 24 hours**.
+
+```sql
+SET TimeZone = 'America/Los_Angeles';
+SELECT timestamptz '2026-11-01 00:00' + interval '1 day';     -- 2026-11-02 00:00-08  (25 real hours)
+SELECT timestamptz '2026-11-01 00:00' + interval '24 hours';  -- 2026-11-01 23:00-08  (24 real hours)
+SELECT interval '1 day' = interval '24 hours';                -- true
+```
+
+The last line is not a typo. Interval *comparison* canonicalizes with 30-day months and
+24-hour days, so the two values are equal to each other while behaving differently when
+added to a `timestamptz`. `days` addition is done in civil time — decompose to local, add
+the field, re-resolve the offset — while `microseconds` addition is done on the instant.
+`months` is applied before `days`, which is applied before `microseconds`, and that ordering
+is why sequential addition does not associate:
+
+```sql
+SELECT date '2026-01-31' + interval '1 month' + interval '1 month';  -- 2026-03-28
+SELECT date '2026-01-31' + interval '2 months';                      -- 2026-03-31
+```
+
+Subtraction of two `timestamptz` values yields only days and microseconds, never months;
+`age()` yields months too, which is why `age()` and `-` disagree and why "days between" is a
+question you must define before you answer.
+
+### Bucketing is a zone decision
+
+`date_trunc('day', tstz)` truncates the value *as rendered in the session `TimeZone`*, then
+returns an instant. Change the GUC and every bucket boundary slides along the UTC axis —
+watch the dashed lines move in the lab. So:
+
+```sql
+-- wrong for a Los Angeles business: buckets on UTC midnight, 16:00 or 17:00 local
+SELECT date_trunc('day', sold_at), sum(amount) FROM sale GROUP BY 1;
+
+-- right: name the zone, and let the day be 23, 24 or 25 hours long
+SELECT date_trunc('day', sold_at AT TIME ZONE 'America/Los_Angeles') AS local_day,
+       sum(amount)
+FROM sale GROUP BY 1;
+```
+
+The same applies to `generate_series(tstz, tstz, interval '1 day')`, which steps by calendar
+days in the session zone and therefore keeps landing on local midnight across a transition —
+the reason a series of "days" can be 23 or 25 hours apart while a series built on
+`interval '24 hours'` slowly walks off local midnight. `date_bin()` (Postgres 14+) bins onto a fixed-width
+stride from an explicit origin and refuses month and year units outright, because those have
+no fixed width to bin on.
+
+:::caution[Session-dependent expressions cannot be indexed]
+Anything whose value depends on the session `TimeZone` — `tstz::timestamp`, a bare
+`date_trunc('day', tstz)`, `CURRENT_DATE` — is at best `STABLE`, and Postgres rejects
+non-`IMMUTABLE` expressions in index definitions, partition keys and generated columns with
+*functions in index expression must be marked IMMUTABLE*. Naming the zone removes the session
+dependency: `timestamptz AT TIME ZONE 'America/Los_Angeles'` is `IMMUTABLE`, so
+
+```sql
+CREATE INDEX sale_local_day ON sale ((date_trunc('day', sold_at AT TIME ZONE 'America/Los_Angeles')));
+```
+
+builds, and the matching `GROUP BY`/`WHERE` can use it. Check any expression you are unsure of
+with `SELECT proname, provolatile, pg_get_function_arguments(oid) FROM pg_proc WHERE proname IN
+('timezone', 'date_trunc');` (`i` immutable, `s` stable, `v` volatile). The caveat is that the
+index is only as correct as the tzdata it was built against: a tz rule change for past dates
+means a `REINDEX`.
+:::
+
+## Precision, epochs and the integer swamp
+
+Storage precision is finite and the boundaries are not where people assume.
+
+| System | Instant type | Resolution | Range / gotcha |
+|---|---|---|---|
+| PostgreSQL | `timestamptz` | 1 µs, `timestamp(0..6)` rounds | 4713 BC – 294276 AD; no nanoseconds, ever |
+| MySQL | `TIMESTAMP` | 1 s, `TIMESTAMP(6)` for µs | 1970-01-01 00:00:01 UTC to **2038-01-19 03:14:07 UTC** — a signed 32-bit epoch |
+| MySQL | `DATETIME` | 1 s, `DATETIME(6)` for µs | 1000-01-01 to 9999-12-31, and **no session-zone conversion at all** |
+| SQL Server | `datetimeoffset` | 100 ns | Stores local time *plus an offset*, not a zone id |
+| SQL Server | `datetime` (legacy) | ~3.33 ms, rounded to .000/.003/.007 | Equality on `datetime` is a trap |
+| Oracle | `TIMESTAMP WITH TIME ZONE` | up to 1 ns | Actually stores the offset or region — unlike Postgres |
+| Snowflake | `TIMESTAMP_LTZ` / `_NTZ` / `_TZ` | ns | Three types for exactly the distinction on this page |
+| SQLite | none | — | Dates are TEXT, REAL (Julian day) or INTEGER (Unix seconds), by convention only |
+
+MySQL's pair is the one that bites hardest, because the two types disagree about zones:
+`TIMESTAMP` converts from the session `time_zone` on write and back on read, while `DATETIME`
+stores the literal you gave it. Change `time_zone` between two connections and the same
+`TIMESTAMP` column reads differently while the `DATETIME` beside it does not — and a
+`DATETIME` written from a server in UTC and read by a reporting job in `America/Chicago`
+never shifts, which is right only if you meant civil time. (The legacy auto-initialize and
+auto-update behaviour on the first `TIMESTAMP` column, governed by
+`explicit_defaults_for_timestamp`, is a separate ambush in the same type.)
+
+Then there are the epoch integers, where every API picked a different scale:
+
+| Producer | Unit |
+|---|---|
+| `SELECT EXTRACT(EPOCH FROM ts)` | seconds, with a fractional part |
+| JavaScript `Date`, Java `System.currentTimeMillis()`, Kafka record timestamps | milliseconds |
+| Postgres internal storage, BigQuery `TIMESTAMP` | microseconds |
+| `clock_gettime(CLOCK_REALTIME)`, Go `UnixNano()`, Java `Instant` | nanoseconds |
+
+A `bigint` carries no unit, so a scale mismatch is not a type error — it is a plausible
+wrong answer. Milliseconds decoded as microseconds land in January 1970 (the lab computes
+the exact date). Microseconds decoded as milliseconds land tens of thousands of years out,
+which Postgres accepts happily because its range runs to 294276 AD. And JSON makes it worse:
+JSON has no integer type and mainstream parsers decode numbers into IEEE-754 doubles, exact only to 2^53, so nanosecond epochs stop being
+representable exactly after 1970-04-15 — microseconds survive to the year 2255, milliseconds
+are fine. Serialize nanosecond timestamps as strings or keep them out of JSON.
+
+## Where it bites in production
+
+- **Daily reports that move by an hour twice a year.** A UTC-bucketed "day" for a US
+  business starts at 16:00 or 17:00 local depending on the season, so two days a year contain
+  23 or 25 local hours and the year-over-year comparison wobbles. The fix is one explicit
+  `AT TIME ZONE` in the `GROUP BY`.
+- **Rows that vanish from a range.** `WHERE ts >= d AND ts < d + interval '24 hours'` drops
+  the 25th hour on the fall-back day and double-counts an hour in spring; `BETWEEN` on
+  timestamps is worse because its upper bound is inclusive, so the instant at the boundary is
+  counted in both adjacent buckets. Half-open, calendar-aware, zone-explicit — all three, or
+  the numbers are wrong.
+- **The scheduler that fires twice, or not at all.** A cron-like job pinned to 01:30 local in
+  a DST zone runs twice on the fall-back day and is skipped on the spring-forward day. Make
+  jobs idempotent by keyed run id, or schedule them on UTC instants.
+- **Client drivers quietly re-zoning.** JDBC's `getTimestamp()` converts using the JVM's
+  default zone; `node-postgres` parses a zone-less `timestamp` into a JS `Date` in the
+  *client's* local zone, shifting it by the client's offset. Prefer `OffsetDateTime` /
+  explicitly zone-aware client types, and pin the session `TimeZone` in your pool's
+  connection setup so it does not inherit the server's locale.
+- **The 2038 wall.** Any MySQL `TIMESTAMP` column used for expiry dates, subscription ends or
+  bond maturities is already failing today for values past January 2038 — as is any 32-bit
+  `time_t` in an old client library.
+- **A tzdata upgrade changing the answer.** The container base image bumps its tzdata and a
+  set of materialized future instants becomes stale. Track which columns are derived from
+  civil time plus a zone, and recompute them on upgrade.
+
+:::note[What to take forward]
+`timestamptz` stores an instant with the zone thrown away; `timestamp` stores a wall clock
+with no instant at all; the session `TimeZone` decides only rendering and the parsing of
+zone-less text. Local civil times are not unique — an hour vanishes each spring and repeats
+each autumn, and every stack silently picks an offset rather than failing — so future events
+belong in the database as civil time plus an IANA zone id, with the instant treated as a
+cache. And because a day is a calendar unit rather than 24 hours, bucketing, ranges and
+`interval` addition are all zone decisions you should make explicitly in the query.
+:::

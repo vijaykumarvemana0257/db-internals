@@ -1,0 +1,260 @@
+---
+title: "Optional deep dive: multivalued dependencies, 4NF and the chase"
+description: Why a table can be in BCNF and still store a cross product, what 4NF and 5NF actually forbid, and how the chase decides losslessness in a handful of rewrite steps.
+depth: deep
+sidebar:
+  order: 6
+---
+
+import MvdCrossProductLab from '../../../../components/viz/MvdCrossProductLab';
+import ChaseTableauStepper from '../../../../components/viz/ChaseTableauStepper';
+
+BCNF removes every anomaly a functional dependency can cause and then stops, because an FD is
+a statement about single values and the worst redundancy in a schema is usually a statement
+about *sets*. This page is the theory behind that stopping point. It is genuinely skippable on
+a first pass; if you skip it, take the one-line translation with you — **two independent
+one-to-many facts about the same entity must not share a table**, and the symptom that you
+broke that rule is an update whose row count is a product.
+
+<MvdCrossProductLab client:visible />
+
+## The dependency BCNF cannot see
+
+`employee(emp, skill, phone)`. An engineer has several skills. She has several contact numbers.
+The two lists have nothing to do with each other. Look for a functional dependency to violate
+and you find none: `emp` does not determine `skill`, `skill` does not determine `phone`, and the
+only candidate key is all three columns. Every FD that holds is trivial, so the table is in
+BCNF — and it is obviously, expensively wrong.
+
+What holds instead is a **multivalued dependency**. Writing `Z` for the attributes outside `X`
+and `Y`, the MVD `X ↠ Y` holds in `R` when, for every pair of tuples `t` and `u` with
+`t[X] = u[X]`, the relation *also contains* the tuple that agrees with `t` on `X` and `Y` and
+with `u` on `Z`. Read operationally: once you fix `X`, the set of `Y`-values and the set of
+`Z`-values are independent, so the relation is obliged to hold their cross product for that `X`.
+
+Four properties make MVDs behave differently from FDs, and all four matter in practice:
+
+- **Complementation.** `X ↠ Y` holds if and only if `X ↠ R − X − Y` holds. You never get one
+  without the other, which is why saying "`emp ↠ skill`" is the whole assertion — `emp ↠ phone`
+  comes free. FDs have no such symmetry.
+- **Every FD is an MVD.** `X → Y` implies `X ↠ Y`. MVDs are the weaker, more general statement,
+  and that is exactly why they survive a BCNF decomposition.
+- **Trivial cases.** `X ↠ Y` is trivial when `Y ⊆ X` or when `X ∪ Y` is all of `R`. A
+  two-attribute relation therefore cannot violate 4NF: there is nothing left over to be
+  independent of.
+- **It is a tuple-generating constraint.** An FD forbids states. An MVD *requires* tuples. That
+  is the whole cost model: assert the MVD and the table must physically store every combination.
+
+The inference rules (Armstrong's three, plus complementation, MVD augmentation and transitivity,
+plus replication and coalescence tying FDs and MVDs together) were proved sound and complete by
+Beeri, Fagin and Howard in 1977. You will almost never run them by hand — the chase below does
+the same job mechanically — but the *shape* is worth knowing: MVD reasoning is not FD reasoning
+with extra arrows.
+
+Toggle the MVD off in the lab and the table stops being redundant and starts being *wrong* in a
+different way: the projections onto `(emp, skill)` and `(emp, phone)` rejoin to strictly more
+rows than you stored. Those extra rows are not a bug in the join. They are the definition: a
+relation that does not satisfy the MVD cannot be reassembled from those two projections.
+
+## 4NF, and exactly what it buys
+
+`R` is in **fourth normal form** with respect to a set of dependencies if, for every non-trivial
+MVD `X ↠ Y` that holds on `R`, `X` is a superkey of `R`. `employee` fails on the only test that
+matters: `emp ↠ skill` is non-trivial and `emp` is not a superkey. The decomposition algorithm is
+the same shape as the BCNF one — find a violating `X ↠ Y`, replace `R` with `X ∪ Y` and
+`X ∪ (R − X − Y)`, recurse — and it lands on `employee_skill(emp, skill)` and
+`employee_phone(emp, phone)`. Because every FD is an MVD, a schema in 4NF is automatically in
+BCNF.
+
+The theorem underneath is **Fagin's**, from the 1977 TODS paper that introduced 4NF: a binary
+decomposition of `R` into `R₁` and `R₂` is lossless **if and only if** `R₁ ∩ R₂ ↠ R₁ − R₂` holds
+in `R`. The "if" is the useful half at a whiteboard; the "only if" is the half that changes how
+you think. Losslessness is not a property of picking sensible columns, and it is not something
+you verify by staring at today's data — it is precisely a multivalued dependency on the shared
+columns. The familiar FD test ("the shared columns must be a key of one side") is just the
+corollary you get because every FD is an MVD.
+
+| Normal form | Constrains | Rule | What a decomposition guarantees |
+|---|---|---|---|
+| 3NF | FDs | every non-trivial `X → A` has `X` a superkey, or `A` prime | lossless **and** dependency-preserving, always achievable |
+| BCNF | FDs | every non-trivial `X → A` has `X` a superkey | lossless always; may lose an FD you can no longer check locally |
+| 4NF | MVDs | every non-trivial `X ↠ Y` has `X` a superkey | lossless always (Fagin); preservation still not guaranteed |
+| 5NF / PJNF | join dependencies | every non-trivial JD is implied by the candidate keys | may require an *n*-ary projection; no binary split suffices |
+
+The arithmetic is the reason to care. With `s` skills and `p` phone numbers you store `s × p`
+rows to record `s + p` facts. Six skills and four numbers is 24 rows for 10 facts; across
+5 000 employees with those averages it is 120 000 rows instead of 50 000, and every one of the
+extra 70 000 exists only so that a `DISTINCT`-free `COUNT` can lie to you.
+
+## Finding one in a table you inherited
+
+There is no DDL for this. `CHECK` is evaluated per row and cannot see the rest of the group;
+`UNIQUE` constrains a column list, not a cross product; and `CREATE ASSERTION`, the SQL-92
+construct that could express a multi-row invariant, is not implemented by PostgreSQL, MySQL or
+SQL Server. Your options are a trigger that re-validates the whole `X`-group on every insert and
+delete, or decomposition. Only one of them also makes the update cheap.
+
+Diagnosis is a single aggregate. If the stored row count for a group equals the product of the
+distinct counts of two other columns, that group is a materialized cross product:
+
+```sql
+SELECT emp,
+       count(*)                                      AS rows_stored,
+       count(DISTINCT skill)                         AS skills,
+       count(DISTINCT phone)                         AS phones,
+       count(DISTINCT skill) * count(DISTINCT phone) AS product
+FROM employee
+GROUP BY emp
+HAVING count(DISTINCT skill) > 1
+   AND count(DISTINCT phone) > 1;
+```
+
+Both possible answers are bad news, in different ways. Where `rows_stored = product`, the MVD
+holds and you are paying for it on every write. Where `rows_stored < product`, the MVD does
+*not* hold, which means the table is already recording which skill goes with which phone number
+— a claim nobody intended to make, and one that silently breaks any query that projects the two
+columns apart and rejoins them.
+
+## Join dependencies, and the relation no binary split fixes
+
+4NF is not the end of the ladder, because a relation can be decomposable into three projections
+while every pairwise split loses information. The standard example is real enough to keep:
+`shipment(supplier, part, project)`, under the business rule that if a supplier supplies a part,
+that part is used by a project, and the supplier already works on that project, then the supplier
+supplies that part *to* that project. That rule is a **join dependency**, written
+`⋈[(supplier,part), (part,project), (project,supplier)]`: the relation must equal the natural
+join of its three projections.
+
+Take the instance `(s1,p1,j2)`, `(s1,p2,j1)`, `(s2,p1,j1)`. The rule fires — `s1` supplies `p1`,
+`p1` is used by `j1`, `s1` works on `j1` — so `(s1,p1,j1)` must also be present, giving four rows.
+Now try the binary split into `(supplier,part)` and `(part,project)`: rejoining those two
+projections yields five rows, including `(s2,p1,j2)`, which nobody asserted. Every other binary
+split fails the same way. Only the three-way projection reconstructs the relation exactly.
+
+An MVD is precisely a **binary** join dependency: `X ↠ Y` is the same statement as
+`⋈[X∪Y, X∪Z]`. **5NF** (also called projection-join normal form; Fagin, 1979) generalizes the
+rule one more step: every non-trivial join dependency that holds on the relation must be implied
+by its candidate keys. A relation can sit in 4NF, carry a genuine ternary JD, and still be
+decomposable — which is why 5NF cannot be reached by repeatedly cutting relations in half.
+
+:::caution[5NF is a claim about the world, not a refactor]
+The three-way split is only correct while the cyclic rule is true. The moment reality admits a
+supplier who works on a project and supplies a part *but not that part to that project*, the
+decomposed schema starts manufacturing shipments that do not exist. Genuine non-key join
+dependencies are rare, and splitting on a rule you have not verified is worse than the
+redundancy you were trying to remove.
+:::
+
+<ChaseTableauStepper client:visible />
+
+## The chase
+
+The chase is the decision procedure that answers all of this mechanically. To test whether the
+decomposition of `R` into `R₁ … Rₙ` is lossless under a set of dependencies, build a **tableau**:
+one row per fragment, holding the distinguished symbol `aₖ` in every column that fragment keeps
+and a fresh placeholder `bᵢₖ` in every column it drops. Then apply the dependencies as rewrite
+rules until nothing changes:
+
+| Dependency | Rule |
+|---|---|
+| FD `X → Y` | two rows agreeing on `X` must agree on `Y`: equate the two symbols everywhere in the tableau — a distinguished `a` always beats a placeholder `b` |
+| MVD `X ↠ Y` | two rows agreeing on `X`: add the row that takes `Y` from the first and the remaining columns from the second |
+| JD `⋈[R₁ … Rₙ]` | rows `t₁ … tₙ` that agree on every shared column: add the row that takes each `Rᵢ`'s columns from `tᵢ` |
+
+The decomposition is lossless **iff** some row becomes all-`a`. That is the entire test, and the
+stepper above runs it: an FD kills a placeholder, an MVD or a JD adds a row, and the verdict is
+whether the all-`a` row ever appears. Switch between the two FD scenarios to see the point that
+catches people — the same decomposition of the same three columns is lossless under
+`order_id → customer` and lossy under `item → customer`, because only a dependency rooted at the
+*intersection* can ever fire.
+
+Termination is not an accident. FDs, MVDs and JDs are **full** dependencies: they never invent a
+value that was not already in the tableau. So the symbol alphabet is fixed, the number of
+distinct rows over that alphabet is finite, and every step either merges two symbols or adds a
+row that was not there — both bounded. The chase always halts, though it can take exponentially
+many steps in the size of the dependency set.
+
+A stuck tableau is not a non-answer; it is a **counterexample**. Read the final rows as a
+relation over the symbols and you have an instance that satisfies every dependency in the set and
+whose projections rejoin to strictly more tuples than it contains. That is the lossy case,
+constructed for you.
+
+The same machinery answers more than losslessness:
+
+- **Dependency implication.** To test whether a set `D` implies `X → Y`, start from a two-row
+  tableau that agrees on `X` and differs everywhere else, chase under `D`, and check whether the
+  `Y` columns were forced equal. The MVD version starts the same way and checks whether the
+  completion row appears. This is the algorithm from Maier, Mendelzon and Sagiv's 1979 TODS paper
+  that gave the technique its name.
+- **Query containment and equivalence** for conjunctive queries under a set of dependencies,
+  via the tableau formulation of Aho, Sagiv and Ullman.
+- **Query optimization.** Real planners run degenerate chases constantly. PostgreSQL's join
+  removal drops a `LEFT JOIN` whose inner relation is provably unique on the join key and whose
+  columns are unreferenced — one chase step over a key dependency, and the reason an ORM's
+  twelve-table view often plans as four. Materialized-view rewriting and semantic query
+  optimization are the same idea with a larger dependency set.
+
+The boundary is worth knowing: everything above holds for full dependencies. Allow *embedded*
+dependencies — an MVD asserted only on a projection of the relation — and implication becomes
+undecidable (Herrmann, 1995). Allow existential tuple-generating dependencies, as data exchange
+does, and the chase may not terminate at all, which is why that literature is full of acyclicity
+conditions designed to guarantee it does.
+
+## Where it bites
+
+The production symptom is arithmetic, not theory: **an update whose row count is a product**.
+`UPDATE employee SET phone = $2 WHERE emp = $1 AND phone = $3` reporting 24 rows for one changed
+phone number is an MVD announcing itself. Three consequences follow, and none of them are about
+elegance:
+
+- **Write amplification through MVCC.** Twenty-four logical duplicates are twenty-four physical
+  row versions. PostgreSQL writes a new heap tuple per row plus an index entry in every index on
+  a changed column — HOT applies only when no indexed column changed *and* the page has room —
+  and `autovacuum` must later reclaim twenty-four dead tuples. InnoDB writes twenty-four undo
+  records, updates every affected secondary index, and holds twenty-four row locks for the
+  duration of the transaction, which is twenty-four times the deadlock surface.
+- **The constraint is atomic or it is broken.** All twenty-four rows must change in one
+  transaction. Update twenty-three and the MVD no longer holds; from that moment any query that
+  projects the columns apart and rejoins them — including a perfectly innocent reporting view —
+  produces rows that were never asserted.
+- **Fan-out double counting.** `SUM(salary)` over the flat table multiplies every salary by that
+  employee's phone-number count. This is the same fan-out trap as
+  [page 1](/p01-foundations/sql-semantics-types-and-schema-design/01-sql-semantics-engineers-get-wrong/),
+  with the cross product baked into storage rather than created by a join, and `DISTINCT` will
+  not save you because the duplicated values are genuinely distinct rows. BI tools have a name
+  for the modelling version — the *chasm trap*, two independent one-to-many bridges hanging off
+  one dimension — and the only correct fix is two queries, not one join.
+
+It is not a relational-only problem, because it is not about tables. Two independent arrays in
+one document are an MVD in document form: MongoDB stores them cheaply and then makes you pay on
+read, since `$unwind` on both produces the cross product, and a compound index can include at
+most one array-valued field per document. BigQuery's `REPEATED` fields behave identically —
+`UNNEST` two of them in the same `FROM` clause and you have cross-joined them. In PostgreSQL,
+two `jsonb_array_elements` calls in the `FROM` list are an implicit lateral cross join over the
+same row. And ORMs enforce the rule by refusing: Hibernate's `MultipleBagFetchException` exists
+precisely because eagerly fetching two `List` collections in one query produces a Cartesian
+product it cannot deduplicate.
+
+## Where to stop
+
+4NF is usually free. If you drew the ER model and gave each independent one-to-many relationship
+its own table, you were already there; violations arrive later, by accident — a "one big table"
+export, a denormalized read model, an EAV design, a JSON document flattened into rows for a
+warehouse. 5NF is a different kind of decision: it asks you to assert a cyclic business rule is
+universally true, and it is worth the three-way split only when it is. Fagin's later
+domain-key normal form is a beautiful result and not an engineering target.
+
+The practical payoff of all of this returns in Part 5, where the same question — which facts are
+independent, and which storage engine's data model can express that independence natively — is
+what decides whether a document, wide-column or relational store is the right home for a given
+entity. See the [curriculum map](/curriculum/) for that module.
+
+:::note[What to take forward]
+An MVD is the constraint that forces a relation to store a cross product, and BCNF cannot see it
+because no FD is violated. 4NF says every non-trivial MVD's determinant must be a superkey, and
+Fagin's theorem makes that the exact condition for a binary decomposition to be lossless. The
+chase decides losslessness and dependency implication mechanically, and hands you a
+counterexample when the answer is no. In engineering terms: independent one-to-many facts belong
+in separate tables, separate arrays or separate documents, and the symptom that you got it wrong
+is a single logical update that rewrites a cross product of rows.
+:::

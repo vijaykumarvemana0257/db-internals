@@ -1,0 +1,250 @@
+---
+title: 'Scan resistance: sequential flooding, ring buffers and midpoint insertion'
+description: How one table scan evicts an entire hot working set under LRU, and the three real defenses — PostgreSQL's strategy rings, InnoDB's old/young sublists, and RocksDB's fill_cache and priority pools.
+depth: intermediate
+sidebar:
+  order: 5
+---
+
+import ScanFloodRingLab from '../../../../components/viz/ScanFloodRingLab';
+
+A buffer pool that has been serving a 99% hit rate for weeks can be taken to 30% by a single
+`SELECT count(*)` — not because the scan is slow, but because every page it reads looks, to a
+recency-based replacement policy, exactly like the most valuable page in the pool. The scan
+wins every eviction decision it participates in, and it participates in all of them. Every
+serious engine therefore has a mechanism that lets a scan read a billion pages without being
+allowed to keep any of them.
+
+<ScanFloodRingLab client:visible />
+
+## Why LRU loses to a scan every time
+
+Replacement policies rank pages by *recency*, because recency is the cheapest available proxy
+for *reuse*. A sequential scan breaks the proxy. Each page it reads has a reuse distance of
+infinity — the scan will never come back to it — while simultaneously having the best possible
+recency score, because it was touched a microsecond ago. LRU cannot tell those two facts apart,
+so it evicts pages that will be read again in milliseconds to make room for pages that will
+never be read again at all.
+
+The arithmetic is unforgiving. If the pool holds `P` frames and the scan reads `S > P` pages,
+then by the end of the scan, under strict LRU, *every* frame holds a scan page: the scan has
+issued more distinct references than the pool can hold, and LRU keeps the most recent `P` of
+them. It does not matter how hot the evicted pages were or how long they had been resident.
+This is the pathological case behind the k-competitive bound from
+[the previous page](/p02-storage-engines/buffer-pool/04-how-good-can-a-cache-policy-be-opt-competitive-ratios-and-th/):
+an adversary that wants to make LRU miss on everything writes a loop over `P + 1` pages, and a
+sequential scan is that adversary by accident.
+
+Run the lab with **Plain LRU** and drag through the scan window. The hot set is evicted from
+the tail at exactly the rate the scan inserts at the head, the point-read hit rate falls to
+roughly the fraction of the pool the hot set can still defend, and — the part people forget —
+it stays down after the scan finishes. The pool is now full of pages that will never be read
+again, and the only way out is to fault the working set back in one miss at a time. A five-second
+scan can cost minutes of degraded latency.
+
+The fix is not a cleverer general-purpose policy. It is to let the engine say, at the call site
+that issues the read, *"this access has no reuse; do not let it compete."* That is what a
+`BufferAccessStrategy`, a midpoint insertion point, and `fill_cache=false` all are.
+
+## PostgreSQL: strategy rings, and the quarter-of-the-pool rule
+
+PostgreSQL gives certain operations a **`BufferAccessStrategy`** — a small ring of buffer IDs
+that the operation allocates from and recycles, instead of taking a fresh victim out of the
+shared clock sweep each time. The ring is created in `freelist.c` by `GetAccessStrategy()`,
+and there are three sizes:
+
+| Strategy | Ring size | Used by |
+|---|---|---|
+| `BAS_BULKREAD` | 256 kB (32 buffers at the default `BLCKSZ`) | Sequential scans of large tables, the heap scan behind `CREATE INDEX` |
+| `BAS_BULKWRITE` | 16 MB | `COPY FROM`, `CREATE TABLE AS`, `CREATE MATERIALIZED VIEW`, table-rewriting `ALTER TABLE` |
+| `BAS_VACUUM` | 256 kB before PostgreSQL 16; since 16 it is `vacuum_buffer_usage_limit`, default **2 MB**, overridable per statement with `VACUUM (BUFFER_USAGE_LIMIT ...)` | `VACUUM`, autovacuum, `ANALYZE` |
+
+Two rules decide whether a ring is used at all. First, the ring is capped so it can never be an
+undue fraction of the pool — it is silently capped at an eighth of `shared_buffers`, which
+matters on the tiny pools people give test instances. Second, and more importantly,
+`initscan()` only turns the strategy on when the relation is **larger than a quarter of
+`shared_buffers`** (`NBuffers / 4`). A scan of a small table is allowed to populate the pool
+normally, because a small table genuinely might be worth caching; a scan of a big one is not,
+because it cannot fit anyway.
+
+The ring itself is a circular array of buffer IDs. When the scan needs a frame,
+`GetBufferFromRing()` looks at the next slot and reuses that buffer **only if nobody else has
+become interested in it** — the check is that its pin count is zero and its `usage_count` is at
+most one. If another backend has pinned the page or bumped its usage count, the strategy gives
+up on that slot, takes a fresh buffer from the normal clock sweep, and installs it in the ring.
+That single condition is what keeps the mechanism safe: a page that turns out to be hot after
+all gets promoted out of the ring's control rather than being recycled out from under its
+readers.
+
+Dirty pages are the other subtlety, and it is the reason the write ring is 64× the read ring.
+Evicting a dirty buffer means writing it, and writing it means first flushing the WAL through
+its page LSN — the rule [page 6](/p02-storage-engines/buffer-pool/06-dirty-pages-write-back-and-the-wal-before-data-rule/)
+covers in full. With a 32-buffer ring, a bulk *write* would hit that cost every 32 pages, so
+`COPY` would spend its life in `XLogFlush()`. `StrategyRejectBuffer()` handles the read side of
+the same problem: if the buffer the ring offers back is dirty, a `BAS_BULKREAD` strategy rejects
+it and falls back to the clock sweep, so a plain `SELECT` never gets stuck writing out somebody
+else's dirty page to make room in its own ring. Bulk writes and vacuum do not reject — writing
+is what they came to do — they just get a ring large enough to amortize the flush.
+
+Note what the ring does *not* cover. It is attached to heap sequential scans, vacuum, analyze
+and the bulk-write paths. An ordinary index scan, and the heap fetches of a bitmap heap scan,
+allocate buffers the normal way. A query plan that reads half a large table through an index is
+every bit as capable of flooding the pool as a sequential scan would have been, and it gets no
+protection at all.
+
+## Synchronized scans: many readers, one set of reads
+
+The ring makes a second problem visible: if five reporting queries each scan the same 40 GB table
+through their own 256 kB ring, the table is read from disk five times — and it would be read five
+times without the ring too, since it does not fit in the pool either way. PostgreSQL's
+answer is **synchronized sequential scans**, controlled by `synchronize_seqscans` (on by
+default) and gated by the same size threshold.
+
+The mechanism is a small shared hash table mapping a relation to the block number a scan of it
+most recently reported. A starting scan looks the relation up and, instead of starting at block
+0, starts *where the existing scan already is*. It reports its own position back every 128 kB
+of progress. The scans then move through the file as a pack: the leader faults each page in,
+the followers find it already present, and one physical read feeds all of them. On a table far
+larger than memory this turns N× the I/O into 1×.
+
+:::caution[The visible side effect]
+A synchronized scan starts in the middle of the table and wraps around. So
+`SELECT * FROM big_table LIMIT 10` with no `ORDER BY` can return *different rows on every
+execution*, depending on where another scan happened to be. This is legal — SQL guarantees no
+order without `ORDER BY` — but it surprises people, and it is why the behaviour has an off
+switch.
+:::
+
+## InnoDB: the midpoint, and the clock that makes it work
+
+InnoDB takes the other approach: one LRU list, but with two insertion points. The list is split
+into a **new (young) sublist** at the head and an **old sublist** at the tail, with the boundary
+— the midpoint — placed so the old sublist is about 3/8 of the list. That fraction is
+`innodb_old_blocks_pct`, default **37**, adjustable from 5 to 95.
+
+A page read from disk is not inserted at the head. It is inserted **at the midpoint**, at the
+head of the old sublist. It is promoted to the head of the young sublist only when it is
+accessed *again*. Since a scan of a table many times the pool's size touches each page once, a
+scan can only ever churn through the old sublist — 3/8 of the pool — and the young sublist,
+where the OLTP working set lives, never notices. Read-ahead pages enter at the midpoint too, so
+speculative I/O that turns out to be wrong costs nothing but a slot in the old sublist.
+
+That design has a hole, and the hole is why the second knob exists. A "single touch" per page is
+a lie at the row level: a heap page holds dozens of rows, and a scan reads all of them, back to
+back, in microseconds. Under a naive "promote on second access" rule the scan's own second row
+would promote the page into the young sublist and the flood would be back. So InnoDB gates the
+promotion on *time*: **`innodb_old_blocks_time`**, default **1000** milliseconds, is the window
+a page must survive in the old sublist before an access is allowed to promote it. Row two of a
+scanned page arrives a microsecond after row one, so it does not qualify. A genuinely hot page
+read now and read again a second later does.
+
+Set the lab to **Midpoint (InnoDB)** and flip `innodb_old_blocks_time` between 1000 ms and 0. At
+1000 ms the scan's pages pile up below the midpoint and evict each other; the young sublist
+holds still. At 0 the scan's second touch of each page promotes it, the young sublist is
+overwritten from the head, and the midpoint strategy collapses into plain LRU — the same curve
+as the first tab. One knob, two completely different outcomes, and it is the knob most likely to
+have been "tuned" to zero by somebody chasing a microbenchmark.
+
+InnoDB reports on this directly. `SHOW ENGINE INNODB STATUS` has, in the BUFFER POOL AND MEMORY
+section, `Database pages`, `Old database pages`, `Pages made young`, `not young`, and the rates
+`youngs/s` and `non-youngs/s`. A scan that is being correctly resisted shows a high
+`non-youngs/s` and a near-flat `youngs/s`: pages are being read and refused promotion, which is
+exactly what you want. A spike in `youngs/s` during a reporting query is the signature of
+midpoint insertion being defeated. `information_schema.INNODB_BUFFER_PAGE_LRU` gives the
+per-page view, at a cost high enough that you should not query it on a busy production server.
+
+There is one more piece of relink avoidance worth knowing about, because it is a contention
+mechanism rather than a scan-resistance one: a hit on a page that is *already* near the head of
+the young sublist does not move it. Relinking costs the LRU list mutex, and a page two positions
+from the head gains nothing by becoming position zero. InnoDB uses an approximate age counter to
+decide, so the hottest pages in the system stop paying list maintenance on every access.
+
+## RocksDB, Oracle, and the option of not caching at all
+
+RocksDB's block cache has both defenses, expressed as options rather than heuristics:
+
+- **`ReadOptions::fill_cache = false`** tells an iterator not to insert the data blocks it reads
+  into the block cache at all. Compaction reads use it — compaction is the archetypal
+  zero-reuse scan, and inserting its blocks would evict the live read path's working set — and
+  you can set it on any analytical iterator you write.
+- **Priority pools.** `Cache::Insert()` takes a `Cache::Priority`, and the LRU cache keeps a
+  high-priority pool whose size is set by `high_pri_pool_ratio`. Low-priority entries are
+  inserted at the midpoint of the list, exactly as InnoDB does, and are promoted into the
+  high-priority pool on a subsequent hit. With
+  `cache_index_and_filter_blocks_with_high_priority`, index and filter blocks — the ones whose
+  eviction costs an extra I/O on *every* subsequent lookup — go straight into the high-priority
+  pool, where a data-block scan cannot reach them.
+
+Oracle skips the pool entirely: a full table scan of a sufficiently large segment does a
+**serial direct path read**, streaming blocks into the session's PGA instead of the buffer
+cache, with the size decision keyed off `_small_table_threshold` (a small fraction of the
+cache). The buffer cache is not merely protected, it is not involved. The same is true of
+parallel query, which has always used direct path.
+
+And some engines have no defense. SQLite's page cache is a plain LRU with a `PRAGMA cache_size`
+bound; a scan of a large table will evict everything, which matters less than it sounds because
+SQLite usually sits on top of an OS page cache doing its own thing.
+
+## The price of the defense: a bypassed scan cannot warm the pool
+
+Every one of these mechanisms trades away the one good thing a scan does — it brings pages into
+memory. Three consequences follow, and all three show up in real systems.
+
+**The medium-sized table that is never cached.** PostgreSQL applies the ring to any table larger
+than `shared_buffers / 4`. With `shared_buffers = 64GB`, a 20 GB table gets a 256 kB ring — even
+though it would fit in the pool four times over with room to spare, and even if it is scanned
+every minute. Each scan reads it from storage again. The fixes are blunt: raise `shared_buffers`
+until the table is under the threshold, or force the pages in with `pg_prewarm()` and rely on the
+fact that a page already resident is found by the scan and never enters the ring at all. The
+Linux page cache often saves you here — the read is a page-cache hit rather than a device read —
+which is one of the few good arguments for PostgreSQL's double-buffered design.
+
+**The cold start after a bulk load.** `COPY` into a new table uses `BAS_BULKWRITE`. When it
+finishes, the table is on disk and almost none of it is in the pool, so the first queries against
+freshly loaded data are all misses. Loading then measuring makes the load look fine and the query
+look terrible.
+
+**Vacuum starving itself.** A vacuum of a large, heavily dirtied table recycles a small ring —
+256 kB before PostgreSQL 16, 2 MB by default since — and each recycled dirty buffer needs a WAL
+flush before it can be written. That is deliberate
+throttling — it is why vacuum does not obliterate the pool — but on a big maintenance window it
+is also why vacuum can be much slower than the hardware allows. PostgreSQL 16's
+`VACUUM (BUFFER_USAGE_LIMIT '256MB')` exists precisely so you can trade scan resistance for
+speed when nobody is watching, and `BUFFER_USAGE_LIMIT 0` removes the ring entirely.
+
+## Where it bites in production
+
+- **The nightly report that breaks the morning.** The symptom is a p99 latency step on the OLTP
+  path that outlasts the analytical query by many minutes, with CPU flat and device reads up. In
+  PostgreSQL, `pg_stat_database.blks_read` climbing while `blks_hit` stalls is the signal; the
+  proof is `pg_buffercache`, grouping resident buffers by relation and finding the reporting
+  table holding most of the pool. If it is holding the pool despite the ring, the plan was an
+  index or bitmap heap scan, which no strategy covers.
+- **`innodb_old_blocks_time = 0` in the config.** Someone set it years ago, and from then on
+  every full scan promotes its pages. `youngs/s` spiking in `SHOW ENGINE INNODB STATUS` during
+  a batch job is the tell. The MySQL-recommended countermeasure to a known scan window is the
+  opposite move: raise `innodb_old_blocks_time` (to several seconds) or drop
+  `innodb_old_blocks_pct` (to 5) for its duration, both of which are dynamic.
+- **A backup that evicts the working set.** `mysqldump` does full scans; `pg_dump` does
+  sequential scans and therefore gets the ring, but a logical backup driven by an index-ordered
+  cursor does not. Physical backups (`pg_basebackup`, Percona XtraBackup) read files outside
+  the engine entirely and touch neither pool — but they do evict the OS page cache, which on a
+  PostgreSQL host is the second-level cache.
+- **Replica promotion into a cold pool.** Scan resistance means a standby that has been
+  replaying WAL is warm in exactly the pages WAL touched and cold everywhere else, so the first
+  analytical query after failover is also the first scan. That is the warm-up problem from
+  [page 2](/p02-storage-engines/buffer-pool/02-cache-warm-up-cold-pools-dump-load-and-prewarming/),
+  and prewarming is the answer to it — not the ring.
+- **Benchmarks that measure the wrong pool.** A `SELECT count(*)` run twice on a table above
+  the ring threshold is slow both times, and it is not a caching bug. A benchmark that reports
+  "PostgreSQL does not cache my table" has usually just found `NBuffers / 4`.
+
+:::note[What to take forward]
+Recency is a proxy for reuse, and a sequential scan is the case where the proxy inverts: maximum
+recency, zero reuse. No general-purpose replacement policy can fix that from the inside, so
+engines fix it from the call site — PostgreSQL hands scans, vacuum and bulk writes a small
+recycled ring of frames; InnoDB inserts every newly read page at the midpoint and refuses to
+promote it until it has survived `innodb_old_blocks_time`; RocksDB lets the reader say
+`fill_cache=false` and keeps index and filter blocks in a high-priority pool. All of them work,
+and all of them cost the same thing: a scan that cannot flood the pool also cannot warm it.
+:::
