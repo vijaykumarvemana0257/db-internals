@@ -25,51 +25,51 @@ The physics of storage and durability, the data models and SQL a beginner needs,
 
 *foundations* — A true beginner needs the relational model, a way to turn a domain into tables, working SQL and a map of the non-relational models before relational algebra, query plans, isolation anomalies or per-store modeling can mean anything; this module gives every later module its vocabulary and a live sandbox to test claims against.
 
-- [Why a DBMS instead of files](/p01-foundations/data-models-and-sql-primer/01-why-a-dbms-instead-of-files/)
-- [The relational model precisely: relations, keys, constraints and NULLs](/p01-foundations/data-models-and-sql-primer/02-the-relational-model-precisely-relations-keys-constraints-an/)
-- [Entities, relationships and cardinality](/p01-foundations/data-models-and-sql-primer/03-entities-relationships-and-cardinality/)
-- [Mapping an ER model to tables](/p01-foundations/data-models-and-sql-primer/04-mapping-an-er-model-to-tables/)
-- [SQL primer: DDL, DML and single-table queries](/p01-foundations/data-models-and-sql-primer/05-sql-primer-ddl-dml-and-single-table-queries/)
-- [SQL primer: joins, GROUP BY, subqueries and set operations](/p01-foundations/data-models-and-sql-primer/06-sql-primer-joins-group-by-subqueries-and-set-operations/)
-- [Document, key-value, wide-column and graph models](/p01-foundations/data-models-and-sql-primer/07-document-key-value-wide-column-and-graph-models/)
-- [OLTP vs OLAP vs HTAP and the systems landscape](/p01-foundations/data-models-and-sql-primer/08-oltp-vs-olap-vs-htap-and-the-systems-landscape/)
+- [Why a DBMS instead of files](/db-internals/p01-foundations/data-models-and-sql-primer/01-why-a-dbms-instead-of-files/)
+- [The relational model precisely: relations, keys, constraints and NULLs](/db-internals/p01-foundations/data-models-and-sql-primer/02-the-relational-model-precisely-relations-keys-constraints-an/)
+- [Entities, relationships and cardinality](/db-internals/p01-foundations/data-models-and-sql-primer/03-entities-relationships-and-cardinality/)
+- [Mapping an ER model to tables](/db-internals/p01-foundations/data-models-and-sql-primer/04-mapping-an-er-model-to-tables/)
+- [SQL primer: DDL, DML and single-table queries](/db-internals/p01-foundations/data-models-and-sql-primer/05-sql-primer-ddl-dml-and-single-table-queries/)
+- [SQL primer: joins, GROUP BY, subqueries and set operations](/db-internals/p01-foundations/data-models-and-sql-primer/06-sql-primer-joins-group-by-subqueries-and-set-operations/)
+- [Document, key-value, wide-column and graph models](/db-internals/p01-foundations/data-models-and-sql-primer/07-document-key-value-wide-column-and-graph-models/)
+- [OLTP vs OLAP vs HTAP and the systems landscape](/db-internals/p01-foundations/data-models-and-sql-primer/08-oltp-vs-olap-vs-htap-and-the-systems-landscape/)
 
 ### 1.3 SQL Semantics, Types and Schema Design
 
 *foundations* — Once a beginner can write SQL and draw a schema, the next failures are silent rather than loud — NULL and fan-out traps that return plausible wrong numbers, type choices that lose money or shift timestamps across a DST boundary, and schemas whose redundancy makes a single update rewrite a cross product — and every later module on partitioning by time, ledgers, indexes and query plans assumes these are already right.
 
-- [SQL semantics engineers get wrong](/p01-foundations/sql-semantics-types-and-schema-design/01-sql-semantics-engineers-get-wrong/)
-- [Temporal types: instants, civil time and DST](/p01-foundations/sql-semantics-types-and-schema-design/02-temporal-types-instants-civil-time-and-dst/)
-- [Numeric types: exact money vs float drift](/p01-foundations/sql-semantics-types-and-schema-design/03-numeric-types-exact-money-vs-float-drift/)
-- [Text, encoding and collation](/p01-foundations/sql-semantics-types-and-schema-design/04-text-encoding-and-collation/)
-- [Normalization, functional dependencies and schema design](/p01-foundations/sql-semantics-types-and-schema-design/05-normalization-functional-dependencies-and-schema-design/)
-- [Optional deep dive: multivalued dependencies, 4NF and the chase](/p01-foundations/sql-semantics-types-and-schema-design/06-optional-deep-dive-multivalued-dependencies-4nf-and-the-chas/)
+- [SQL semantics engineers get wrong](/db-internals/p01-foundations/sql-semantics-types-and-schema-design/01-sql-semantics-engineers-get-wrong/)
+- [Temporal types: instants, civil time and DST](/db-internals/p01-foundations/sql-semantics-types-and-schema-design/02-temporal-types-instants-civil-time-and-dst/)
+- [Numeric types: exact money vs float drift](/db-internals/p01-foundations/sql-semantics-types-and-schema-design/03-numeric-types-exact-money-vs-float-drift/)
+- [Text, encoding and collation](/db-internals/p01-foundations/sql-semantics-types-and-schema-design/04-text-encoding-and-collation/)
+- [Normalization, functional dependencies and schema design](/db-internals/p01-foundations/sql-semantics-types-and-schema-design/05-normalization-functional-dependencies-and-schema-design/)
+- [Optional deep dive: multivalued dependencies, 4NF and the chase](/db-internals/p01-foundations/sql-semantics-types-and-schema-design/06-optional-deep-dive-multivalued-dependencies-4nf-and-the-chas/)
 
 ### 1.4 Hardware, the OS and What Durable Means
 
 *foundations* — Now that tables, rows and queries are on the table, this module supplies the machine-level facts the rest of the site keeps referring back to: every storage-engine decision is a response to latency ladders, NAND erase blocks, page-cache behavior and the exact promise fsync does or does not make.
 
-- [Memory hierarchy and latency numbers](/p01-foundations/hardware-os-durability/01-memory-hierarchy-and-latency-numbers/)
-- [HDD and SSD internals: seeks, NAND and the FTL](/p01-foundations/hardware-os-durability/02-hdd-and-ssd-internals-seeks-nand-and-the-ftl/)
-- [Storage abstractions: files, block devices and object stores](/p01-foundations/hardware-os-durability/03-storage-abstractions-files-block-devices-and-object-stores/)
-- [Encoding data: bytes, endianness and serialization](/p01-foundations/hardware-os-durability/04-encoding-data-bytes-endianness-and-serialization/)
-- [The OS I/O path: syscalls, page cache and mmap](/p01-foundations/hardware-os-durability/05-the-os-i-o-path-syscalls-page-cache-and-mmap/)
-- [fsync, write barriers and the durability contract](/p01-foundations/hardware-os-durability/06-fsync-write-barriers-and-the-durability-contract/)
-- [Atomicity of writes and torn pages](/p01-foundations/hardware-os-durability/07-atomicity-of-writes-and-torn-pages/)
-- [Filesystem crash consistency: journaling, rename and the safe-replace protocol](/p01-foundations/hardware-os-durability/08-filesystem-crash-consistency-journaling-rename-and-the-safe-/)
-- [Direct I/O and io_uring: alignment, submission and completion](/p01-foundations/hardware-os-durability/09-direct-i-o-and-io-uring-alignment-submission-and-completion/)
+- [Memory hierarchy and latency numbers](/db-internals/p01-foundations/hardware-os-durability/01-memory-hierarchy-and-latency-numbers/)
+- [HDD and SSD internals: seeks, NAND and the FTL](/db-internals/p01-foundations/hardware-os-durability/02-hdd-and-ssd-internals-seeks-nand-and-the-ftl/)
+- [Storage abstractions: files, block devices and object stores](/db-internals/p01-foundations/hardware-os-durability/03-storage-abstractions-files-block-devices-and-object-stores/)
+- [Encoding data: bytes, endianness and serialization](/db-internals/p01-foundations/hardware-os-durability/04-encoding-data-bytes-endianness-and-serialization/)
+- [The OS I/O path: syscalls, page cache and mmap](/db-internals/p01-foundations/hardware-os-durability/05-the-os-i-o-path-syscalls-page-cache-and-mmap/)
+- [fsync, write barriers and the durability contract](/db-internals/p01-foundations/hardware-os-durability/06-fsync-write-barriers-and-the-durability-contract/)
+- [Atomicity of writes and torn pages](/db-internals/p01-foundations/hardware-os-durability/07-atomicity-of-writes-and-torn-pages/)
+- [Filesystem crash consistency: journaling, rename and the safe-replace protocol](/db-internals/p01-foundations/hardware-os-durability/08-filesystem-crash-consistency-journaling-rename-and-the-safe-/)
+- [Direct I/O and io_uring: alignment, submission and completion](/db-internals/p01-foundations/hardware-os-durability/09-direct-i-o-and-io-uring-alignment-submission-and-completion/)
 
 ### 1.5 Anatomy of a Database Engine
 
 *foundations* — A component map, a schema-to-files mapping, one traced read, a first look at transactions and versions, and a WAL primer give every later module a place to plug in; the module deliberately stops at 'enough to continue' after the WAL primer — the page-level write path belongs to Pages, Tuples and Heap Files and the concurrency primitives to The Buffer Pool, where the structures they touch are defined.
 
-- [Component map: parser, planner, executor, storage manager, log](/p01-foundations/anatomy-of-a-database-engine/01-component-map-parser-planner-executor-storage-manager-log/)
-- [Logical schema vs physical storage](/p01-foundations/anatomy-of-a-database-engine/02-logical-schema-vs-physical-storage/)
-- [Row, column and key-value physical models](/p01-foundations/anatomy-of-a-database-engine/03-row-column-and-key-value-physical-models/)
-- [Life of a query: from SQL text to rows](/p01-foundations/anatomy-of-a-database-engine/04-life-of-a-query-from-sql-text-to-rows/)
-- [Transactions at 10,000 feet](/p01-foundations/anatomy-of-a-database-engine/05-transactions-at-10-000-feet/)
-- [Versions, snapshots and the garbage horizon](/p01-foundations/anatomy-of-a-database-engine/06-versions-snapshots-and-the-garbage-horizon/)
-- [WAL primer: log records, LSNs and log-before-page](/p01-foundations/anatomy-of-a-database-engine/07-wal-primer-log-records-lsns-and-log-before-page/)
+- [Component map: parser, planner, executor, storage manager, log](/db-internals/p01-foundations/anatomy-of-a-database-engine/01-component-map-parser-planner-executor-storage-manager-log/)
+- [Logical schema vs physical storage](/db-internals/p01-foundations/anatomy-of-a-database-engine/02-logical-schema-vs-physical-storage/)
+- [Row, column and key-value physical models](/db-internals/p01-foundations/anatomy-of-a-database-engine/03-row-column-and-key-value-physical-models/)
+- [Life of a query: from SQL text to rows](/db-internals/p01-foundations/anatomy-of-a-database-engine/04-life-of-a-query-from-sql-text-to-rows/)
+- [Transactions at 10,000 feet](/db-internals/p01-foundations/anatomy-of-a-database-engine/05-transactions-at-10-000-feet/)
+- [Versions, snapshots and the garbage horizon](/db-internals/p01-foundations/anatomy-of-a-database-engine/06-versions-snapshots-and-the-garbage-horizon/)
+- [WAL primer: log records, LSNs and log-before-page](/db-internals/p01-foundations/anatomy-of-a-database-engine/07-wal-primer-log-records-lsns-and-log-before-page/)
 
 ## Part 2 — Storage Engines: Pages, Trees, Logs and Columns
 
@@ -79,47 +79,47 @@ The single-node storage substrate in depth: page layout, buffer management, B-tr
 
 *core* — The slotted page and heap file are the unit of everything above them; the byte layout of a tuple decides what every page, index and log record above it has to move around.
 
-- [Page anatomy and the slotted page](/p02-storage-engines/pages-tuples-heap-files/01-page-anatomy-and-the-slotted-page/)
-- [Tuple layout: headers, null bitmaps, alignment and varlena](/p02-storage-engines/pages-tuples-heap-files/02-tuple-layout-headers-null-bitmaps-alignment-and-varlena/)
-- [Heap file organization and free space management](/p02-storage-engines/pages-tuples-heap-files/03-heap-file-organization-and-free-space-management/)
-- [HOT updates, redirect line pointers and opportunistic page pruning](/p02-storage-engines/pages-tuples-heap-files/04-hot-updates-redirect-line-pointers-and-opportunistic-page-pr/)
-- [Large values: TOAST and overflow pages](/p02-storage-engines/pages-tuples-heap-files/05-large-values-toast-and-overflow-pages/)
-- [Checksums, corruption detection and on-disk format evolution](/p02-storage-engines/pages-tuples-heap-files/06-checksums-corruption-detection-and-on-disk-format-evolution/)
-- [Catalog storage, the bootstrap problem and cache invalidation](/p02-storage-engines/pages-tuples-heap-files/07-catalog-storage-the-bootstrap-problem-and-cache-invalidation/)
+- [Page anatomy and the slotted page](/db-internals/p02-storage-engines/pages-tuples-heap-files/01-page-anatomy-and-the-slotted-page/)
+- [Tuple layout: headers, null bitmaps, alignment and varlena](/db-internals/p02-storage-engines/pages-tuples-heap-files/02-tuple-layout-headers-null-bitmaps-alignment-and-varlena/)
+- [Heap file organization and free space management](/db-internals/p02-storage-engines/pages-tuples-heap-files/03-heap-file-organization-and-free-space-management/)
+- [HOT updates, redirect line pointers and opportunistic page pruning](/db-internals/p02-storage-engines/pages-tuples-heap-files/04-hot-updates-redirect-line-pointers-and-opportunistic-page-pr/)
+- [Large values: TOAST and overflow pages](/db-internals/p02-storage-engines/pages-tuples-heap-files/05-large-values-toast-and-overflow-pages/)
+- [Checksums, corruption detection and on-disk format evolution](/db-internals/p02-storage-engines/pages-tuples-heap-files/06-checksums-corruption-detection-and-on-disk-format-evolution/)
+- [Catalog storage, the bootstrap problem and cache invalidation](/db-internals/p02-storage-engines/pages-tuples-heap-files/07-catalog-storage-the-bootstrap-problem-and-cache-invalidation/)
 
 ### 2.2 The Buffer Pool
 
 *core* — The buffer pool decides which pages hit disk, when dirty pages may leave memory, and how long a restarted or failed-over system runs cold.
 
-- [Buffer pool structure: frames, page table and pins](/p02-storage-engines/buffer-pool/01-buffer-pool-structure-frames-page-table-and-pins/)
-- [Cache warm-up: cold pools, dump/load and prewarming](/p02-storage-engines/buffer-pool/02-cache-warm-up-cold-pools-dump-load-and-prewarming/)
-- [Replacement policies: LRU, CLOCK, LRU-K, 2Q and ARC](/p02-storage-engines/buffer-pool/03-replacement-policies-lru-clock-lru-k-2q-and-arc/)
-- [How good can a cache policy be? OPT, competitive ratios and the stack property](/p02-storage-engines/buffer-pool/04-how-good-can-a-cache-policy-be-opt-competitive-ratios-and-th/)
-- [Scan resistance: sequential flooding, ring buffers and midpoint insertion](/p02-storage-engines/buffer-pool/05-scan-resistance-sequential-flooding-ring-buffers-and-midpoin/)
-- [Dirty pages, write-back and the WAL-before-data rule](/p02-storage-engines/buffer-pool/06-dirty-pages-write-back-and-the-wal-before-data-rule/)
-- [Prefetching and asynchronous reads](/p02-storage-engines/buffer-pool/07-prefetching-and-asynchronous-reads/)
+- [Buffer pool structure: frames, page table and pins](/db-internals/p02-storage-engines/buffer-pool/01-buffer-pool-structure-frames-page-table-and-pins/)
+- [Cache warm-up: cold pools, dump/load and prewarming](/db-internals/p02-storage-engines/buffer-pool/02-cache-warm-up-cold-pools-dump-load-and-prewarming/)
+- [Replacement policies: LRU, CLOCK, LRU-K, 2Q and ARC](/db-internals/p02-storage-engines/buffer-pool/03-replacement-policies-lru-clock-lru-k-2q-and-arc/)
+- [How good can a cache policy be? OPT, competitive ratios and the stack property](/db-internals/p02-storage-engines/buffer-pool/04-how-good-can-a-cache-policy-be-opt-competitive-ratios-and-th/)
+- [Scan resistance: sequential flooding, ring buffers and midpoint insertion](/db-internals/p02-storage-engines/buffer-pool/05-scan-resistance-sequential-flooding-ring-buffers-and-midpoin/)
+- [Dirty pages, write-back and the WAL-before-data rule](/db-internals/p02-storage-engines/buffer-pool/06-dirty-pages-write-back-and-the-wal-before-data-rule/)
+- [Prefetching and asynchronous reads](/db-internals/p02-storage-engines/buffer-pool/07-prefetching-and-asynchronous-reads/)
 
 ### 2.3 Buffer Pool Memory, mmap and Contention
 
 *advanced* — Past the caching policy, the pool becomes a memory-budgeting, kernel-interface and scalability problem: where the rest of the server's RAM goes, why mmap cannot replace a buffer pool, what engines that delete the page table gain, and the hot page no amount of partitioning fixes.
 
-- [Memory beyond the pool: shared, per-backend and context allocation](/p02-storage-engines/buffer-pool-memory-mmap-and-contention/01-memory-beyond-the-pool-shared-per-backend-and-context-alloca/)
-- [Buffer pool vs OS page cache vs mmap](/p02-storage-engines/buffer-pool-memory-mmap-and-contention/02-buffer-pool-vs-os-page-cache-vs-mmap/)
-- [Beyond the page table: pointer swizzling, in-memory engines and anti-caching](/p02-storage-engines/buffer-pool-memory-mmap-and-contention/03-beyond-the-page-table-pointer-swizzling-in-memory-engines-an/)
-- [Latching the buffer pool and hot-page contention](/p02-storage-engines/buffer-pool-memory-mmap-and-contention/04-latching-the-buffer-pool-and-hot-page-contention/)
+- [Memory beyond the pool: shared, per-backend and context allocation](/db-internals/p02-storage-engines/buffer-pool-memory-mmap-and-contention/01-memory-beyond-the-pool-shared-per-backend-and-context-alloca/)
+- [Buffer pool vs OS page cache vs mmap](/db-internals/p02-storage-engines/buffer-pool-memory-mmap-and-contention/02-buffer-pool-vs-os-page-cache-vs-mmap/)
+- [Beyond the page table: pointer swizzling, in-memory engines and anti-caching](/db-internals/p02-storage-engines/buffer-pool-memory-mmap-and-contention/03-beyond-the-page-table-pointer-swizzling-in-memory-engines-an/)
+- [Latching the buffer pool and hot-page contention](/db-internals/p02-storage-engines/buffer-pool-memory-mmap-and-contention/04-latching-the-buffer-pool-and-hot-page-contention/)
 
 ### 2.4 B-Trees: Structure, Maintenance and Key Encoding
 
 *core* — The B+tree is the default index of every OLTP engine, and its shape, split behaviour, key encoding and the external-memory bounds behind them decide real lookup and range-scan cost.
 
-- [B+tree structure, invariants and search](/p02-storage-engines/b-trees-and-variants/01-b-tree-structure-invariants-and-search/)
-- [Insert, split, delete and merge](/p02-storage-engines/b-trees-and-variants/02-insert-split-delete-and-merge/)
-- [Crash safety of structure modifications: atomic splits and incomplete-split repair](/p02-storage-engines/b-trees-and-variants/03-crash-safety-of-structure-modifications-atomic-splits-and-in/)
-- [Fill factor, fragmentation and splits under load](/p02-storage-engines/b-trees-and-variants/04-fill-factor-fragmentation-and-splits-under-load/)
-- [Bulk loading and index construction](/p02-storage-engines/b-trees-and-variants/05-bulk-loading-and-index-construction/)
-- [Key layout, prefix compression and suffix truncation](/p02-storage-engines/b-trees-and-variants/06-key-layout-prefix-compression-and-suffix-truncation/)
-- [Collation, Unicode and byte-comparable key encoding](/p02-storage-engines/b-trees-and-variants/07-collation-unicode-and-byte-comparable-key-encoding/)
-- [Why fanout B: the external-memory model, optimality bounds and cache-oblivious layouts](/p02-storage-engines/b-trees-and-variants/08-why-fanout-b-the-external-memory-model-optimality-bounds-and/)
+- [B+tree structure, invariants and search](/db-internals/p02-storage-engines/b-trees-and-variants/01-b-tree-structure-invariants-and-search/)
+- [Insert, split, delete and merge](/db-internals/p02-storage-engines/b-trees-and-variants/02-insert-split-delete-and-merge/)
+- [Crash safety of structure modifications: atomic splits and incomplete-split repair](/db-internals/p02-storage-engines/b-trees-and-variants/03-crash-safety-of-structure-modifications-atomic-splits-and-in/)
+- [Fill factor, fragmentation and splits under load](/db-internals/p02-storage-engines/b-trees-and-variants/04-fill-factor-fragmentation-and-splits-under-load/)
+- [Bulk loading and index construction](/db-internals/p02-storage-engines/b-trees-and-variants/05-bulk-loading-and-index-construction/)
+- [Key layout, prefix compression and suffix truncation](/db-internals/p02-storage-engines/b-trees-and-variants/06-key-layout-prefix-compression-and-suffix-truncation/)
+- [Collation, Unicode and byte-comparable key encoding](/db-internals/p02-storage-engines/b-trees-and-variants/07-collation-unicode-and-byte-comparable-key-encoding/)
+- [Why fanout B: the external-memory model, optimality bounds and cache-oblivious layouts](/db-internals/p02-storage-engines/b-trees-and-variants/08-why-fanout-b-the-external-memory-model-optimality-bounds-and/)
 
 ### 2.5 B-Tree Concurrency and Write-Optimized Variants
 
@@ -136,7 +136,7 @@ The single-node storage substrate in depth: page layout, buffer management, B-tr
 
 *core* — LSM trees power RocksDB, Cassandra, and most distributed stores; the write path, the sorted-run file format and the filtered read path explain both their speed and where that speed quietly disappears.
 
-- [Append-only logs and Bitcask hash indexes](/p02-storage-engines/lsm-trees/01-append-only-logs-and-bitcask-hash-indexes/)
+- [Append-only logs and Bitcask hash indexes](/db-internals/p02-storage-engines/lsm-trees/01-append-only-logs-and-bitcask-hash-indexes/)
 - Write path: WAL, memtable, flush and write stalls <span class="pending">soon</span>
 - Skip lists: probabilistic balance without rebalancing <span class="pending">soon</span>
 - Writes that must read first: constraints, secondary indexes and Merge <span class="pending">soon</span>

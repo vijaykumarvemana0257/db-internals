@@ -5,6 +5,10 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+// Must match astro.config.mjs's BASE resolution, so generated links land under
+// the same base path the site is actually served from (e.g. GitHub Pages project sites).
+const base = process.env.BASE ?? '/';
+const withBase = (path) => `${base.replace(/\/$/, '')}${path}`;
 const curriculum = JSON.parse(
   readFileSync(resolve(root, '_planning/curriculum-result.json'), 'utf8'),
 ).curriculum;
@@ -56,7 +60,7 @@ curriculum.parts.forEach((part, pi) => {
         visual: sub.visual,
         depth: sub.depth,
         path: `src/content/docs/${moduleDir}/${pad(si + 1)}-${slugify(sub.title)}.mdx`,
-        url: `/${moduleDir}/${pad(si + 1)}-${slugify(sub.title)}/`,
+        url: withBase(`/${moduleDir}/${pad(si + 1)}-${slugify(sub.title)}/`),
       });
     });
   });
