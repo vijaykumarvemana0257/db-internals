@@ -1,0 +1,161 @@
+---
+title: 'Read path, Bloom filters and the block cache'
+description: How an LSM point lookup searches memtables, every L0 file and one file per level, why Bloom filters make absent keys nearly free, what the block cache holds, and why range scans cannot use filters.
+depth: intermediate
+sidebar:
+  order: 6
+---
+
+import BloomReadPathLab from '../../../../components/viz/BloomReadPathLab';
+
+Writes in an LSM tree are cheap because they are deferred. Reads pay for it. A key's newest version
+might be in the active memtable, in an immutable memtable waiting to flush, in any of several
+overlapping L0 files, or in exactly one file in each level below — and the engine cannot know which
+without looking. The read path is the set of tricks that make "looking" cheap enough that an LSM can
+serve point reads competitively with a B-tree.
+
+<BloomReadPathLab client:visible />
+
+## A point lookup, in order
+
+A `Get(key)` in RocksDB searches from newest data to oldest and stops at the first version it finds —
+a newer version of a key always shadows older ones, and a tombstone means the key is deleted:
+
+1. **The active memtable**, then **each immutable memtable**, newest first. These are in-memory
+   skip-list searches.
+2. **Every L0 file whose key range contains the key**, newest first. L0 files are flushed memtables, so
+   their key ranges overlap and each one has to be checked separately.
+3. **One file per level from L1 down.** Below L0, files within a level do not overlap, so a binary search
+   over the level's file boundaries — kept in memory in the version's file metadata — names the single file
+   that could hold the key.
+
+For each SSTable, the [file format page](../../../p02-storage-engines/lsm-trees/05-sstable-format-blocks-restart-points-index-filters-footer/)
+showed the rest: consult the filter, and if it does not rule the key out, use the index to find one data
+block and read it.
+
+Switch the lab to **Read path** and select *Get a key that does not exist*. With four L0 files and five
+levels below them, the read consults eleven sources: two memtables, four L0 files and five levels. Now select
+*Get a key in the newest L0 file*: the read stops after the first L0 file that holds it, and the deeper
+levels are never touched. The newest version wins, so the search order is also the stopping rule.
+
+That worst case — a key that is absent, or that lives in the bottom level — is **read amplification**:
+the number of places one logical read has to look. Raise **L0 files** and watch the number of sources climb
+one for one. This is why the [write stalls](../../../p02-storage-engines/lsm-trees/02-write-path-wal-memtable-flush-and-write-stalls/)
+refuse to let L0 grow without bound.
+
+## Bloom filters: making "not here" nearly free
+
+Most of those sources do not contain the key, and reading a data block from each would make LSM reads
+hopeless. Each SSTable therefore carries a **Bloom filter** over its keys, and the filter is checked before
+any data block is read.
+
+A Bloom filter is an array of *m* bits and *k* hash functions. Inserting a key sets the *k* bits its hashes
+select. A lookup computes the same *k* positions:
+
+- if **any** of those bits is clear, the key was definitely never inserted — no false negatives;
+- if **all** are set, the key is *probably* present, but those bits might have been set by other keys — a
+  false positive.
+
+After inserting *n* keys, the probability that a particular bit is still clear is about e^(−kn/m), so the
+false-positive rate is approximately:
+
+```
+FP ≈ (1 − e^(−kn/m))^k
+```
+
+For a given number of bits per key, *m/n*, the rate is lowest when **k ≈ (m/n) · ln 2**, which is also the point
+where about half the bits are set. At the common setting of **10 bits per key**, that optimum is k ≈ 7 and the
+false-positive rate is under 1%.
+
+Switch the lab to **Bloom filter**. At 10 bits per key and k = 7, about half the bits are set, and the measured
+false-positive rate over 20,000 lookups of keys that were never inserted comes out close to the formula. Then move k:
+
+- **k too small** leaves few bits set per key, so a random absent key finds all its few bits set more often. At k = 2,
+  the rate is several times higher.
+- **k too large** fills the array — most bits end up set — so every absent key's bits are set too. At k = 14 the bits
+  are about three-quarters set and the rate roughly doubles.
+
+The table under the lab gives the predicted rate at the optimal k for a range of bits per key. Each extra bit per key
+reduces the rate by roughly a factor of 0.62, so going from 10 to 20 bits per key takes the predicted rate from about 1%
+to about one in ten thousand, for twice the memory.
+
+The lab uses the probing scheme LevelDB's Bloom filter uses: one hash of the key, then a second value derived by rotating
+it, added repeatedly to generate the remaining positions. At very low predicted rates the measured rate in the lab runs
+somewhat above the formula, for two reasons worth knowing: a filter over a few dozen keys is small enough that one or two
+unlucky collisions dominate the count, and probe positions generated from a single hash are not fully independent, which
+the formula assumes. Production filters are far larger, and RocksDB has moved to newer filter implementations with better
+properties, covered on the page about filters beyond Bloom.
+
+### What a filter buys on the read path
+
+Return to **Read path**. For *Get a key that does not exist*, the filter check happens in memory for each of the nine
+on-disk sources, and each one that does not hold the key is read only with the false-positive probability. The expected
+number of data-block reads is a small fraction of one. Turn **Bloom filters** off and the same lookup has to read a block
+from every one of those files.
+
+For a key that does exist, the filter cannot help with the file that holds it — that file's filter correctly says "maybe" —
+but it still eliminates the other files. So a present key costs one real block read plus a small false-positive tail, and an
+absent key costs almost nothing. That asymmetry is the reason the [unique-check page](../../../p02-storage-engines/lsm-trees/04-writes-that-must-read-first-constraints-secondary-indexes-an/)
+found existence checks cheap and old-row reads expensive.
+
+## The block cache
+
+A filter check or an index search only avoids I/O if the filter and index blocks are in memory, and a data-block read only
+avoids I/O if that block has been read recently. RocksDB's **block cache** holds recently used blocks so repeated reads do
+not go to disk.
+
+- **What it holds.** The block cache stores uncompressed blocks, so a hit costs neither a read nor a decompression. RocksDB
+  can add a compressed secondary cache tier behind it, which fits more blocks into the same memory at the cost of decompressing
+  on a hit. RocksDB's older separate compressed block cache option has been removed in favor of that secondary cache design.
+- **How it evicts.** The default implementation is a sharded LRU cache: the cache is split into shards, each with its own lock and
+  LRU list, so concurrent readers rarely contend on the same lock. Newer RocksDB versions add `HyperClockCache`, a clock-based design
+  built to scale further under heavy concurrency. The trade-offs mirror the
+  [buffer pool's replacement policies](../../../p02-storage-engines/buffer-pool/03-replacement-policies-lru-clock-lru-k-2q-and-arc/).
+- **Index and filter blocks.** By default, RocksDB loads a table's index and filter blocks when it opens the file and keeps them in
+  memory outside the block cache. Setting `cache_index_and_filter_blocks` puts them *in* the cache instead, so their memory is bounded
+  and accounted — but then they compete with data blocks and can be evicted. Options such as
+  `pin_l0_filter_and_index_blocks_in_cache`, and caching them with high priority, exist so the blocks every read needs are not the ones
+  that get evicted.
+
+Without direct I/O, the operating system's page cache also holds recently read file pages, and those pages contain *compressed*
+blocks. Memory given to RocksDB's block cache and memory left to the page cache are therefore two different trade-offs over the same
+data: one holds blocks ready to use, the other holds more blocks that still need decompressing.
+
+The lab's **Block cache hit rate** slider converts expected block reads into expected disk reads. It is a deliberately simple model —
+a single hit rate applied to every block — but it shows the shape: filters decide how many blocks a read needs, and the cache decides how
+many of those become I/O.
+
+## Range scans cannot use Bloom filters
+
+A range scan — "every key from `a` to `b`" — works differently. It creates an **iterator** over every source that could contain keys
+in the range: the memtables, each L0 file, and a level iterator for each deeper level. A **merging iterator** keeps those child iterators
+in a heap ordered by their current key, repeatedly takes the smallest, and skips older versions and tombstones for the same user key.
+
+A Bloom filter answers "is this exact key present?" and has nothing to say about "which keys fall between `a` and `b`", so an ordinary
+scan cannot skip any source. Select *Range scan* in the lab: every L0 file and every level contributes a block read, and raising the L0
+file count adds one source per file. Scans are where read amplification is felt most directly.
+
+There is one important exception. If keys have a structured prefix — a tenant ID, a user ID — and the table is configured with a
+**prefix extractor**, RocksDB can build filters over key prefixes. A scan confined to a single prefix can then ask each file whether it
+contains *that prefix* and skip the files that do not. Check **Prefix Bloom** in the lab to see a prefix-bounded scan recover most of the
+benefit. It only helps scans that stay within one prefix, which is why key design and prefix configuration go together.
+
+## Where it bites in production
+
+- **L0 buildup shows up as read latency first.** Every extra L0 file is another filter check on every point read and another source on
+  every scan. A read-latency regression that tracks the L0 file count is compaction falling behind, not a read-path problem.
+- **Filter memory is real memory.** At 10 bits per key, a billion keys need on the order of a gigabyte of filter data. If filters are not
+  cached or not held in memory, every filter check becomes a read, and filters stop saving anything.
+- **Evicted index and filter blocks cause latency spikes.** When index and filter blocks live in the block cache and get evicted under
+  pressure, the next reads of those files pay extra I/O before they can even look for a key.
+- **Scans are the worst case.** Workloads dominated by range scans get little from filters and pay for every source. Keeping L0 small and
+  the number of levels modest matters more for them than for point lookups.
+- **Deleted data still costs reads.** A scan over a range full of tombstones has to step over every tombstone to find live keys. That cost
+  is covered on the deletes and tombstones page.
+
+:::note[What to take forward]
+A point read searches newest to oldest — memtables, every overlapping L0 file, one file per level — and stops at the first version. Bloom
+filters make files that do not hold the key nearly free to skip, so absent keys cost almost nothing and present keys cost about one block read.
+The block cache decides how many of those reads touch disk. Range scans must merge every source and can only use filters when confined to a
+key prefix, which makes them the workload most sensitive to read amplification.
+:::

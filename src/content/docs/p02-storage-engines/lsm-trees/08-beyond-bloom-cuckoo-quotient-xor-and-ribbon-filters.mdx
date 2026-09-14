@@ -1,0 +1,155 @@
+---
+title: 'Beyond Bloom: cuckoo, quotient, xor and ribbon filters'
+description: Every approximate-membership filter needs at least log₂(1/ε) bits per key. How far above that floor Bloom, blocked Bloom, cuckoo, quotient, xor, binary fuse and ribbon filters sit — and which operations each supports, which decides where it fits in an LSM.
+depth: deep
+sidebar:
+  order: 8
+---
+
+import FilterSpaceCuckooLab from '../../../../components/viz/FilterSpaceCuckooLab';
+
+The [read path](../../../p02-storage-engines/lsm-trees/06-read-path-bloom-filters-and-the-block-cache/)
+made Bloom filters look like the whole story: a few bits per key, and absent keys become nearly free.
+For a large database, though, filter memory is a real line item — on the order of a gigabyte per billion
+keys at 10 bits per key — and Bloom filters are not especially efficient with it. Since Bloom's 1970
+paper, a family of alternatives has pushed closer to the theoretical limit, each with different trade-offs
+in lookup cost, build cost and what you can do to the filter after it exists.
+
+This page compares them on the questions that actually decide the choice for a storage engine.
+
+<FilterSpaceCuckooLab client:visible />
+
+## The floor: log₂(1/ε) bits per key
+
+Any structure that answers "is this key in the set?" with no false negatives and a false-positive rate ε must use
+at least **log₂(1/ε) bits per key**, regardless of how clever it is. At ε = 1%, that floor is about 6.64 bits per key.
+The useful way to compare filters is therefore not raw bits, but **how far above the floor** each one sits.
+
+In the lab's **Space vs the floor** panel, drag the target false-positive rate and read the bars. Every design's bar starts
+from the floor marked on each row; the distance past it is that design's overhead.
+
+## Bloom and blocked Bloom
+
+A Bloom filter at its optimal number of hash functions needs about **1.44 × log₂(1/ε)** bits per key — roughly 44% above
+the floor. That overhead is the price of its simplicity: a flat bit array, *k* independent probes, and nothing else.
+
+Its other cost is locality. The *k* probes land at unrelated positions across the bit array, so a lookup in a large filter
+can take up to *k* cache misses. **Blocked Bloom filters** fix that by first hashing the key to one block — typically a
+cache line of 512 bits — and placing all *k* probes inside it. A lookup then costs one cache miss.
+
+The price is a higher false-positive rate for the same memory: some blocks end up with more keys than average, and those
+blocks fill up. The lab measures both designs over thousands of keys. At 10 bits per key the blocked version's rate is
+noticeably higher than standard Bloom's; move **Measure blocked Bloom at** up to 16 bits per key and the gap grows to several
+times, because the overloaded blocks dominate once the average rate is very low. Blocked designs usually compensate by spending
+a little more memory.
+
+Blocked designs are common in practice because a cache miss costs far more than a slightly higher false-positive rate:
+
+- The **split block Bloom filter** used by Impala and Kudu, and specified for **Parquet** bloom filters, is a blocked design.
+- RocksDB's newer Bloom filter implementation is cache-local in the same spirit, confining a key's probes to one cache line.
+
+## Cuckoo filters: fingerprints you can delete
+
+A **cuckoo filter** stores short **fingerprints** of keys in a table of buckets, usually with four slots per bucket. Each key has
+two candidate buckets. Its fingerprint goes into whichever has room.
+
+The trick that makes it a filter rather than a hash table is **partial-key cuckoo hashing**. The second candidate bucket is computed
+from the first bucket and the *fingerprint alone* — `i₂ = i₁ XOR hash(fingerprint)` — so a fingerprint can be moved between its two
+buckets without knowing the original key. When both buckets are full, the insert evicts a resident fingerprint, which moves to *its*
+other bucket, possibly evicting another, along a chain that usually ends quickly in a free slot.
+
+Switch the lab to **A cuckoo filter** and press **Insert 10** repeatedly. Early inserts drop straight into a free slot. As the table fills,
+inserts start triggering eviction chains — the buckets on the last chain are outlined — and eventually an insert gives up after hundreds of
+kicks. With four-slot buckets that happens around 95% load, which is why cuckoo filters can pack fingerprints so densely. Now press **Delete
+oldest key** a few times and insert again: it succeeds.
+
+That is the capability Bloom filters lack. Clearing a Bloom bit might remove a bit another key depends on, so a Bloom filter cannot delete; a
+cuckoo filter deletes a key by removing one copy of its fingerprint. The caveat matters: you may only delete keys that were really inserted.
+Deleting a key that was never added could remove a *different* key's identical fingerprint and create a false negative.
+
+A cuckoo filter's false-positive rate is roughly 2 × (slots per bucket) ÷ 2^(fingerprint bits), since a lookup compares against up to eight
+fingerprints across two buckets. Its space is about (log₂(1/ε) + 3) ÷ load bits per key, which makes it better than Bloom at low false-positive
+rates and worse at high ones. A lookup touches two buckets — two cache lines at most.
+
+## Quotient filters: sorted, mergeable, resizable
+
+A **quotient filter** splits each key's hash into a **quotient**, which picks a slot, and a **remainder**, which is what gets stored. When a slot is
+taken, remainders shift forward into following slots, and three metadata bits per slot record enough about those shifts to reconstruct which quotient
+each remainder belongs to.
+
+The result behaves like a compact, sorted hash table:
+
+- lookups scan a short contiguous run of slots, which is cache-friendly;
+- **deletion** is supported by removing a remainder and repairing the metadata;
+- two quotient filters can be **merged** by walking them in hash order, much like merging sorted runs, and a filter can be **resized** without the original
+  keys — a property most filters lack.
+
+The cost is space and load sensitivity: about (log₂(1/ε) + 3) bits per slot, and performance degrades as the table fills past roughly three-quarters, so
+practical space is higher than cuckoo's. Counting quotient filters extend the design to track multiplicities as well.
+
+## Xor and binary fuse filters: static and close to the floor
+
+If you never need to insert after construction, you can do much better. An **xor filter** stores an array of fingerprint-sized values chosen so that, for
+every key in the set, the XOR of three array entries at positions derived from the key equals the key's fingerprint. A lookup computes three positions,
+XORs three values and compares. Construction solves for the array by repeatedly "peeling" entries that only one key uses.
+
+An xor filter needs about **1.23 × log₂(1/ε)** bits per key. **Binary fuse filters** refine the construction so the three positions are near each other and the
+array can be smaller: about 12.5% above the floor for the three-position version and about 7.5% for the four-position version, with faster construction than xor
+filters.
+
+The trade is that both are **static**. Once built, you cannot add a key, delete one or merge two filters — you rebuild from the full key set.
+
+## Ribbon filters: tunable space versus build time
+
+A **ribbon filter** treats filter construction as solving a system of linear equations over GF(2). Each key contributes one equation, constrained to a narrow band of
+columns — the "ribbon" — so the system can be solved quickly with Gaussian elimination confined to that band. A lookup reads one band-width window of the solution,
+which usually fits in about one cache line.
+
+Its defining property is **tunability**: a wider ribbon brings the filter closer to the floor — within a few percent is achievable — at the cost of more work during
+construction. The lab shows ribbon as a range for that reason. Like xor filters, ribbon filters are static.
+
+RocksDB added a ribbon filter and reports that, at the same false-positive rate, it uses roughly 30% less memory than RocksDB's Bloom filter, at the cost of more CPU
+to build.
+
+## What an LSM actually needs
+
+Switch the lab to **What each can do**, choose a design, and try each operation. Cuckoo and quotient filters handle inserts and deletes; Bloom filters merge by OR-ing
+bit arrays; xor, binary fuse and ribbon filters refuse everything but a full rebuild.
+
+Now consider what an LSM tree asks of a filter:
+
+- **Does it need inserts after construction?** No. An SSTable is immutable; its filter is built once, when the file is written by a flush or compaction, and never changes.
+- **Does it need deletes?** No. A deleted key becomes a tombstone, which is a *new* entry in a *newer* file — the old file and its filter are untouched until compaction
+  replaces the file entirely.
+- **Does it need merging?** No. Compaction reads the keys of its input files and writes new files; it builds new filters from those keys rather than combining the old filters.
+- **Does it need to build incrementally?** Only partly. A table builder sees keys one at a time, but it can buffer their hashes and build a static filter when the file is
+  finished, as RocksDB does.
+
+Every capability that static filters give up is one an LSM does not use. That is why the most space-efficient static designs are a natural fit for SSTables, while cuckoo
+and quotient filters, with their support for deletion and merging, find their homes in places where the key set changes in place.
+
+### Where RocksDB uses ribbon
+
+RocksDB's ribbon filter policy takes a `bloom_before_level` parameter: files in levels above it get Bloom filters, and files at or below it get ribbon filters. The reasoning
+follows from the shape of a leveled LSM:
+
+- **The bottom level holds most of the data.** In a leveled tree the last level is typically around 90% of the total, so saving filter memory there saves most of the memory.
+- **Upper levels are rewritten constantly; the bottom level rarely.** Files near the top are compacted over and over, so paying extra CPU to build a ribbon filter for each short-lived
+  file would be wasted. Bottom-level files live much longer, so their slower-to-build, smaller filters pay off.
+- **Flushes need to be fast.** L0 files are produced by flushes, which sit on the write path; a cheap Bloom build keeps flushes quick.
+
+## Where it bites in production
+
+- **Filter memory scales with keys, not bytes.** A workload with many small keys spends proportionally more on filters. Estimate filter memory from key count × bits per key, and account
+  for it against the block cache.
+- **Construction memory is real.** A static filter needs all key hashes before it can be built, so compacting a large file holds those hashes in memory until the file is finished.
+- **Lower false-positive targets cost less than they look for near-floor filters.** Each halving of ε adds one bit per key at the floor; for a filter close to it, dropping from 1% to 0.1%
+  costs about 3.3 extra bits per key, which can be worth it when each false positive is a disk read.
+- **Blocked filters change the false-positive math.** A cache-local Bloom filter at a given bits-per-key setting does not deliver the textbook rate; check the implementation's documented
+  rate rather than the Bloom formula.
+
+:::note[What to take forward]
+No filter beats log₂(1/ε) bits per key. Bloom sits about 44% above that floor with scattered probes; blocked Bloom trades a higher false-positive rate for one cache miss; cuckoo and quotient
+filters add deletion, and quotient filters merging and resizing, at their own space costs; xor, binary fuse and ribbon filters get close to the floor by being static. An LSM's filters are built
+once per immutable file and never modified, so static filters fit it well — and RocksDB uses the smallest ones where most of the data lives, in the bottom levels.
+:::

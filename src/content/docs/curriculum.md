@@ -5,7 +5,7 @@ tableOfContents: false
 ---
 
 12 parts · 104 modules · 716 pages.
-**66** are written so far; the rest are specified and queued.
+**69** are written so far; the rest are specified and queued.
 
 ## Part 1 — Foundations: Machines, Data and the Shape of an Engine
 
@@ -130,9 +130,9 @@ The single-node storage substrate in depth: page layout, buffer management, B-tr
 - [Skip lists: probabilistic balance without rebalancing](/db-internals/p02-storage-engines/lsm-trees/03-skip-lists-probabilistic-balance-without-rebalancing/)
 - [Writes that must read first: constraints, secondary indexes and Merge](/db-internals/p02-storage-engines/lsm-trees/04-writes-that-must-read-first-constraints-secondary-indexes-an/)
 - [SSTable format: blocks, restart points, index, filters, footer](/db-internals/p02-storage-engines/lsm-trees/05-sstable-format-blocks-restart-points-index-filters-footer/)
-- Read path, Bloom filters and the block cache <span class="pending">soon</span>
-- Deletes, tombstones, TTL and snapshots <span class="pending">soon</span>
-- Beyond Bloom: cuckoo, quotient, xor and ribbon filters <span class="pending">soon</span>
+- [Read path, Bloom filters and the block cache](/db-internals/p02-storage-engines/lsm-trees/06-read-path-bloom-filters-and-the-block-cache/)
+- [Deletes, tombstones, TTL and snapshots](/db-internals/p02-storage-engines/lsm-trees/07-deletes-tombstones-ttl-and-snapshots/)
+- [Beyond Bloom: cuckoo, quotient, xor and ribbon filters](/db-internals/p02-storage-engines/lsm-trees/08-beyond-bloom-cuckoo-quotient-xor-and-ribbon-filters/)
 
 ### 2.6 LSM Compaction, Amplification and Crash Safety
 

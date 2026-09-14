@@ -1,0 +1,152 @@
+---
+title: 'Deletes, tombstones, TTL and snapshots'
+description: In an LSM tree a delete is a write. Tombstones shadow older versions until compaction can prove they are safe to drop — which snapshots, lower levels and replication all delay — and tombstone-heavy scans are a classic production failure.
+depth: intermediate
+sidebar:
+  order: 7
+---
+
+import TombstoneZombieLab from '../../../../components/viz/TombstoneZombieLab';
+
+Nothing in an SSTable can be modified, so an LSM tree cannot delete a key by removing it. It deletes
+a key the same way it writes one: by appending a newer record. That record is a **tombstone**, and it
+says "as of this sequence number, this key does not exist".
+
+That makes deletes as cheap as writes, and it moves all the difficulty to a later question: **when may
+the tombstone itself be thrown away?** Drop it too early and the data it was hiding comes back. Keep it
+too long and every read and scan pays to step over it. This page is about that decision.
+
+<TombstoneZombieLab client:visible />
+
+## Three kinds of delete
+
+- **Point tombstone.** `Delete(key)` writes a deletion marker with a fresh sequence number. A read that
+  reaches it first returns "not found", and older versions of the key below it are hidden.
+- **SingleDelete.** A cheaper marker that is only correct when the key was written exactly once — covered,
+  with its failure mode, on the [read-before-write page](../../../p02-storage-engines/lsm-trees/04-writes-that-must-read-first-constraints-secondary-indexes-an/).
+- **Range tombstone.** `DeleteRange(begin, end)` writes one record that deletes every key in a range. RocksDB
+  stores range tombstones in a separate range-deletion block in each SSTable rather than among the ordinary
+  entries. Because range tombstones from different writes can overlap, reads work from a **fragmented** form:
+  overlapping ranges are split into non-overlapping fragments, each carrying the sequence numbers that cover
+  it, so a lookup can binary-search for the fragment containing its key. Range tombstones are built for deleting
+  large ranges at once; writing very many small ones makes that fragment list large, and every read pays to
+  consult it.
+
+## When a tombstone can be dropped
+
+A tombstone exists to hide older versions. It can only disappear once nothing it hides could still be read.
+RocksDB's compaction applies two conditions.
+
+**1. No older version can exist below.** If there is any lower level whose files overlap the key, an older
+version might be sitting there, and dropping the tombstone would expose it. So a tombstone survives until
+compaction carries it to the level where nothing below overlaps — in general, the **bottommost** level. Older
+versions *in the same compaction* can be dropped earlier, because the tombstone still shadows anything deeper.
+
+**2. No snapshot can still see what it hides.** A **snapshot** pins a sequence number: a read through the snapshot
+sees the database exactly as of that point. If a snapshot was taken *before* the delete, it must still be able to
+read the value the tombstone hides. So a tombstone can only be dropped when its sequence number is at or below the
+**earliest live snapshot** — that is, every open snapshot already sees the delete.
+
+Snapshots also decide what happens to ordinary versions. Compaction keeps, for each key, the newest version visible to
+the latest read and the newest version visible to each live snapshot, and drops versions in between that no reader can
+see.
+
+In the lab, key `k` has three versions: `put v1` at sequence 10, `put v2` at 20, and a tombstone at 30. Work through the
+combinations under **Compaction and snapshots**:
+
+- **No snapshots, bottommost.** Everything is dropped — the tombstone, and both values it hides. The key is gone for good.
+- **Hold snapshot 25.** The tombstone must stay, because snapshot 25 is older than it. `v2` stays because it is what snapshot
+  25 reads. `v1` is dropped: no reader can see it, since snapshot 25 sees `v2` and the latest read sees the tombstone.
+- **Hold snapshot 15 instead.** Now `v1` is kept for snapshot 15, and `v2` is the one dropped.
+- **Hold both.** All three versions survive this compaction.
+- **Clear the snapshots and uncheck bottommost.** The tombstone stays to hide whatever lower levels might contain, while the
+  older values in this compaction are still dropped.
+
+The read results under the lab confirm that every reader still sees exactly what it saw before the compaction. That is the
+invariant compaction must preserve; dropping a version is only allowed when it cannot change any read.
+
+### Long-lived snapshots are expensive
+
+The second condition has an operational consequence: **a snapshot held open for a long time pins every tombstone and every
+overwritten version written after it**, across the whole database. Compaction runs and rewrites files, but it cannot drop
+anything those snapshots might read. Space grows, and scans over recently deleted data slow down.
+
+RocksDB iterators hold an implicit snapshot for their lifetime, so a forgotten iterator has the same effect as a forgotten
+snapshot. The same mechanism appears in every MVCC engine — a long transaction in PostgreSQL holds back vacuum in exactly
+this way — and the MVCC module later in this site covers it in depth.
+
+## TTL and compaction filters
+
+Many deletes are not explicit: rows should simply expire after some time. LSM engines implement expiry during compaction,
+because compaction is the moment every record passes through code that can decide to drop it.
+
+- RocksDB's **compaction filters** are user callbacks invoked for each key during compaction; returning "remove" drops the key.
+  `DBWithTTL` uses this mechanism, storing a timestamp with each value and filtering out expired entries as files are compacted.
+- Because expiry happens at compaction, **expired data can remain readable until compaction reaches it** — expiration is eventual,
+  not instant. Applications that need a hard cutoff also filter by timestamp at read time.
+- Cassandra's TTL marks cells to expire. Once a cell's TTL passes it is treated as a tombstone, and it follows the same purge rules as
+  an explicit delete.
+
+## Distributed tombstones and zombies
+
+Replication adds a third reason a tombstone must not be dropped too early.
+
+In Cassandra, a delete succeeds when enough replicas acknowledge it. A replica that was down at the time never received the
+tombstone and still holds the old row. The cluster fixes that with **repair**: replicas compare data and copy whatever one has
+that another lacks. The tombstone is what lets repair propagate the delete — the down replica receives the tombstone and applies it.
+
+But tombstones cannot be kept forever. Cassandra keeps them for at least **`gc_grace_seconds`**, which defaults to 864,000 seconds
+— ten days — after which compaction may purge them. The operational contract is that **repair must complete on every replica within
+`gc_grace_seconds`**.
+
+Switch the lab to **gc_grace and zombies**. Replica B is down when the delete happens on A and C. With B down for fewer days than the
+grace period, B returns while A and C still hold the tombstone, repair applies it to B, and the row stays deleted. Drag **Replica B down
+for** past `gc_grace_seconds`: by the time B returns, A and C have purged their tombstones, and B is the only replica with anything at
+all to say about the row — the old value. Repair sees data that A and C lack and copies it back. **The deleted row comes back to life** —
+a zombie.
+
+The fix is procedural rather than technical: run repair more often than `gc_grace_seconds`, and do not return a replica that has been down
+longer than that without rebuilding it. Lowering `gc_grace_seconds` to make tombstones disappear sooner is only safe if repair genuinely runs
+within the shorter window.
+
+## The queue anti-pattern
+
+Deletes are cheap to write and expensive to read past, and one workload turns that into an outage: **using an LSM table as a queue.**
+
+A producer inserts messages with increasing keys. A consumer reads from the head, processes a message, and deletes it. Every delete leaves a
+tombstone at the *front* of the key range — exactly where the consumer's next scan begins. After enough messages, finding the first live
+message means stepping over thousands, then hundreds of thousands, of tombstones.
+
+Switch the lab to **A queue full of tombstones**. With 20,000 messages enqueued and 95% consumed, the scan steps over 19,000 tombstones before
+returning a single live row. Check **Compaction has reached the bottom level** and the tombstones disappear — then also check **A long-running
+snapshot is open**, and they come back, because compaction may not drop them.
+
+Cassandra puts guardrails on this: a query that scans more than `tombstone_warn_threshold` tombstones (1,000 by default) logs a warning, and one
+that scans more than `tombstone_failure_threshold` (100,000) is aborted. Hitting the failure threshold in production is almost always this queue
+shape, or a wide partition that is repeatedly deleted from.
+
+The mitigations all change where the scan starts or how quickly tombstones go away:
+
+- **Start past what has been consumed.** Track the consumer's position and seek from it — in RocksDB, set `iterate_lower_bound` — instead of
+  scanning from the start of the range.
+- **Delete in ranges.** Deleting a consumed batch with one `DeleteRange` leaves one range tombstone instead of thousands of point tombstones.
+- **Compact tombstone-dense files sooner.** RocksDB's `CompactOnDeletionCollector` marks files whose recent entries are dominated by deletes for
+  compaction, so they are cleaned up before scans pile into them.
+- **Use a real queue.** A log such as Kafka is built for append-then-consume; a sorted key-value store is not.
+
+## Where it bites in production
+
+- **Deletes grow the database first.** A bulk delete adds tombstones and leaves the deleted data in place until compaction reaches the bottom level.
+  Disk usage rises before it falls.
+- **Scan latency tracks tombstone count, not row count.** A table with few live rows can be slow to scan if it has many tombstones in the scanned range.
+- **A stuck snapshot looks like compaction not working.** If space never reclaims despite compaction running, look for long-lived snapshots or iterators
+  before tuning compaction.
+- **Zombies come from operations, not bugs.** A resurrected row in Cassandra usually means repair did not complete within `gc_grace_seconds`, or a replica
+  that was down too long rejoined without being rebuilt.
+- **TTL is eventual.** Expired data can still be read until compaction removes it; do not rely on TTL alone for anything that must be gone by a deadline.
+
+:::note[What to take forward]
+A delete is a write of a tombstone, and the tombstone must outlive everything it hides: older versions in lower levels, snapshots taken before the delete,
+and — in a replicated store — replicas that have not yet heard about it. Compaction is where tombstones are finally dropped, so anything that delays
+compaction or pins old versions leaves tombstones in place, and scans pay to step over every one.
+:::
