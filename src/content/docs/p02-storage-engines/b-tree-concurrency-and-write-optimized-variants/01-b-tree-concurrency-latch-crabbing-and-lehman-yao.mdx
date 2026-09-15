@@ -1,0 +1,209 @@
+---
+title: 'B-tree concurrency: latch crabbing and Lehman-Yao'
+description: How concurrent B-tree descents stay correct while pages split — latch crabbing and optimistic descent, InnoDB's index->lock with its SX mode, optimistic lock coupling with per-page version counters, and the Lehman–Yao right link and high key that PostgreSQL's nbtree uses, down to half-dead pages and safexid.
+depth: deep
+sidebar:
+  order: 1
+---
+
+import BLinkLatchProtocolLab from '../../../../components/viz/BLinkLatchProtocolLab';
+
+A B-tree page in the buffer pool is shared memory. Every descent reads the root, and at any moment one thread may
+be splitting a leaf: moving half its keys to a new page and adding a separator to the parent. A reader that followed
+a downlink just before that split and reaches the page just after it arrives at a page that no longer holds its key.
+Every protocol here answers one question: **how does a descent know that the page it reached still covers its key?**
+
+These are **latches**, not locks: short-term mutual exclusion on an in-memory page, held for one page visit or one
+structural change, never for a transaction. No deadlock detector ever sees them, so each protocol avoids deadlock by
+construction: by the order in which it takes them, or by never waiting at all.
+
+<BLinkLatchProtocolLab client:visible />
+
+The lab's tree has three levels and at most three keys per page. The inserter adds **27** to the full leaf
+L2 `[20, 25, 30]`, so L2 splits and 27 and 30 end up on a new page, L2′. The reader looks up **30**, the key that moves. Separators
+are inclusive upper bounds, the convention PostgreSQL's nbtree uses, so each page's high key equals its parent's
+separator for it. **Race to the end** lets the reader descend until it is about to enter the leaf, then runs the
+inserter while it can; a thread that would wait makes one attempt, so the wait is recorded, and yields.
+
+## Latch crabbing
+
+The oldest protocol, from Bayer and Schkolnick (1977), is called latch coupling, hand-over-hand locking or
+**crabbing**. The rule: **latch the child before releasing the parent**, so a split can never slip into a gap.
+Readers take shared (S) latches and hold at most two. Writers take exclusive (X) latches and keep every ancestor until
+they latch a **safe** node — one the operation cannot change beyond itself:
+
+- **for an insert**, a node that is not full, so a split cannot climb above it;
+- **for a delete**, a node more than half full, so a merge cannot climb above it.
+
+On latching a safe child, the writer releases all ancestors; from the lowest safe node down, everything stays
+X-latched until the change is done.
+
+Select **Latch crabbing** and press **Race to the end**. The reader holds S on P until it has latched L2, so the
+inserter, already holding X on the root, waits for P; then it sees P has room, releases R, and waits again for L2
+while the reader finds 30 there. The inserter held three pages at once: P, L2 and the new L2′. Tick **Parent P is
+full too**: P is no longer safe, R stays latched, and **Most pages the inserter held at once** reaches 5. Untick it,
+reset, step the inserter three times and the reader twice: the reader's S request on P now waits for the whole split,
+and **Race to the end** then sends it straight to L2′.
+
+The flaw is the first step: **every insert X-latches the root**. Choose **12 — into L1 (has room)**. The inserter
+still takes X on R, still waits for the reader at P, and briefly holds R and P together. On many cores that one root
+latch serializes every writer of the index.
+
+### Optimistic descent
+
+The usual fix is to bet that the leaf will not split: descend with S latches like a reader, X-latch only the leaf,
+and if the leaf is unsafe, release it and start again pessimistically. Tick **Optimistic descent first**. With 12,
+the inserter never waits. With 27, it reaches L2, finds it full and restarts once. The bet pays because a page that
+has just split is half empty. Graefe's survey of B-tree locking notes the weak spot: with variable-length keys "safe"
+is not a count, because room depends on the size of the incoming key and of the separator a split would post.
+
+## InnoDB: an index latch with a third mode
+
+InnoDB's source describes its tree as "an ordinary B-tree, not a B-link tree": pages have prev/next pointers for
+scans, but no high keys, and no descent moves right. Instead a reader–writer lock on the whole index,
+`index->lock`, sits in front of the page latches, with a third mode, **SX**. From `sync0rw.cc`:
+
+| Held \ requested | S | SX | X |
+|---|---|---|---|
+| **S** | compatible | compatible | waits |
+| **SX** | compatible | waits | waits |
+| **X** | waits | waits | waits |
+
+In MySQL 8.0's `btr_cur_search_to_nth_level`:
+
+- **Searches** (`BTR_SEARCH_LEAF`) and **leaf-only changes** (`BTR_MODIFY_LEAF`) take `index->lock` in S, S-latch
+  every non-leaf page on the path and keep them until the leaf is latched, then release them all.
+- **Inserts are optimistic first.** `row_ins_clust_index_entry` tries `BTR_MODIFY_LEAF`; a row that needs a split
+  gets `DB_FAIL` and is retried with `BTR_MODIFY_TREE`.
+- **`BTR_MODIFY_TREE`** takes `index->lock` in **SX**, so other tree changes wait but searches continue. It
+  buffer-fixes the path without latches — nothing else may restructure the tree — then latches only the pages the
+  change can reach, top-down: the root in SX, since it holds the file-segment headers the new page comes from (X if
+  the root itself changes), the parent in X, then the leaf's left sibling, the leaf and its right sibling in X,
+  **left to right**.
+
+Select **InnoDB index lock** and race it. The inserter restarts once on `DB_FAIL`, takes SX on `index->lock` and on R
+while the reader holds S on both, then waits for P and L2. With the parent full it holds seven pages at once. Now tick
+**MySQL 5.6 (X index lock)**: SX first appears in the 5.7 source, and 5.6 took `index->lock` in **X** for tree changes
+while every descent merely buffer-fixed non-leaf pages. Step the inserter five times, then the reader: the reader
+cannot even begin its search. SX turned an index-wide pause into waits on individual pages. The ordering that keeps all
+of this deadlock-free is the index lock first, pages top-down, leaves left to right.
+
+## Optimistic lock coupling
+
+Shared latches cost something even when nobody waits: acquiring S **writes** to the latch to count readers, so the
+root's latch word bounces between CPU caches although nobody modifies the root — the effect the
+[buffer-pool latching page](../../../p02-storage-engines/buffer-pool-memory-mmap-and-contention/04-latching-the-buffer-pool-and-hot-page-contention/)
+measures on hot pages. Crabbing, InnoDB and B-link readers all pay it at every level.
+
+**Optimistic lock coupling** (OLC), as described by Leis, Haubenschild and Neumann, validates instead. Each node packs a
+version counter and a lock bit into one 64-bit word. A reader reads the version (restarting if the lock bit is set),
+reads the node, then re-reads the version and restarts if it changed. A writer locks by compare-and-swap from the
+version it read to that version plus the lock bit, modifies, and unlocks by bumping the version. The coupling is the
+order of checks: after reading a child pointer, the reader validates the node *before* dereferencing the pointer
+(`checkOrRestart` in the paper), because a pointer read mid-modification may be garbage. Readers write nothing.
+
+Select **Optimistic lock coupling** and race it. The reader records R v1, P v1 and L2 v1. The inserter write-locks P and
+L2, splits L2, unlocks both at v2 and restarts, as the reference OLC B-tree does after every split. It locks only a node
+and its parent, so it cannot carry a split upward; instead it splits any full inner node on the way down. The leaf split
+filled P, so the second descent splits P (R v2, P v3) and restarts again before inserting 27 into L2′. The reader's
+speculative search of L2 `[20, 25]` says "not found"; validation sees P at v3 and L2 at v2, discards that wrong answer,
+restarts, and finds 30 in L2′. Reset, step the inserter four times and the reader twice: the reader restarts because P
+is write-locked. OLC readers never wait; they retry, and the paper suggests capping retries and falling back to
+pessimistic latching. Tick **Parent P is full too** and choose 12: the inserter splits P and restarts although L1 has
+room, and the reader, whose parent P changed under it, restarts too.
+
+In the paper's benchmark on a 10-core machine, OLC lookups at 20 threads ran 3.9× faster than traditional lock
+coupling. LeanStore uses OLC, and Umbra adopts it as a **versioned latch**. Umbra's paper adds a shared mode, which it
+says LeanStore lacked, so read-heavy scans stop failing validation; LeanStore's current `HybridLatch` has one too. Speculative code must terminate even on a torn node, and a
+node cannot be freed while an optimistic reader may be inside it: the [next page](../02-memory-models-atomics-and-what-makes-optimistic-latching-cor/) covers why the
+version check is sound on real hardware and how LeanStore and Umbra lay out their version words, and [memory reclamation](../04-memory-reclamation-for-latch-free-structures-epochs-hazard-p/)
+covers the freeing.
+
+## Lehman–Yao B-link trees
+
+Lehman and Yao (1981) observed that if pages never merge, only one thing can happen to a child between releasing its
+parent and latching it: **the child can split**, and a split only moves keys right. So every page gets a **right
+link** to its sibling and a **high key**, an upper bound on its keys. A descent that finds its key **greater than the
+high key** knows the page split after the downlink was read, and follows the right link, repeatedly if necessary.
+A descent never needs to hold two latches, and a split becomes two independent steps — split the page, then post the downlink —
+with a valid tree in between.
+
+PostgreSQL's nbtree README describes the code as "a correct implementation of Lehman and Yao's high-concurrency
+B-tree management algorithm", adapted to shared buffers:
+
+- **A read lock per page.** Lehman and Yao assumed private copies of pages; PostgreSQL holds a shared content lock
+  while examining a shared buffer.
+- **One lock on the way down.** `_bt_search` will "drop the read lock on the page, then acquire one on its child";
+  an insert write-locks only the leaf.
+- **Move right.** `_bt_moveright` steps right while the scan key exceeds the high key at `P_HIKEY`, or while the page
+  is half-dead or deleted.
+- **Split.** `_bt_split` write-locks the left page, the new right page and the old right sibling (to fix its left
+  link), and flags the left page `BTP_INCOMPLETE_SPLIT`.
+- **Parent.** `_bt_insert_parent` re-finds the parent from the descent stack, write-locks it while still holding the
+  left page, releases the right page, then inserts the downlink and clears the flag atomically.
+- **Order.** A second page may be locked before releasing the current one only when moving right or up.
+
+Select **B-link (PostgreSQL)** and race it. Between pages the reader holds no latch, and neither thread waits. At L2 the
+reader sees 30 is above the high key 25 and makes one right-link hop to L2′. The inserter holds at most three pages;
+with the parent full, four (L2, P, P′ and P's old right sibling Q). Untick **Reader checks the high key**: the same
+schedule returns "not found" from L2 `[20, 25]`, the bug the high key exists to catch. Re-tick it, reset, and step the
+inserter five times, then the reader five times: its read lock on L2 waits for the split. A B-link reader never holds
+one page while waiting for another, but it still waits whenever the page it wants is write-locked.
+
+If a crash interrupts a split between its two steps, the flag stays and the next insert passing through calls
+`_bt_finish_split` — the [crash-safety page](../../../p02-storage-engines/b-trees-and-variants/03-crash-safety-of-structure-modifications-atomic-splits-and-in/)
+shows that state. The OLC paper names the limit: releasing the parent early is a big win when the child must be read
+from disk, but in memory a B-link descent still takes one latch per level. OLFIT (2001) added version counters to
+B-link trees; OLC dropped the B-link part.
+
+## Deleting pages under a B-link tree
+
+Move-right works only because keys cross a page boundary in one direction, rightward in a split. Merging partly full
+pages would move items across boundaries, and a scan travelling the other way could miss them, so nbtree **never
+merges**. It deletes only completely empty pages, never the rightmost page of a level, in two stages from Lanin
+and Shasha:
+
+1. **Half-dead:** remove the downlink from the parent and set `BTP_HALF_DEAD`. The key range now belongs to the right
+   sibling, and a search that still arrives moves right.
+2. **Deleted:** lock the left sibling, the page and the right sibling, in that order; unlink it and set `BTP_DELETED`.
+
+A backend may still be on its way to the page, so it stays as a tombstone with its sibling links intact — the README's
+"drain technique". It is stamped with the next transaction ID, and VACUUM recycles it once that ID is visible to
+everyone. Up to PostgreSQL 13 the stamp lived in `btpo.xact`, a union sharing space with the page's level; since 14 it
+is a 64-bit `safexid` in `BTDeletedPageData`, checked by `BTPageIsRecyclable` via `GlobalVisCheckRemovableFullXid`, and
+a VACUUM can recycle pages it deleted itself at the end of the same run. The stages are on the
+[insert and delete page](../../../p02-storage-engines/b-trees-and-variants/02-insert-split-delete-and-merge/).
+
+## The protocols side by side
+
+| | Reader holds | Split holds | A concurrent split is caught by | Deadlock avoided by |
+|---|---|---|---|---|
+| Latch crabbing | S on parent and child | X from the lowest safe ancestor down | not needed: parent stays latched | top-down order |
+| InnoDB 5.7+ | S on `index->lock`, S on the path until the leaf | SX `index->lock`; root SX or X, parent X, three leaves X | not needed: SX excludes tree changes | index lock, top-down, left to right |
+| OLC (LeanStore, Umbra) | nothing written; versions remembered | X on node and parent by compare-and-swap | changed version: restart | restarting instead of waiting |
+| B-link (PostgreSQL) | one read lock | left, new right, old right sibling; then parent | key above high key: move right | second page only rightward or upward |
+
+## Where it bites in production
+
+- **Upper-level latch traffic.** Shared latches on hot internal pages become cache-line contention before anyone
+  waits; queued writers show up in PostgreSQL as `LWLock` / `BufferContent`, and flat throughput with pinned CPUs is
+  the shared-mode signature.
+- **InnoDB serializes tree changes per index.** Constant splits, as with random UUID keys, queue on one index's SX
+  latch, `wait/synch/sxlock/innodb/index_tree_rw_lock` in `performance_schema`. When the undo history list exceeds
+  100,000 (`BTR_CUR_FINE_HISTORY_LENGTH`) and page reads are pending, delete-intended tree changes (mostly purge) take
+  it in **X**, blocking searches too.
+- **Restart storms.** Optimistic readers landing on pages under write keep restarting, long scans worst — hence
+  retry caps and Umbra's shared mode.
+- **Deleted index pages that cannot be reused.** A long-running transaction holds back the XID horizon, so pages VACUUM
+  deleted stay unrecyclable and new splits extend the index instead.
+- **`failed to re-find parent key in index`** is raised when `_bt_insert_parent` cannot find the downlink: corruption,
+  not contention.
+
+:::note[What to take forward]
+A split moves keys right while other threads sit between a parent and a child. Crabbing never opens that gap, at the
+price of X latches from the lowest safe node down (or a restart, if it descends optimistically); InnoDB adds an SX index
+lock so tree changes exclude each other but not searches. Optimistic lock coupling makes readers write nothing and
+restart when a version moves. Lehman–Yao lets the gap exist and gives every page a right link and high key to recover —
+which is why PostgreSQL holds one read lock at a time, splits in two steps, and defers recycling deleted pages until no
+snapshot can reach them.
+:::

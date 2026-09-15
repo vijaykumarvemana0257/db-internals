@@ -1,0 +1,221 @@
+---
+title: 'Persistence by path copying: fat nodes, versions and why snapshots are cheap'
+description: The general result behind copy-on-write trees — partial and full persistence, path copying, fat nodes and node copying — and the one cost model LMDB, bbolt, ZFS, Btrfs, Iceberg, Git, Neon and MVCC engines share.
+depth: deep
+sidebar:
+  order: 6
+---
+
+import PathCopyPersistenceLab from '../../../../components/viz/PathCopyPersistenceLab';
+
+An ordinary B-tree is *ephemeral*: an update overwrites a page, and the tree that existed a moment ago is gone. The
+copy-on-write trees on the [previous page](../05-b-trees-fractal-trees-and-copy-on-write-b-trees/) refuse to do that, and
+so do Git, Iceberg, Datomic and every MVCC engine. They are all instances of one idea, worked out in general by
+Driscoll, Sarnak, Sleator and Tarjan (DSST) in "Making Data Structures Persistent" (Journal of Computer and System
+Sciences, 1989): keep every past version of a linked structure readable, at a cost close to the ephemeral one.
+
+All of them follow the same three rules: what a write costs, what an old reader pins, and what a branch owns.
+
+<PathCopyPersistenceLab client:visible />
+
+## Partial and full persistence
+
+In the paper's terms, a structure is **partially persistent** if every version can be read but only the newest can
+be modified, and **fully persistent** if any version can be modified. Full persistence turns the history from a line
+into a tree of versions.
+
+LMDB and bbolt are partially persistent: one writer extends the newest version while readers hold older ones. ZFS clones,
+Btrfs snapshots (writable by default), Git branches and Neon branches are fully persistent.
+
+The naive baselines, due to Overmars, bracket the problem: copy the whole structure on every update, Ω(n) per update, or
+store only the update log and rebuild version *i* on demand, Ω(*i*) per access.
+
+## Path copying
+
+In a tree, a node is reachable only through its parent. To change a leaf without disturbing any existing version, copy
+the leaf, then copy its parent so the copy can point at the new leaf, and repeat up to a new root. Every other pointer in
+the copies still points at the old, untouched subtrees. The new root *is* the new version, and the old root still
+describes the old one exactly.
+
+The invariant: **a node is never modified once a published root can reach it.** Any root is then a consistent snapshot
+for as long as its nodes stay allocated, and readers need no locks.
+
+The lab opens on two versions of an eight-leaf tree with four levels. v1 updated leaf 5 by writing four pages, **p17–p20**
+(thick outlines): a new root, two internal nodes and the leaf. The other 11 pages in v1 are v0's, reached through
+pointers the copies did not change; the dashed edges are v0's own tree, rooted at p2. **Keep old versions** is 1, so v0
+is retained and the four pages only it reaches show as pinned.
+
+Press **Commit** twice. v2 writes p21–p24, v0 falls out of the keep window, and its pages p2, p4, p7 and p14 go to the
+free list. v3 writes its copies into exactly those pages, and the file stays at 25 pages.
+
+Two costs follow:
+
+- **A write costs O(depth).** Move **Levels** or **Fanout**, then set them back to 4 and 2: a commit always writes one
+  page per level, however many leaves there are — O(log n) space per insertion in a balanced tree. With 4 KiB pages and four levels, changing one key
+  writes 16 KiB. Keys changed in one commit share the upper parts of their paths, so batching amortizes the inner nodes.
+- **Switching versions costs O(1).** A reader of an old version starts from a different root and pays nothing else: one
+  probe per level, at head or at any retained version.
+
+The technique predates the paper, which credits Myers's "AVL dags", Krijnen and Meertens's "Making B-Trees Work for B"
+(1983), Reps, Teitelbaum and Demers, and Swart.
+
+### Publishing the root is the commit
+
+A version exists once its root is recorded where new readers will look. Until then its pages are unreachable, so a crash
+before the publish leaves only garbage. LMDB and bbolt record the root in one of two alternating meta pages, ZFS in an
+uberblock, and CouchDB in a header appended after the changed nodes; the
+[previous page](../05-b-trees-fractal-trees-and-copy-on-write-b-trees/) shows how each writes that record and finds it
+again on open. CouchDB's `couch_btree` also shows the sharing in code: it hands back the old pointer for any node an update
+did not change, so only the path is appended. Iceberg publishes at table scale by atomically swapping the table's pointer
+to a new metadata file, and readers keep the one they loaded.
+
+## Fat nodes and node copying
+
+DSST set out to beat path copying's O(log n) space per update. Their first method, the **fat node**, copies nothing.
+Each node keeps every value each field has ever had, stamped with the version that wrote it. A read of version *i* takes,
+for every field it touches, the value with the largest stamp ≤ *i*, and an array of roots gives O(1) entry into any
+version. Space is O(1) per update step in the worst case. The price moves to reads: choosing among a field's stamps is a
+search, O(log m) per step if the stamps sit in a search tree.
+
+Switch the lab to **Fat nodes**: the same history, one node per position. Leaf 5 holds stamps v2 (the kept version) and
+v3, and each commit wrote one stamp and nothing else. Internal nodes carry no stamps; their child pointers never change.
+
+Press **Open reader on head**, choose **Oldest-version watermark**, and press **Commit ×5** four times. Leaf 5 stores
+21 stamps. With **Binary search**, reading leaf 5 costs 8 probes at head and 8 at the reader's v3: three pointer hops and
+five comparisons. Switch **Find the stamp** to **Walk newest-first**: head drops to 4 and the reader climbs to 24. Switch
+**Reclaim by** to **Reachability**. The 18 stamps no retained version can see disappear, leaving v3, v22 and v23,
+and the reader's walk falls to 6.
+
+The second method, **node copying**, bounds the fat. Each node has a fixed number of extra slots. A change goes into a
+free slot. When the node is full, it is copied with only its newest values, and the pointer to the copy is stored in the
+parent — in a free slot if there is one, otherwise by copying the parent as well. If no node has more than *p*
+predecessors and each has *e* ≥ *p* extra slots, the paper proves O(1) amortized nodes copied per update step and
+O(1) worst-case time per read step. (The paper reserves the slots for pointers; the lab uses the variant where they hold values
+too.)
+
+Switch to **Node copying** with one extra slot and open **Show the numbers**. Nodes written per commit follow a binary
+counter's carries: half the commits write one node, a quarter two, an eighth three. The **Nodes written per commit** tile shows 1.78 over this
+history's 23 commits, against a constant 4 for path copying. A read scans at most two entries per node, 7 probes at head.
+Raise **Extra slots per node** to 2 and 3, and the average falls to 1.39 and 1.26.
+
+Full persistence adds a *version list* that orders the version tree, and **node splitting**: an overflowing node moves
+roughly half its extra pointers to the new copy, much like a B-tree split.
+
+### Why disk engines copy paths anyway
+
+Fat nodes and node copying write into nodes that committed versions can still reach. On disk, a torn write to such a page
+damages committed versions, so the engine needs a second copy to repair it: PostgreSQL logs a full-page image on a page's
+first change after a checkpoint, and InnoDB writes pages to its doublewrite buffer first. Path copying writes only
+unreachable pages until one root publish, which LMDB's header credits for needing no special recovery procedure after a
+crash. That is the trade the on-disk trees make: O(depth) pages per commit, in exchange for atomic commit without a
+write-ahead log.
+
+## MVCC version chains are fat nodes
+
+Row-level MVCC is coarse partial persistence built from fat nodes. PostgreSQL writes a new tuple for an update, with
+`t_xmin` and `t_xmax` naming the inserting and deleting transactions and the old tuple's `t_ctid` pointing to its
+replacement. InnoDB stamps each row with a 6-byte `DB_TRX_ID` and a 7-byte `DB_ROLL_PTR` to an undo record that rebuilds
+the previous version. The field is a whole row, the stamp is a transaction id, and only the newest version is writable.
+
+The row InnoDB keeps in the index is the newest version, so a consistent read at an old snapshot follows undo records
+backwards — the lab's **Walk newest-first**, where an old reader pays for every newer version. And like the lab's
+watermark, both engines reclaim behind a horizon, as the
+[garbage-horizon page](../../../p01-foundations/anatomy-of-a-database-engine/06-versions-snapshots-and-the-garbage-horizon/)
+showed. InnoDB discards update undo only once no snapshot could still need it.
+
+## The same idea, shipped
+
+| System | What a change copies | What names a version | What frees old data |
+|---|---|---|---|
+| LMDB | B+tree pages on the path | root in one of two meta pages | freelist reuse once every reader is newer |
+| bbolt | B+tree pages on the path | root in meta page `txid % 2` | pending pages released outside every reader's view |
+| CouchDB | B-tree nodes on the path, appended | last valid header in the file | compaction into a new `.compact` file |
+| Btrfs | tree blocks; a snapshot is a new root | subvolume | deleting a subvolume frees what only it references |
+| ZFS | changed blocks | uberblock; snapshot; clone | destroying a snapshot frees its `used` space |
+| Iceberg | data files, changed manifests, manifest list | table metadata file | `expireSnapshots`, then orphan-file cleanup |
+| Datomic | index segments in ~1,000-way trees | a new index tree per indexing job | `gc-storage` with an older-than time |
+| Git | blobs and every tree on the file's path | commit → top-level tree | `git gc` pruning unreachable objects |
+| PostgreSQL, InnoDB | row versions (fat nodes) | transaction id and snapshot | `VACUUM`, purge |
+
+Iceberg reuses unchanged manifests across snapshots, Datomic adapts each indexing job to rewrite as few segments as it
+can, and Git names objects by content hash, so an unchanged directory is the same tree object in both commits: three
+spellings of "share the untouched subtree".
+
+## One cost model
+
+### Bytes written follow the path
+
+A commit writes what changed plus everything above it, up to whatever names the version: the lab's four pages, or Git's
+new tree per directory on a file's path. ZFS reports it as `written`: referenced space the previous snapshot does not
+reference.
+
+### Old versions are pinned by the oldest live root
+
+Switch back to **Path copying**, press **Reset**, set **Keep old versions** to 0, press **Open reader on head**, then
+**Commit ×5**. The reader on v0 pins 4 pages, and the file is 100 KB. Set **Leaf to update** to 0 and commit once: pinned
+climbs to 7, because v0's tree and head now differ on two paths. A reader pins **exactly what its root reaches and newer
+roots do not**, and that grows as the head diverges.
+
+That is the reachability rule. Choose **Oldest-version watermark**: the same history now also holds 17 pages nothing can
+reach — every page written and superseded since the reader opened — and the file grows to 164 KB. **Close reader**:
+nothing is pinned any more, 24 pages go to the free list, and the file stays at 164 KB. Freed pages are reused, but the
+file does not shrink.
+
+The two rules are the on-disk forms of the [reclamation schemes](../04-memory-reclamation-for-latch-free-structures-epochs-hazard-p/)
+for latch-free memory: the watermark behaves like epochs, reachability like hazard pointers. Engines pick one rule:
+
+- **LMDB** uses the watermark. `mdb_find_oldest` starts from the writing transaction's id minus one and lowers it to the
+  oldest reader's snapshot; a freed-page record is reused only if the transaction that freed those pages is older still,
+  one commit more conservative than the lab. The original BoltDB released only pages freed before the oldest open reader.
+- **bbolt**, etcd's fork, added `releaseRange`: a page is also released when the transactions that allocated and freed it
+  both fall in one gap between open readers, or after the newest, so no reader can see it. The
+  [previous page](../05-b-trees-fractal-trees-and-copy-on-write-b-trees/) runs both engines against one long reader.
+- **ZFS and Btrfs account by reachability.** A ZFS snapshot's `used` is the space only that snapshot references, and
+  `usedbysnapshots` is not the sum of the snapshots' `used`, because shared space belongs to none of them alone. Btrfs
+  qgroups track `referenced` and `exclusive` the same way; right after a snapshot, source and snapshot are each exclusive
+  of one node, because only the roots differ. The lab's **Show the numbers** table lists both figures per version.
+
+### A branch owns only where it diverged
+
+From that state, switch **Reclaim by** back to **Reachability** and press **Branch from v6**. Set **Leaf to update** to 2
+and commit to the branch: 4 pages are reachable only from it. Switch **Commit to** to **main**, set the leaf to 5, and
+commit: now 7 pages are branch-only — the 4 it wrote, plus 3 of v6's pages that main has since replaced. A branch owns
+where it diverged, plus the origin pages it alone still reaches.
+
+- **Neon** documents a branch as a copy-on-write clone of a current or past state, with writes saved as a delta. Child
+  branches are billed for the lesser of their accumulated changes and logical data size.
+- **ZFS** clones only from a snapshot, which cannot be destroyed while the clone exists; `zfs promote` reverses the
+  dependency.
+
+### Time travel is priced by retention
+
+Retaining old roots on purpose is the same pin:
+
+- **Iceberg** expires snapshots older than `history.expire.max-snapshot-age-ms` (default five days) while keeping at least
+  `history.expire.min-snapshots-to-keep` (default 1). A data file is deleted only when no retained snapshot references it.
+- **Git** keeps reflog entries for 90 days (`gc.reflogExpire`) or 30 days if unreachable from the tip
+  (`gc.reflogExpireUnreachable`), and `git gc` prunes unreachable objects older than two weeks (`gc.pruneExpire`).
+- **Datomic** keeps garbage segments after a new index tree appears, because not every process adopts it at once, and
+  advises `gc-storage` with an older-than time at least a month old.
+- **Neon's** history window, which bounds instant restore, time travel and branching from the past, defaults to 6 hours on
+  the Free plan and 1 day on paid plans, and goes up to 7 days on Launch and 30 on Scale.
+
+## Where it bites in production
+
+- **A forgotten reader grows the file.** Under LMDB's watermark, one long read transaction blocks reuse of every page freed
+  after it began; bbolt's `releaseRange` holds back only the pages that reader can see. Freed pages are reused, not
+  returned to the filesystem: `mdb_env_copy2` with `MDB_CP_COMPACT` writes a copy without them.
+- **Snapshot space that does not add up.** Summing ZFS snapshots' `used` undercounts, and destroying one can raise its
+  neighbors' `used`. Read `usedbysnapshots` and `written@snapshot` instead.
+- **Clones and branches pin their origin.** A ZFS snapshot with clones cannot be destroyed until they are destroyed or
+  promoted, and a long-lived Neon child branch keeps accumulating billed changes, up to its logical size.
+- **Retention is a bill.** An Iceberg table whose snapshots are never expired keeps every data file ever committed, even
+  after the rows are deleted from head.
+
+:::note[What to take forward]
+Persistence means never modifying a node a published version can reach. Path copying copies the leaf-to-root path:
+O(depth) writes, O(1) version switches, and atomic commit by publishing one root. Fat nodes and node copying store
+versions inside nodes, cutting writes to O(1) but moving cost to reads and needing torn-write repair on disk — MVCC version
+chains are this design. Every shipping system follows one cost model: bytes written follow the path, an old root pins what only it
+reaches (or everything since, under a watermark), and a branch owns only where it diverged.
+:::

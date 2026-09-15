@@ -1,0 +1,203 @@
+---
+title: Bε-trees, fractal trees and copy-on-write B-trees
+description: Bε-trees that buffer messages in internal nodes and flush them in batches (TokuDB/PerconaFT, BetrFS), and copy-on-write B-trees that copy the path, flip a meta page to commit and let readers pin old pages (LMDB, bbolt, Btrfs, ZFS, CouchDB).
+depth: deep
+sidebar:
+  order: 5
+---
+
+import BepsilonCowTreeLab from '../../../../components/viz/BepsilonCowTreeLab';
+
+A B+tree pays for every change at the leaf. A random insert into an index larger than memory reads a leaf, changes a
+few bytes and writes the whole page back, and it needs a write-ahead log plus a torn-page defense to survive a crash
+halfway through. Two descendants change that contract. A **Bε-tree** defers the leaf write: changes become messages that
+wait in internal nodes and travel down in batches. A **copy-on-write B-tree** never overwrites a live page: a commit writes
+new copies and then flips one small pointer, which gives atomic commit and free reader snapshots with no log at all.
+
+<BepsilonCowTreeLab client:visible />
+
+## Bε-trees: messages instead of leaf writes
+
+A Bε-tree has the same leaves as a B+tree, but an internal node of size B spends only about B<sup>ε</sup> of its space on
+pivots and child pointers. The rest is a **message buffer**, stored in the node and written to disk with it. With ε = 1
+there is no buffer and the structure is a B+tree. The
+[external-memory page](../../../p02-storage-engines/b-trees-and-variants/08-why-fanout-b-the-external-memory-model-optimality-bounds-and/)
+covers the Brodal–Fagerberg bounds; this page is about the machinery.
+
+Every update becomes a message addressed to a key: an insert, a delete (a **tombstone**), or an **upsert** that says how
+to change the old value. PerconaFT, the engine inside TokuDB, gives each message a sequence number (the MSN), logs it,
+and puts it in the root's buffer. Its code also **promotes** a message up to two levels lower past empty buffers, and to a
+leaf at the tree's edges, where sequential inserts land; the lab keeps the textbook root-only rule.
+
+When a buffer overflows, the node **flushes**: it picks the child with the most pending messages and moves that child's
+whole batch down. PerconaFT's `find_heaviest_child` weighs each child by the bytes in its buffer plus work already done.
+If the child is internal and its buffer now overflows, it flushes too — a **cascade**. A leaf applies the batch it
+receives. Leaves and internal nodes still split as in a B+tree, and a splitting internal node divides its buffer
+between the halves.
+
+The lab opens mid-cascade. Each node has 64 slots and an internal node spends 8 on pivots (fanout 8, ε = 0.5).
+Operation #446 overflowed the root: the root flushed 13 messages to child 7, which overflowed and sent 11 to
+leaf 56 and 10 to leaf 59. That one operation cost four node writes. The 445 before it cost 62 between them, and most cost
+nothing. Press **Run to next flush** a few times: each flush moves a dozen or so messages and writes three nodes.
+
+### Why batching wins
+
+A message is rewritten once per level on its way down, yet the tree still writes less, because each write carries many
+messages. The lab counts disk writes in a simple model: a B+tree insert into a tree much larger than memory
+writes its leaf, and a Bε-tree flush writes each node it changed once. Neither tree splits, and neither gets credit for
+checkpoints that merge repeated writes of a node.
+
+Drag **Operations applied** to 10,000. With node size 64 and fanout 8, the Bε-tree has written 2,176 nodes against the
+B+tree's 10,000 leaves, 4.6 times fewer. Switch **Node size B** to 256 and keep fanout 8: writes drop to 494, about 20 times
+fewer, because a root flush now carries about 55 messages instead of 13 (the table's **Messages per flush** column). Batch size grows like B<sup>1−ε</sup>, and so
+does the saving. Bender and colleagues' ;login: introduction to Bε-trees gives the textbook case: with B = 1,024 and
+ε = ½, inserts run 16 times faster than in a B-tree.
+
+The chart under the tree shows a trap. Early on the gap is wider, because most messages are still in buffers and have not
+paid for their trip down. With B = 256 and fanout 8, none of the first 1,000 has reached a leaf and the ratio is 33×; it
+settles near 20× by 10,000. Buffered messages are write debt, like an LSM's pending compaction.
+
+Real nodes are far larger. PerconaFT's defaults (`FT_DEFAULT_NODE_SIZE`, `FT_DEFAULT_BASEMENT_NODE_SIZE`,
+`FT_DEFAULT_FANOUT`) are a 4 MB node, 128 KB basement nodes and fanout 16; the ;login: article puts TokuDB's and
+BetrFS's branching factor at 4 to 16, so a flush moves at least 256 KB. Flushes of an over-full root run on background
+flusher threads, and a cleaner thread wakes every second by default (`tokudb_cleaner_period`), picking internal nodes under
+cache pressure to flush (`tokudb_cleaner_iterations`, default 5, per run).
+
+## Reads pay: every buffer on the path
+
+A lookup cannot trust the leaf. Pending messages for its key can sit in any buffer between the root and the leaf, so the
+lookup reads every node on that path and applies what it finds in MSN order.
+
+The line under the tree shows one. Press **Reset** to return to operation 446: the busiest key,
+4236, is absent from its leaf, but a level-1 node buffers two inserts for it (#71 and #351) and the root a third (#427). The answer is the newest: 427. Choose the **Mixed**
+workload and **Newest pending tombstone**: key 1985 has value 0 in its leaf, but a tombstone in the root makes the answer
+NOT FOUND. The leaf is corrected only when the tombstone arrives.
+
+The structural cost is height. Fanout B<sup>ε</sup> instead of B makes the tree about 1/ε times taller at the same node size.
+The **Lookup reads** tile shows 3 nodes with fanout 8, against 2 for a B+tree whose 64-slot nodes are all pivots. Set fanout to 2 and
+every lookup reads 7 nodes. It buys cheaper writes: over 10,000 random inserts at node size 64, fanout 2 writes 7.7 times less than the
+B+tree, against 4.6 times at fanout 8. Engines buy the height back with large nodes and a cache holding the upper levels.
+
+PerconaFT keeps lookups cheaper in two ways. A leaf is divided into **basement nodes**, and a point query reads only the one it
+needs. When a basement node comes into memory, PerconaFT applies the relevant ancestor messages to that in-memory copy
+(`apply_ancestors_messages_to_bn`) and records the highest MSN applied, so nothing is applied twice. The messages stay in the
+ancestors' buffers until a real flush moves them.
+
+### Upserts: never read before you write
+
+Inserts are far cheaper than lookups here, so the classic read-modify-write — read a counter, add one, write it back — runs at
+lookup speed. An **upsert** message (key, f, Δ) skips the read: it means "replace v with f(v, Δ)" and is applied when it reaches
+the leaf, or on the fly by any lookup that meets it. Press **Reset** and choose **Upserts to 16 hot counters**: counter 1755 is 0 in
+its leaf while 34 upserts wait for it, 5 in the root and 29 in a level-1 node. No page stores its value, 34; a read computes it.
+
+The ;login: authors note why this suits a Bε-tree better than an LSM. Pending upserts can leave messages for one key in every
+LSM level, so a point read must visit them all and
+[Bloom filters](../../../p02-storage-engines/lsm-trees/06-read-path-bloom-filters-and-the-block-cache/) stop helping. In a Bε-tree
+they lie on the one path the lookup reads anyway.
+
+### Where Bε-trees shipped
+
+Tokutek sold its Bε-tree as the **fractal tree index** in TokuDB for MySQL and TokuMX for MongoDB. Percona acquired Tokutek and
+carried the engine on as the PerconaFT library, but starting with Percona Server for MySQL 8.0.28-19 (May 2022), TokuDB is no
+longer supported. The BetrFS research file system is built on the same tree.
+
+PerconaFT's durability is itself partly copy-on-write. Messages go to a recovery log, and a checkpoint runs every 60 seconds by
+default (`tokudb_checkpointing_period`). Every node write gets a fresh disk offset from a **block translation table**
+(`realloc_on_disk`). A checkpoint writes the table to a new place and syncs, then writes a header holding its address to one of
+two slots, chosen by the parity of `checkpoint_count`. Reopen uses the valid header with the higher count.
+
+## Copy-on-write B-trees: commit by flipping a meta page
+
+A copy-on-write (COW) B-tree changes a leaf by writing a copy on a free page. The parent must point at the copy, so the parent is
+copied too, and so on up to a new root. The old path stays intact and still describes the previous version. Nothing references the new
+root until the engine writes a **meta page** pointing at it, and that write is the commit. The
+[shadow paging page](../../../p04-transactions-concurrency-control-and-recovery/crash-recovery-passes-and-durability/01-shadow-paging-and-copy-on-write-recovery-sqlite-journals-and/)
+treats this as a recovery method and the [next page](../06-persistence-by-path-copying-fat-nodes-versions-and-why-snaps/) as
+persistence.
+
+Switch the lab to **Copy-on-write tree**. It follows LMDB:
+
+- **Two meta pages.** Pages 0 and 1 each hold a transaction id (`mm_txnid`), the roots of the main tree and of the free-page tree,
+  and the last used page number. Transaction t writes meta page `t & 1`, so commits alternate. On open, `mdb_env_read_header` reads
+  both and keeps the larger id.
+- **Copy once per transaction.** `mdb_page_touch` gives a page a new number the first time a transaction modifies it, lists the old
+  number as freed and updates the parent's pointer. Later changes in the same transaction edit the copy.
+- **A fixed order.** The commit saves the free list, writes the dirty pages, syncs the file, and only then writes the meta page: the
+  tail of the meta structure (120 bytes on 64-bit builds) through a descriptor opened with `O_DSYNC`, so the write is also a sync.
+
+Press **Step through a commit**, then **Next step** twice. Txn 9's copies of the root, a branch and a leaf are on disk and synced, but
+the meta pages still describe txns 8 and 7. Press **Crash now**: the file reopens at txn 8 from meta page 0. The three new pages lie past
+the last page txn 8 recorded, so nothing refers to them. There is nothing to replay or undo; LMDB has no write-ahead log.
+
+**bbolt** (etcd's storage engine, forked from BoltDB, a Go port of LMDB) adds a check. Its meta page carries an FNV-64a
+checksum, and `db.meta()` uses the page with the higher `txid` only if it validates, falling back to the other. Switch **Engine** to
+bbolt, step to step 4 and crash: the half-written meta page fails its checksum and the file opens at txn 8. LMDB 0.9 stores no checksum in
+its meta pages.
+
+Every commit pays. Changing one key wrote four pages here, one per level plus the meta page, and real LMDB and bbolt also
+rewrite their free-page structures. A B+tree with a write-ahead log appends a small record and writes the leaf later. Set **Keys changed per
+commit** to 3: the three paths share one new root, so a commit copies 5 to 7 pages, not 9.
+
+## One writer, free readers, and the oldest reader
+
+A committed page is never modified, so readers need no latches. An LMDB read transaction records the current txn id in a slot of the
+shared reader table (126 slots by default) and reads from that version's root for as long as it lives. Writers never block it. Writers are
+serialized, though: LMDB holds a write mutex and bbolt a `sync.Mutex` for the whole write transaction.
+
+A page replaced by txn t may still belong to an older snapshot, so both engines tag it with t and reuse it only
+when no reader can reach it:
+
+- **LMDB** keeps freed page lists in a B-tree keyed by txn id. `mdb_page_alloc` only uses a record older than both the oldest reader and
+  the last committed transaction. Pages freed by the latest commit are therefore never reused by the next one: they belong to the previous
+  version, which the other meta page still points at, and which a crash under `MDB_NOMETASYNC` may fall back to.
+- **bbolt** keeps pending pages per txn. When a write transaction begins, `ReleasePendingPages` frees pages that transactions older than the
+  oldest open reader released, and pages allocated and freed with no open reader starting in between, which no reader can see.
+
+Press **Reset** for LMDB at txn 8, one key per commit, and a reader that started at txn 3 and is still open.
+Its snapshot, on the right, shares 6 pages with the newest tree and holds 7 old pages that cannot be freed. LMDB also holds 11 freed pages that no reader uses, because they were freed at or after txn 3; the
+file has 33 pages. Switch to bbolt: the reader still pins 7 pages, but the file has 27 and 2 are free. Press **Commit** up to txn 25 and switch
+between the engines: LMDB's file has grown by three pages per commit to 84, while bbolt's stopped at 33. Set the reader to 0 to replay the same 25 commits with no reader:
+LMDB needs 21 pages, bbolt 18. A real file never shrinks back.
+
+This is [epoch-based reclamation](../04-memory-reclamation-for-latch-free-structures-epochs-hazard-p/) on disk: one slow reader holds back
+everything retired after it started.
+
+## Copy-on-write beyond embedded stores
+
+| System | What a commit writes last | How open finds the newest version |
+|---|---|---|
+| LMDB | Meta page `txnid & 1` | Larger `mm_txnid` of pages 0 and 1 |
+| bbolt | Meta page `txid % 2` | Higher `txid` whose checksum validates |
+| Btrfs | Superblock at 64 KiB, mirrors at 64 MiB and 256 GiB | Primary superblock: checksum, generation, root tree address |
+| ZFS | Uberblock in the labels of up to three top-level vdevs, or all after a config change | Highest transaction group (txg) among valid uberblocks |
+| CouchDB | Header at the next 4 KB boundary of an append-only file | Scan back from the end for a header whose checksum matches |
+
+**Btrfs** keeps all its metadata in copy-on-write trees and commits a transaction every 30 seconds by default (`commit=`). **ZFS** syncs a
+transaction group at least every 5 seconds (`zfs_txg_timeout`), flushes the write cache of every disk it wrote before writing an uberblock that
+references the new blocks, and rotates uberblocks through slots. Both still log synchronous writes — the Btrfs tree-log and the ZFS intent log
+(ZIL) — so `fsync` need not wait for the next commit.
+
+**CouchDB** appends new nodes of its by-id and by-sequence B+trees to the end of the file, then a header, with an fsync before and after the header
+when the commit is synced. Nothing is reused in place, so the file grows until compaction copies live data into a `.compact` file (roughly twice the
+disk space) and swaps it in. Automatic compaction has been on by default since CouchDB 2.1.1.
+
+## Where it bites in production
+
+- **A long read transaction grows the file.** LMDB's documentation warns that read transactions prevent reuse of pages freed by newer writes,
+  "thus the database can grow quickly", and bbolt's README gives the same warning. A process that dies mid-read leaves a stale reader slot
+  pinning pages until `mdb_reader_check` or the `mdb_stat` tool clears it.
+- **Freed space stays in the file.** bbolt cannot truncate its file, so etcd must run `etcdctl defrag` after compacting history to return space,
+  and a member cannot serve reads or writes while it defragments.
+- **One writer at a time.** A slow write transaction stalls all other writers; bbolt's `DB.Batch` combines concurrent updates into fewer commits.
+- **Random writes copy whole paths.** Each commit writes a page per level plus the meta page, and bbolt's README warns that random writes
+  can be slow.
+- **Bε-trees only win on blind writes.** Read-before-update runs at lookup speed on a taller tree with buffers to merge; use upserts.
+- **Buffered messages are debt.** A short insert benchmark flatters a Bε-tree: most messages have not reached the leaves. The flushes arrive later,
+  alongside checkpoints, and PerconaFT's own comments note that locking nodes during a checkpoint causes performance variability.
+
+:::note[What to take forward]
+A Bε-tree turns each update into a message in the root's buffer and flushes batches toward the busiest child, so one node write carries many updates;
+the price is a taller tree and lookups that merge pending messages, and upserts make read-modify-write blind. A copy-on-write B-tree writes a new
+leaf-to-root path and commits by writing one meta page, so recovery is choosing the newest valid meta page and readers are free. It pays with one
+writer, a whole path rewritten per commit, and old space that stays pinned until the oldest open reader finishes.
+:::

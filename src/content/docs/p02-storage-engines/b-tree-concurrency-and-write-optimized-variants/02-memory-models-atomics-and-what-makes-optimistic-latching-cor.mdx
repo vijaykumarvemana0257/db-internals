@@ -1,0 +1,240 @@
+---
+title: Memory models, atomics and what makes optimistic latching correct
+description: Why a seqlock-style optimistic read is only correct on top of explicit ordering guarantees — x86-TSO's store buffer versus the weaker Power and ARM models, the fences in Linux's seqcount and C++'s release/acquire orderings, how LeanStore, Umbra and Silo validate reads, ABA and tagged pointers, false sharing, and Herlihy's consensus hierarchy that makes compare-and-swap the primitive.
+depth: deep
+sidebar:
+  order: 2
+---
+
+import SeqlockFenceLab from '../../../../components/viz/SeqlockFenceLab';
+import AbaTaggedPointerLab from '../../../../components/viz/AbaTaggedPointerLab';
+import FalseSharingCacheLineLab from '../../../../components/viz/FalseSharingCacheLineLab';
+
+The optimistic lock coupling on the [previous page](../01-b-tree-concurrency-latch-crabbing-and-lehman-yao/) reads a
+node without taking its latch: load the node's version, read the node, load the version again, restart if it moved. The
+safety argument is usually drawn as one timeline, which hardware does not provide. A store on one core
+becomes visible on another core later, not necessarily in the order the stores ran, and the compiler may rearrange or
+merge loads that look redundant to a single thread.
+
+What makes the pattern correct is a handful of ordering guarantees — **fences** — placed exactly where the proof needs
+them. This page is about that contract, then about the two ways compare-and-swap code fails even when ordering is right,
+and finally about why compare-and-swap is the primitive every latch-free design leans on.
+
+<SeqlockFenceLab client:visible />
+
+## Shared memory is not one timeline
+
+Most concurrency proofs assume Lamport's **sequential consistency**: every load and store from every thread happens in one
+global order, and a load returns the latest store. Multicore CPUs do not provide it.
+
+**x86-TSO.** Owens, Sarkar and Sewell's model of Intel and AMD processors gives each core a FIFO buffer of pending stores.
+A store enters the buffer; that core's own later loads see it; other cores see it only when the buffer drains it to
+memory, oldest first. So if core 0 runs `x = 1; r0 = y` while core 1 runs `y = 1; r1 = x`, both loads can return 0 on real
+x86 hardware — an outcome no sequential order allows. The model's fence is `MFENCE`, which cannot execute until the buffer is
+empty; every `LOCK`-prefixed instruction has the same precondition. What TSO never does is reorder one core's stores
+against each other, or its loads. The only reordering is a store against a later load.
+
+**Power and ARM.** *Herding cats* (Alglave, Maranget and Tautschnig, 2014) formalises what those architecture specifications
+permit, which is far less. Program order is preserved only where a dependency forces it, such as a load whose address came
+from the previous load. Two stores to different locations may reach another core in either order, and one core's loads may be
+satisfied out of program order. Power restores order with a lightweight fence, `lwsync`, which orders stores against stores
+and loads against loads but not a store against a later load, and a full fence, `sync`. The paper's ARM model has only full
+fences, `dmb` and `dsb`. Some Alpha implementations, whose split cache gave a core more than one path to memory, could reorder
+even across a fence.
+
+These are architecture models: the envelope a vendor reserves the right to use, not a measurement of one chip. Linux encodes
+them:
+
+| Machine | May reorder | `smp_mb()` (full) | `smp_wmb()` | `smp_rmb()` |
+|---|---|---|---|---|
+| x86-64 | a store against a later load | `lock addl $0,-4(%rsp)` | `barrier()`: no instruction | `barrier()`: no instruction |
+| 64-bit Power | stores, loads, store then load | `sync` | `lwsync` | `lwsync` |
+| arm64 | stores, loads, store then load | `dmb(ish)` | `dmb(ishst)` | `dmb(ishld)` |
+
+In the lab, the store lines in the TSO panel never cross. In the weak panel they can, and that crossing is the whole problem.
+
+## The three fences in a seqlock
+
+Linux's seqcount (`include/linux/seqlock.h`) is the pattern stripped to its core. Writers are serialized separately; the
+counter is odd exactly while a writer is inside its section, and each section adds two:
+
+```c
+/* writer: do_raw_write_seqcount_begin ... do_raw_write_seqcount_end */
+s->sequence++;                 /* odd: a write is in progress */
+smp_wmb();                     /* fence A */
+/* ... update the protected data ... */
+smp_wmb();                     /* fence B */
+s->sequence++;                 /* even again */
+
+/* reader: __read_seqcount_begin ... do_read_seqcount_retry */
+while ((seq = smp_load_acquire(&s->sequence)) & 1)
+        cpu_relax();
+/* ... copy the protected data ... */
+smp_rmb();                     /* fence R */
+retry = READ_ONCE(s->sequence) != seq;
+```
+
+A reader keeps its copy only if it started on an even value and finds the same value at the end. On a sequentially consistent
+machine that proves no write section overlapped the copy. Each fence pins down one ordering the proof silently assumed:
+
+- **Fence A** makes the odd value visible before any data store. Without it a reader can load the old even value, copy a
+  half-written record, and reload the same even value. Choose *The payload store outruns seq = 1* and untick fence A: the weak
+  reader accepts `a=2, b=1`.
+- **Fence B** makes every data store visible before the new even value. Choose *seq = 2 outruns the payload store* and untick
+  it: the weak reader starts on `seq = 2` while `b` is still old.
+- **Fence R** makes the re-check load happen after the copy's loads. Choose *The re-check load is satisfied early* and untick
+  it: the check answers "unchanged" for a moment before the copy.
+
+The begin load needs an ordering too, and `smp_load_acquire()` supplies it: on 64-bit Power it is `READ_ONCE()` followed
+by `lwsync`. The lab keeps that load first on both machines.
+
+In all three cases the TSO panel, replaying identical timing, gets a consistent copy or a retry: its FIFO buffer delivers
+one core's stores in order, and its loads run in order. That is why all three fences compile to nothing on
+x86. The counters under the lab run 2,000 random schedules: with every fence in place neither machine accepts a torn record;
+untick any CPU fence and the weak machine's torn count climbs while TSO's stays at zero. Drag *Max propagation delay* to zero
+and the write fences stop mattering in the random runs — the hazard is timing skew between stores.
+
+The fourth checkbox is not a CPU fence. The reader never writes `sequence`, so a compiler that sees two plain loads of it with
+only local copies between them may merge the second into the first. Linux's `memory-barriers.txt` lists merging and reloading
+loads among the optimizations that are safe for one thread and fatal here; `READ_ONCE()` forbids them.
+On the re-check schedule, with fence R back, untick *Re-check is READ_ONCE*: **both** machines accept the torn record, and
+TSO's torn counter climbs too. No memory model rescues a check that was deleted.
+
+## The same contract in C++
+
+`std::memory_order` carries these fences in the atomics API itself. `memory_order_relaxed` promises atomicity and nothing else —
+enough for a statistics counter. A `memory_order_release` store and a `memory_order_acquire` load synchronize: once the
+acquiring load returns the value that was stored, everything the releasing thread wrote before that store is visible to the
+acquirer — the guarantee fence B hand-builds for the final increment. `mutex::unlock()` and `lock()` are the canonical release
+and acquire, and Linux's own seqcount begins with `smp_load_acquire()`.
+`memory_order_seq_cst`, the default, adds a single total order over all such operations, which is what the store-buffering
+pattern needs. On x86, SPARC TSO and IBM mainframes, release–acquire adds no instructions for most operations — only
+constraints on the optimizer — while ARM, Itanium and PowerPC need load or fence instructions.
+
+In generated code, Apple Clang 21 compiles `a.store(v, std::memory_order_release)` for x86-64 to a
+plain `mov`, and the default `a.store(v)` to `xchg`. With a memory operand, `xchg` runs under the processor's locking protocol
+even without a `lock` prefix — in x86-TSO terms it waits for the store buffer to drain. Linux's `smp_store_mb()` on x86 is the
+same `xchg`.
+
+:::caution[The copy is still a data race]
+In C++, a non-atomic read that runs concurrently with a write, with no happens-before relation between them, is a data race
+and undefined behavior. Optimistic readers survive by treating everything they copied as untrusted until validation passes:
+no following a pointer, trusting a length or looping on a count taken from the copy before the check succeeds.
+:::
+
+## How engines validate
+
+**Optimistic lock coupling.** In ARTSynchronized, a concurrent adaptive radix tree whose `OptimisticLockCoupling` variant
+implements Leis et al.'s scheme, each node's
+`typeVersionLockObsolete` word uses bit 0 for *obsolete* and bit 1 for *locked*. `readLockOrRestart` loads it and restarts if
+either bit is set; `readUnlockOrRestart` restarts if the word changed. A writer upgrades with
+`compare_exchange_strong(version, version + 0b10)` and unlocks with `fetch_add(0b10)`, which clears the lock bit and advances
+the version in one store. Setting the lock bit is the odd increment; unlocking is the even one.
+
+**LeanStore.** `HybridLatch` is a 64-byte, cache-line-aligned struct holding an `atomic<u64>` version and a
+`std::shared_mutex`. The low bit is the exclusive flag: an exclusive acquire takes the mutex and stores `version + 1` with
+`memory_order_release`, and release stores `version + 1` again. An optimistic guard remembers the version, and `recheck()`
+jumps back to the restart point if the latch's version differs. A guard that finds the latch exclusively held can wait on the
+mutex in shared mode instead (`toOptimisticOrShared`), which damps the restart storms of write-hot nodes described on the
+[previous page](../01-b-tree-concurrency-latch-crabbing-and-lehman-yao/).
+
+**Umbra** adopts LeanStore's scheme: one 64-bit word per buffer frame, 5 state bits (0 unlocked, 1 exclusive, *n* + 1 for *n*
+shared holders) and a 59-bit version. An optimistic reader writes nothing. Umbra even lets a page be evicted mid-read: the
+frame's virtual memory stays reserved, and a region released with `MADV_DONTNEED` reads as zero bytes, so an optimistic reader
+copies zeros instead of faulting.
+
+**Silo** applies the pattern to records. The low three bits of a record's TID word are a lock bit, a latest-version bit and an
+absent bit. A reader loads the TID word (spinning while locked), checks the latest-version bit, copies the data, performs a
+memory fence and loads the TID word again. A committing writer updates the data, fences, then stores the new TID and clears the
+lock in one step. The paper notes that on TSO machines these are compiler fences — in the code, `COMPILER_MEMORY_FENCE` is an
+empty inline-assembly statement — that exist so the compiler cannot move the loads.
+
+Validation tells you the copy was consistent. Whether the memory could be freed while you read it is the
+[reclamation problem](../04-memory-reclamation-for-latch-free-structures-epochs-hazard-p/).
+
+## ABA: equal is not unchanged
+
+<AbaTaggedPointerLab client:visible />
+
+A compare-and-swap compares bits. It cannot distinguish "`top` is still A" from "`top` is A again". Michael and Scott's 1996
+queue paper describes the failure: a thread reads A, computes a new value, and its CAS succeeds when it should not because
+other threads changed A to B and back to A in between.
+
+Step through the lab with **Plain pointer**. T1 loads `top = A` and `A.next = B`, then stalls. T2 pops A, pops B, and pushes 40
+into a node the allocator hands back at A's address. T1's CAS finds A and installs B, a node on the free list; the stack's next
+pop returns 20, which T2 already popped. Switch to **Tagged pointer**: every successful CAS increments a counter stored with the
+pointer, T1 expects `<A, 0>` and finds `<A, 3>`, and its retry pops 40 correctly. Untick *Allocator reuses A's address* and even
+the plain CAS fails: ABA needs A's address back on top, here through the allocator.
+
+Michael and Scott call this counter the most common fix. It needs a double-width CAS, or array indices that share a word with
+the counter, and they note it makes ABA extremely unlikely rather than impossible. The other fix is to stop addresses from being reused
+while any thread might still hold them: epochs and hazard pointers, on the [reclamation page](../04-memory-reclamation-for-latch-free-structures-epochs-hazard-p/).
+Seqlock and OLC versions only ever increase, which is why they are not fooled this way.
+
+## A lock-free counter still moves a cache line
+
+<FalseSharingCacheLineLab client:visible />
+
+A core can write a cache line only while it owns the line; if another core wrote it last, the line is pulled over first.
+Ownership is tracked per line, not per variable, so two counters that happen to share 64 bytes behave like one shared counter.
+
+Start with four cores and **Padded**: throughput is 4× one core. Choose **Packed**: the code is unchanged, but nearly every
+increment now pulls the line from another core and, in this model, throughput drops to 0.27× — worse than one core. **One shared
+counter**, a `fetch_add` with no lock anywhere, draws the same curve: removing the lock did not remove the serialization,
+because the line itself is serializing the cores. Raise *Private work per increment* and the damage shrinks as the line cools.
+The costs are model units, not measurements; the [hot-page contention page](../../../p02-storage-engines/buffer-pool-memory-mmap-and-contention/04-latching-the-buffer-pool-and-hot-page-contention/)
+shows the same effect on buffer descriptors.
+
+Engines design around it:
+
+- **RocksDB** defines `CACHE_LINE_SIZE` as 64 bytes, 128 on aarch64 and POWER and 256 on s390, and keeps statistics in a
+  `CoreLocalArray` of `StatisticsData` aligned to it, so that tickers belonging to different cores never share a line.
+- **InnoDB**'s `ib_counter_t` spaces 64 slots `INNODB_CACHE_LINE_SIZE` apart (64 bytes, 128 on POWER) and picks a slot from the
+  CPU cycle counter; its `Counter::Shards` pads each `std::atomic<uint64_t>` shard to a full line and updates it with
+  `memory_order_relaxed`.
+- **LeanStore**'s `HybridLatch` is declared `alignas(64)` and statically asserted to be exactly 64 bytes.
+
+## Why the primitive is compare-and-swap
+
+Herlihy's *Wait-Free Synchronization* (1991) ranks shared objects by **consensus number**: the largest number of threads that
+can use the object to agree on one value, wait-free. No object can be built wait-free, for that many threads, from objects with
+a lower number.
+
+| Consensus number | Objects |
+|---|---|
+| 1 | atomic read/write registers |
+| 2 | test&set, swap, fetch&add, queue, stack |
+| ∞ | compare&swap, memory-to-memory move and swap, augmented queue, fetch&cons, sticky byte |
+
+Plain loads and stores, however carefully fenced, sit at 1: they cannot solve consensus even for two threads. `test&set` and
+`fetch&add` reach 2 and stop — Herlihy shows no combination of them yields a wait-free compare-and-swap for three or more threads.
+Compare-and-swap solves consensus for any number in one line: each thread tries to replace ⊥ with its own proposal, and whatever
+the register holds afterwards is the decision. The paper also shows an object is universal for *n* threads exactly when its
+consensus number is at least *n*.
+
+So a `fetch_add` counter needs nothing more, and anything that must agree on a pointer without a lock needs nothing less. OLC upgrades its latch
+with a CAS, the lock-free stack above pops with one, and the [Bw-tree](../03-bw-tree-delta-chains-and-the-mapping-table/) installs
+its page updates with a CAS on a mapping-table slot.
+
+## Where it bites in production
+
+- **Correct on x86, a bet elsewhere.** A seqlock or OLC implementation built from relaxed stores, or with fences removed because
+  x86 compiles them away, is relying on TSO. Use the platform's barriers, or release and acquire orderings, and the code carries
+  its ordering requirements to Power and ARM.
+- **A validation the optimizer deleted.** A version held in a plain integer and reloaded with no intervening write can be folded
+  away, and every read then validates. Keep versions `std::atomic` or behind `READ_ONCE`, and do nothing with the copy until the
+  check passes.
+- **ABA after an allocator change.** A CAS structure that was correct while nodes were never recycled breaks when a free list or
+  a faster allocator starts reusing addresses. The symptoms — duplicated or lost elements, crashes far from the cause — rarely
+  point at the CAS.
+- **Flat scaling with no lock waits.** Counters, reader counts or version words sharing a line with other hot writes. `perf c2c`
+  samples loads and stores and ranks cache lines by HITM accesses; the fix is padding or per-core sharding, not a better lock.
+
+:::note[What to take forward]
+An optimistic read is correct only if the odd version becomes visible before the data, the data before the even version, and the
+re-check after the copy. x86-TSO's FIFO store buffer supplies those orderings for free, the Power and ARM architecture models do
+not, and the compiler can remove the re-check on any machine — which is what `smp_wmb`/`smp_rmb`, `READ_ONCE`, and C++'s
+release/acquire orderings exist to prevent. A CAS can be fooled by a recycled address, and a lock-free write still serializes on
+its cache line. And compare-and-swap is the primitive because, unlike loads, stores and `fetch_add`, it can solve consensus for any
+number of threads.
+:::

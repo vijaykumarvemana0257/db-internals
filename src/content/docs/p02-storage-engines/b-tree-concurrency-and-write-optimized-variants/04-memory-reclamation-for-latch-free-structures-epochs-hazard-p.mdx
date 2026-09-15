@@ -1,0 +1,213 @@
+---
+title: 'Memory reclamation for latch-free structures: epochs, hazard pointers, RCU'
+description: Why a latch-free index cannot free a node the moment it unlinks it, and how epochs, hazard pointers and RCU grace periods decide when it can — with crossbeam-epoch, folly, liburcu, the Bw-tree, Silo, RocksDB's SuperVersion and PostgreSQL's page recycling, and the stalled thread that makes memory climb.
+depth: deep
+sidebar:
+  order: 4
+---
+
+import ReclamationSchemesRaceLab from '../../../../components/viz/ReclamationSchemesRaceLab';
+
+A latch-free reader holds no latch, no pin and no reference count, so a writer cannot see who is reading. When the
+writer unlinks a node, a reader that loaded the pointer a moment earlier is still about to dereference it. Free the
+node now and that reader touches freed memory; never free it and the index leaks. Every optimistic design in this
+module — [optimistic lock coupling](../01-b-tree-concurrency-latch-crabbing-and-lehman-yao/), the
+[Bw-tree](../03-bw-tree-delta-chains-and-the-mapping-table/) — needs a rule for when unreachable memory may actually be
+freed. That rule is safe memory reclamation.
+
+<ReclamationSchemesRaceLab client:visible />
+
+## Unlinking is not freeing
+
+The Linux RCU documentation splits an update in two. **Removal** takes the node out of the structure so no *new*
+reader can reach it — one atomic pointer store, safe alongside readers. **Reclamation** frees the memory, and must wait
+until no *old* reader can still hold it. Every scheme here is a different way of deciding when that wait is over.
+
+To see what happens without one, pick **Free at once (unsafe)**, choose **No stalls** and make the writer unlink a
+node every tick. By t = 300 the readers have made 65 unsafe reads of two kinds:
+
+- **Use-after-free** (41). A reader follows the next pointer of a node freed after it arrived. Freed memory usually still
+  holds the old bytes, so the read "works" until the allocator hands them to someone else.
+- **Reuse (ABA)** (24). The address already belongs to a new node elsewhere. The reader follows that node's next pointer
+  and silently skips or revisits keys. Only R3, at three ticks per node, lingers long enough to see this.
+
+The [memory-models page](../02-memory-models-atomics-and-what-makes-optimistic-latching-cor/) closed ABA on one
+compare-and-swap with tagged pointers. Reclamation closes it at the source: if an address cannot be reused while any
+thread might hold it, a stale pointer never meets a different node.
+
+A reference count in every node would work, but a reader would then write a shared counter at every node it visits,
+and that cache line would ping-pong between cores like the
+[lock-free counter's](../02-memory-models-atomics-and-what-makes-optimistic-latching-cor/) — Silo's authors reject it
+for exactly this reason. The schemes that replace it differ in what readers announce: **epochs and RCU** announce *when* a thread is reading; **hazard pointers**
+announce *which* nodes it holds.
+
+## Epoch-based reclamation
+
+Keir Fraser's epoch-based reclamation (EBR) keeps a global epoch counter and a limbo list of retired nodes per epoch:
+
+1. An operation **pins**: the thread copies the global epoch into its own slot and marks itself active. It unpins at the end.
+2. A writer that unlinks a node **retires** it into the current epoch's limbo list.
+3. Any thread may try to **advance** the global epoch, and succeeds only if every *pinned* thread is pinned in the current epoch.
+4. A node retired in epoch *e* is **freed** once the global epoch reaches *e* + 2.
+
+A pinned thread therefore sees at most one advance. By the time the epoch is *e* + 2, every thread still pinned
+entered epoch *e* + 1 or later — after the node was unlinked — so none of them can hold it.
+
+crossbeam-epoch, the Rust implementation, shows the engineering. `epoch::pin()` returns a `Guard`;
+`guard.defer_destroy(ptr)` puts the node in a thread-local bag of up to 64 deferred frees; a full bag is sealed with
+the global epoch and pushed onto a global queue. Every 128 pins the thread tries to advance the epoch and frees up
+to 8 expired bags. The expiry test is `global_epoch.wrapping_sub(self.epoch) >= 2`, beside the comment "A pinned
+participant can witness at most one epoch advancement."
+
+The read-side cost is constant: a store on pin and one on unpin, however many nodes the operation visits. The lab counts
+these as **reader bookkeeping writes** — 2.0 per operation under epochs.
+
+### Memory follows the slowest reader
+
+The lab opens on the failure case (**Epochs**, **R3 stalls mid-scan**, a write every 3 ticks). R3, a slow range scan, stalls mid-scan while pinned in epoch 2. The global epoch
+reaches 3 and stops, because R3 is not in 3, so nothing retired in epoch 2 or later can be freed. At t = 100, 33
+unlinked nodes wait; at t = 200, 66; at t = 299, 99 — one more every three ticks. The scheme cannot tell which of them
+R3 could actually reach, so it keeps them all. R3 resumes at t = 300, finishes its scan at t = 349, and at t = 350
+the count drops from 115 to 0. You can stall any reader yourself with the checkboxes under the list.
+
+No stall is needed for this to matter. Choose **No stalls** and move **R3 scan speed**: the peak number waiting by
+t = 600 is 6 at one tick per node, 16 at three and 41 at eight. Every retired node waits for the longest operation in
+flight when it was retired. Set the speed back to three and choose **R3 stalls between operations**, and the peak is only 12 at t = 299: an
+unpinned thread holds nothing back, which is why crossbeam offers `Guard::repin_after` for long calls such as a sleep.
+
+### Epochs inside engines
+
+**The Bw-tree** puts a consolidated page's old base page and delta chain on a pending list, and does the same with
+the page IDs of merged-away nodes, so neither memory nor a mapping-table slot is reused early. Its rule: a thread
+enrolled in epoch *E* cannot have seen objects deallocated in *E* − 1, so once every thread enrolled in *E* has exited,
+*E*'s objects can be recycled. Hekaton's range indexes are Bw-trees. The original Bw-tree kept a central list of epoch objects
+whose shared per-epoch counters every thread incremented; CMU's OpenBw-Tree replaced them with per-thread local
+epochs and garbage lists, freeing whatever is tagged below the minimum local epoch, and measured 1.3× higher
+throughput with 20 threads on a monotonic-key read/update workload.
+
+**Silo** advances a global epoch every 40 ms, and each worker's local epoch may lag it by at most one — if a worker
+falls further behind, the advancing thread *delays the epoch*. A B+tree node freed in a transaction takes the worker's
+epoch as its reclamation epoch and is freed once min(local epochs) − 1 reaches it. The same epochs drive group commit.
+**LeanStore** reuses buffer frames this way; see
+[pointer swizzling](../../../p02-storage-engines/buffer-pool-memory-mmap-and-contention/03-beyond-the-page-table-pointer-swizzling-in-memory-engines-an/).
+
+## Hazard pointers
+
+Maged Michael's hazard pointers (IEEE TPDS, 2004) make readers publish *what* they use. Each of *N* threads owns *K*
+single-writer, multi-reader pointer slots, usually one or two: *H* = *N*·*K* in all.
+
+**Protect.** Load the pointer, write it into a hazard pointer, then re-read the source and check it is unchanged.
+Folly's `hazptr_holder::try_protect` does exactly that — set, full memory fence, reload, return false on a mismatch
+so `protect` retries. Without the re-check the node could be retired and freed between the load and the publish.
+
+**Retire and scan.** A writer appends the unlinked node to its private retire list. When the list reaches *R*, it
+collects every non-null hazard pointer into a set (Michael recommends a sorted array and binary search) and frees every
+retired node not in it. With *R* = *H* + Ω(*H*) each node costs constant amortized time, and at most *N*·*R* retired
+nodes ever wait — **even if threads are delayed or have crashed**.
+
+Switch the lab to **Hazard pointers** and choose **R3 stalls mid-scan** again. At t = 200 two nodes wait and the peak is 5. R3's
+hazard pointer names #12, unlinked at t = 42; every scan frees the rest of the retire list and keeps #12. Raise **Scan
+threshold R** and the peak follows it: at R = 12 it is 11, because the writer scans the moment its list reaches R.
+
+The price is on the read side: a traversal must protect and validate every node it steps onto. In Michael's list-based
+set, two hazard pointers cover the current node and its predecessor, and validation checks that the predecessor still
+points at the current node. Deletion first marks the victim's next pointer, so the check fails as soon as the predecessor
+is marked or the current node is unlinked, and the search restarts from the head. Under epochs, a reader may keep walking through unlinked nodes, which stay allocated
+while it is pinned. With **No stalls** at t = 600, hazard pointers cost 7.5 bookkeeping writes per operation against
+2.0, and R3 restarted 22 times, completing 9 scans against 16 under epochs. Tom Hart's 2005 comparison at Toronto
+reached the same shape: a fence per node visited, unbounded once traversals restart.
+
+Folly reclaims when a domain's retired count reaches max(1000, 2 × hazard pointers), or on a retire at least two seconds after
+the last pass. Its documentation states the trade-off: hazard pointers can protect an object while the thread
+blocks indefinitely; RCU cannot. The C++26 working draft standardises both, as `<hazard_pointer>` and `<rcu>`.
+
+## RCU: grace periods and quiescent states
+
+Readers bracket access with `rcu_read_lock()` / `rcu_read_unlock()`, fetch with `rcu_dereference()`, and may not block
+inside. An updater publishes with `rcu_assign_pointer()` and calls `synchronize_rcu()`, which waits until **every
+read-side critical section that already existed has finished** — later readers cannot reach the removed node — or
+registers a callback with `call_rcu()`. That interval is a **grace period**. In classic RCU on a non-preemptible kernel
+the read-side calls compile to nothing: blocking inside a section is illegal, so a CPU that has context-switched has
+left it. A context switch is a **quiescent state**, and once every CPU has passed one the grace period is over.
+
+Userspace RCU (liburcu) offers both styles. The preferred `memb` flavor marks read-side sections explicitly and uses
+the kernel's `membarrier` system call when it is available. The `qsbr` flavor has the fastest read side because readers mark nothing;
+instead every registered thread must call `rcu_quiescent_state()` periodically and wrap long idle periods in
+`rcu_thread_offline()` / `rcu_thread_online()`.
+
+Switch the lab to **RCU** with **R3 stalls mid-scan**; nodes retired while a grace period runs wait for the next
+one. Grace period 1 waits for R3 and the count at t = 200 is 66, the same climb as epochs. That is no accident: Silo calls
+its scheme epoch-based reclamation "à la RCU", and Hart names the fundamental difference as who detects grace
+periods — the library for EBR, the application for QSBR. Now choose **R3 stalls between operations**: plain RCU stays low, since R3 is outside
+any section. Tick **QSBR flavor** and at t = 299, 98 nodes wait. A QSBR thread that stops reporting quiescent states
+blocks every grace period while holding no pointer at all, unless it went offline first.
+
+## RocksDB's SuperVersion: reference counts with a thread-local fast path
+
+RocksDB does count references, but keeps point reads off the shared counter. A read needs a consistent memtable, set of
+immutable memtables and Version; `SuperVersion` holds references to all three (`mem`, `imm`, `current`) behind
+`std::atomic<uint32_t> refs`. When a flush or compaction installs a new one, the old SuperVersion lives until its count
+reaches zero, and `Cleanup()` then releases the memtables and the Version — what lets a flushed memtable be freed and an
+obsolete SST deleted, as in [MANIFEST and Versions](../../../p02-storage-engines/lsm-compaction-and-maintenance/04-manifest-versions-and-crash-safety/).
+
+To avoid an atomic increment per `Get`, each column family caches a referenced SuperVersion per thread in a
+`ThreadLocalPtr` (`local_sv_`). `GetThreadLocalSuperVersion` swaps the marker `kSVInUse` into the slot; only if it finds
+`kSVObsolete` does it take the DB mutex and reference the current SuperVersion. `ReturnThreadLocalSuperVersion`
+compare-and-swaps the pointer back expecting `kSVInUse`, and if that fails the reader drops its now-stale reference.
+`InstallSuperVersion`, under the DB mutex, scrapes every thread's slot to `kSVObsolete`, releasing cached pointers but
+skipping `kSVInUse`, *before* releasing the old SuperVersion, so a thread-local slot never holds the last reference.
+
+The protection is still a reference count: the slot owns one reference, and `kSVInUse` only records that the reader has
+taken it out, so the reader rather than the installer releases it. The common read costs two thread-local atomic
+operations and no shared write. The stalled reader is an **iterator**, which holds its
+SuperVersion for its whole life, pinning memtables and obsolete files. `Iterator::Refresh()` (since 5.8) moves it to the
+current SuperVersion; the opt-in `auto_refresh_iterator_with_snapshot` (10.0, default `false`) does so automatically
+while an iterator with an explicit snapshot makes progress.
+
+## PostgreSQL: a transaction id as the epoch
+
+Following Lehman and Yao, a PostgreSQL index scan holds no lock or pin between levels, so after VACUUM deletes an empty
+B-tree page a search that just left the parent, or a scan stepping from a sibling, may still land on it. The page
+therefore stays as a tombstone with its sibling links intact, and the searcher recovers by moving right — what the
+nbtree README calls Lanin and Shasha's "drain technique". The deletion protocol, and how its stamp changed in
+PostgreSQL 14, are on [this module's first page](../01-b-tree-concurrency-latch-crabbing-and-lehman-yao/).
+
+Read it as epochs. **Retire:** `_bt_unlink_halfdead_page` stores `ReadNextFullTransactionId()` as the page's `safexid`;
+the source notes that any scan still holding a stale link advertises an xmin no newer than that. **Free:**
+`BTPageIsRecyclable` lets the page into the free space map only once `GlobalVisCheckRemovableFullXid(heaprel, safexid)`
+is true, so the xmin horizon plays the minimum pinned epoch. The README calls waiting for all snapshots "overly
+strong", but simple — the same conservatism as EBR. The stalled thread is a long-running transaction: its snapshot
+holds deleted index pages back, along with the dead heap tuples it is better known for.
+
+## Where it bites in production
+
+- **One stalled thread, unbounded memory.** Under epochs, RCU and QSBR, a thread preempted, blocked on I/O or just slow
+  inside a pinned region stops reclamation for everyone. Retired memory climbs for as long as the thread stays pinned and
+  drains only after it moves on; a leak checker finds nothing, because every node is still referenced from a retire list. Keep pinned regions short and never
+  block while pinned (`repin_after`, `rcu_thread_offline`). Silo makes long transactions refresh their epoch; Trevor
+  Brown's DEBRA+ uses signals to neutralise a thread that will not advance.
+- **Idle QSBR threads.** A registered thread parked on a condition variable without going offline stalls every grace
+  period, and the graph looks like a stuck reader when no reader is active.
+- **Hazard pointers on long traversals.** A publish, fence and validation per node, and restarts under churn. Hazard
+  pointers suit short, pointer-hopping operations and code that must block while holding a reference.
+- **The reclaimer as the bottleneck.** A shared epoch counter touched on every operation brings back the cache-line
+  ping-pong it was meant to avoid; the OpenBw-Tree's per-thread epochs exist because of it.
+- **Long-lived iterators and transactions.** An open RocksDB iterator pins memtables and SST files, so disk space is not
+  reclaimed; an open PostgreSQL transaction pins deleted index pages. Refresh or close them.
+
+| Scheme | Readers announce | Read-side cost | Memory waiting | A stalled reader holds back | Examples |
+|---|---|---|---|---|---|
+| Epochs | the epoch they pinned | a store per pin and unpin | unbounded | everything retired since it pinned | crossbeam-epoch, Bw-tree, Silo, LeanStore |
+| Hazard pointers | the exact nodes they hold | publish and validate per node | at most *N*·*R* | only the nodes it names | folly `hazptr`, C++26 `<hazard_pointer>` |
+| RCU / QSBR | read-side sections, or quiescent states | near zero | unbounded | every grace period (QSBR: even idle) | Linux, liburcu, C++26 `<rcu>` |
+| Ref count + thread-local cache | a cached reference | thread-local swap and CAS | what holders pin | its SuperVersion | RocksDB |
+| Transaction-id horizon | a snapshot's xmin | none extra | what the oldest snapshot pins | pages deleted after its xmin | PostgreSQL nbtree |
+
+:::note[What to take forward]
+Unlinking makes a node unreachable for new readers; freeing it must wait for old ones, which a latch-free writer cannot
+see. Epochs and RCU make readers say *when* they read — nearly free per operation, but one stalled reader holds back
+everything retired after it started. Hazard pointers make readers say *what* they hold — bounded memory and a stalled
+thread pins only its own nodes, at the cost of a publish and validation per node. RocksDB's thread-local SuperVersion and
+PostgreSQL's `safexid` are the same bargain, with the same production symptom: the oldest reader decides how much
+garbage you keep.
+:::

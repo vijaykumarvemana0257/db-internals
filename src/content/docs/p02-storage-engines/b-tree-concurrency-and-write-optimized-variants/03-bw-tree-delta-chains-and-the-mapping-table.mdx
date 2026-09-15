@@ -1,0 +1,217 @@
+---
+title: 'Bw-tree: delta chains and the mapping table'
+description: How the Bw-tree makes a B+tree latch-free with a mapping table and delta records installed by compare-and-swap — consolidation, two-phase splits, merges, LLAMA storage, Hekaton, and why OpenBw-Tree still lost to optimistic lock coupling.
+depth: deep
+sidebar:
+  order: 3
+---
+
+import BwTreeMappingTableLab from '../../../../components/viz/BwTreeMappingTableLab';
+
+Latch crabbing and optimistic lock coupling, from the
+[first page of this module](../01-b-tree-concurrency-latch-crabbing-and-lehman-yao/), both still change a node
+in place: a writer latches the node and rewrites bytes other cores have cached, and every other thread using that
+node waits or restarts. The Bw-tree, by Levandoski, Lomet and Sengupta at Microsoft Research (ICDE 2013), removes the
+latch by never changing a node at all.
+
+It adds one level of indirection. Pages refer to each other by a logical page ID, and a **mapping table** holds each
+ID's current physical address. A change is a new immutable record placed in front of the page and published with a
+single compare-and-swap on one mapping slot. Splits, merges, consolidation and flushes are all built from that CAS.
+
+<BwTreeMappingTableLab client:visible />
+
+## The mapping table
+
+Every page has a **PID**, an index into the mapping table. The slot holds a memory pointer to the page's newest state
+or, for a page that is only on storage, a flash offset. Every link inside the tree is a PID — downlinks and each page's
+**side link** to its right sibling. The only physical pointers are the slots and the `next` pointers inside one page's chain.
+
+That separation is the whole design. Because nothing outside a page holds its physical address, the page can move on
+every update and every write to storage without touching its parent or siblings. Without the indirection, a tree that
+never updates in place must give each new node copy a new downlink in a new copy of its parent, up to the root — the path
+copying of [page 5](../05-b-trees-fractal-trees-and-copy-on-write-b-trees/).
+
+SQL Server's documentation calls the table the PidMap. In the lab, the column of `@` addresses is the mapping table;
+solid arrows are physical pointers, and a label like `P3` is a logical link back through the table.
+
+## A page is a chain of deltas
+
+A Bw-tree never updates a page in place. To insert, update or delete a record, a thread reads the page's slot — say
+`@6` — allocates a **delta record** describing the change with `next` = `@6`, and compare-and-swaps the slot from `@6`
+to the delta's address. If the CAS succeeds, the delta *is* the page's new state. Readers already walking the old
+state are unaffected. Leaf deltas are insert, modify or delete, and each
+carries its operation's log sequence number for the transactional layer above.
+
+A page becomes a chain: the newest delta, older deltas, and an immutable **base page** at the end, a sorted node like
+any B+tree node. Pages are elastic, with no hard size limit. OpenBw-Tree copies the page's high key, right sibling, item
+count and chain length into every delta, so navigation need not replay the chain.
+
+A point search walks the chain newest first and stops at the first delta for its key: insert or modify returns the
+record, delete means the key is gone. Only if no delta mentions the key does it binary-search the base page.
+
+Set **Key** to 40. The read shows **7** pointer chases: the root's slot, the root's base page, P2's slot, `del 30`,
+`mod 10`, `ins 25`, and P2's base page. An in-place B+tree of two levels dereferences two nodes. Set Key to 30 and
+the read stops after four, because `del 30` is the first delta in the chain.
+
+Now set Key to 45 and press **Insert 45**, with **Step through each CAS** ticked. The first step shows thread A holding
+a private `ins 45` whose `next` is `@6`. Press **Next step**: the CAS finds `@6` still in the slot and stores `@7`.
+That one store published the insert. Move Key back to 40 and the read costs 8.
+
+## When the CAS fails
+
+Two threads can read the same slot, build deltas against the same old address, and race. Exactly one CAS succeeds. The
+loser's delta points at a state that is no longer current — installing it would silently erase the winner's write — so
+its CAS fails and it retries. OpenBw-Tree restarts the operation from the root.
+
+Press **Reset**, choose **B's CAS lands second**, set Key to 45 and insert again. A and B both load `@6`. A's CAS stores `@7`.
+B's CAS fails, because the slot holds `@7`, so B discards its `ins 46`, descends from the root again and succeeds on
+top of A's delta. **CAS ok / failed** ends at 3 / 1: two inserts, plus the consolidation B's write triggered.
+
+Comparing addresses raises the ABA question from
+[page 2](../02-memory-models-atomics-and-what-makes-optimistic-latching-cor/): could `@6` be freed, reused, and fool the
+CAS? Epochs prevent it. Unlinked state is not reused until every thread that might have seen it has left its epoch, so
+an address a thread holds cannot come back as a different node — [page 4](../04-memory-reclamation-for-latch-free-structures-epochs-hazard-p/) covers how.
+
+In the ICDE experiments, with 8 threads, record updates failed under 0.02% of the time on all three workloads. Splits and
+consolidations failed far more: 1.27% of splits on an Xbox LIVE trace, and 8.88% of splits and 7.35% of consolidations on
+8-byte synthetic keys, where record deltas are so fast that a slower, page-sized operation often loses.
+
+## Consolidation
+
+A thread that notices a chain past a threshold consolidates the page after its own operation — including a thread that
+was only reading. It builds a new base page privately, with the newest version of every record and deleted ones dropped,
+and installs it with the same CAS: same PID, new address. If that CAS fails, the thread frees the new page and does not
+retry; a later thread will find the chain too long. The old chain goes to the epoch mechanism, since readers may still
+be on it.
+
+Reset the lab, set **Racing writer B** back to None, and at the default threshold of 5 insert 45 and then 35. The
+second insert makes P2's chain five deltas long, so thread A consolidates: a base page holding 10, 20, 25, 35, 40 and 45 replaces the chain, and six objects — five
+deltas and the old base page — move to the retired row. Every read in P2 now costs 4 pointer chases.
+
+To watch a consolidation lose, reset, choose **B's CAS lands first**, and press **Consolidate P2**. A replays three deltas
+into a private page, but B's small `ins 26` lands first. A's CAS fails, A frees its page, and the chain is four long.
+
+The threshold trades copying against walking:
+
+| | Consolidation trigger | Page size |
+|---|---|---|
+| Bw-tree paper (ICDE 2013) | chain past a threshold; in sweeps of 2–32, large Xbox records degraded beyond 4 deltas, 8-byte keys tolerated about 8 | elastic; 8 KB in the experiments |
+| SQL Server In-Memory OLTP | a new delta added to a chain that already has 16 | grows to 8 KB, then the next insert splits it |
+| OpenBw-Tree source | chain length ≥ 8, leaf and inner | split at 128 entries |
+| OpenBw-Tree experiments | 24 for leaves, 2 for inner nodes; 32–40 measured best | 128-entry leaves, 64-entry inner nodes |
+
+OpenBw-Tree's authors tie its longer best chain to allocating each node's deltas in one block beside its base page.
+
+## Splits in two CASes
+
+A split changes three pages: the full page P, its new right sibling Q, and the parent, which needs a separator and a
+downlink for Q. One CAS cannot change three slots, so the Bw-tree uses the Lehman–Yao B-link design from
+[page 1](../01-b-tree-concurrency-latch-crabbing-and-lehman-yao/) — a high key and a side link, the paper's name for the
+right link, on every page — to split in two atomic steps.
+
+**Phase 1, the half split.** The thread picks a separator K<sub>P</sub>, allocates a PID for Q, and builds Q's base page
+from P's records above K<sub>P</sub>, with P's old high key and a side link to P's old right sibling. It stores Q's address
+into Q's slot with a plain write — no CAS, since no other thread knows the PID. Then it CASes a **split delta** onto P,
+holding K<sub>P</sub> and a logical pointer to Q. The tree is now valid: a search reaching P with a key above K<sub>P</sub>
+follows the side link to Q.
+
+**Phase 2, the index entry.** It then CASes an **index-entry delta** onto the parent, holding K<sub>P</sub>, a pointer to Q,
+and K<sub>Q</sub>, the separator that used to route to P. A parent search with a key above K<sub>P</sub> and at most
+K<sub>Q</sub> goes straight to Q. Consolidation later folds both deltas into ordinary base pages.
+
+Reset, set the racing writer to None and Key to 40, and press **Split P2**. P2's live keys are 10, 20, 25 and 40, so
+the separator is 20, and P4 is built holding 25 and 40 before the split delta goes in. Reading 40 now costs 6 pointer chases, one through the side link, because
+the root still sends every key up to 49 to P2. Press **Post index entry for P4**: the root gains `index (20,49] → P4`, and
+the read costs 4.
+
+Between the phases the split is visible to everyone, and nothing guarantees the splitting thread lives to finish it. So a
+thread that finds an unfinished structure change completes it before its own work: any updater or structure change that
+would traverse the side link posts the index entry first. Reset and split P2 again, skip the posting, then set Key to 45
+and insert: A crosses the side link, finds no entry for P4 in the root, posts it, and only then inserts into P4.
+PostgreSQL's latched B-link tree has the same obligation through `BTP_INCOMPLETE_SPLIT`, as the
+[crash-safety page](../../../p02-storage-engines/b-trees-and-variants/03-crash-safety-of-structure-modifications-atomic-splits-and-in/)
+shows.
+
+Phase 1 can lose its race. Reset, choose **B's CAS lands first**, and split P2: B's `ins 11` lands after A copied P2, so A's
+split delta would describe a state that no longer exists. The CAS fails, and A releases P4's page and PID, which no other
+thread ever saw. The paper calls these failed splits, and installs a small delta rather than whole new pages partly to keep
+their window short.
+
+SQL Server documents a different split: first it allocates a new P1 and P2, linked, and swaps the slot from the old P1 to the
+new one; then it copies the parent into a new page with a row for P2 and swaps the parent's slot.
+
+## Merges take three steps
+
+Merging an underfull page R into its left sibling L takes three atomic steps in the ICDE design:
+
+1. a **remove-node delta** on R stops all use of R; a thread that meets it goes to L instead;
+2. a **node-merge delta** on L points *physically* at R's state, turning L's chain into a small tree, with a separator key to
+   choose the branch;
+3. an **index-term-delete delta** on the parent removes R's entry and extends L's range to R's old high key.
+
+Only then does R's PID go on the epoch's pending list. A thread that meets a half-finished merge completes it, and dependent
+changes serialize: if L is itself being deleted, the thread deleting R finishes deleting L first.
+
+This is the delicate part. The OpenBw-Tree authors found that a child merge interleaved with a parent split could leave a
+stale separator behind; their fix is an abort delta on the parent that makes other threads' appends there abort until the
+merge delta is in. SQL Server merges a page when a delete leaves it under 10% of 8 KB or with a single row, in three
+atomic steps.
+
+## LLAMA: the log-structured store underneath
+
+LLAMA (Levandoski, Lomet and Sengupta, VLDB 2013) is the cache and storage layer beneath the Bw-tree. An access method gets `Update-D` to prepend a delta, `Update-R` to replace the page state as consolidation
+does, and `Flush`, which copies page state into the log-structured store and prepends a **flush delta** recording its location.
+
+- **Flushes are incremental.** Only deltas added since the last flush are written, as one contiguous record, so on flash a page
+  is a chain of pieces linked by file offsets.
+- **Writes are large and sequential.** Pages are packed with no empty space into big buffers: 1 MB in the ICDE prototype,
+  about 4 MB holding 1,000 to 10,000 page flushes per write in DocumentDB.
+- **Cleaning** moves live page states from the head of the circular log to its tail and installs each new location with a CAS on
+  a relocation delta.
+
+Write-ahead logging is enforced per delta. A flush omits any delta whose LSN is past the end of the stable transaction log, and
+consolidation folds in only deltas at or below it, so a flush never waits for the log. Structure changes are logged as small
+system transactions, and only the thread that wins the CAS commits.
+
+## Where it shipped, and the CMU verdict
+
+**SQL Server In-Memory OLTP (Hekaton)** uses the Bw-tree for nonclustered indexes on memory-optimized tables, the ones that support
+range seeks, purely in memory: these indexes are never written to disk and are rebuilt from the rows when the database comes online.
+**Azure DocumentDB** (now Cosmos DB) built its engine on an extended Bw-tree with log-structured storage. Its blind incremental update prepends
+"add document d to term t" without reading the page, even from SSD; reads and consolidation combine the fragments with a merge
+callback that must be commutative and idempotent, because latch-free updates to one key can arrive out of order. The ICDE paper
+measured the Bw-tree 18.7× faster than BerkeleyDB on an Xbox trace, with BerkeleyDB limited to one writer and page latches.
+
+Wang, Pavlo and colleagues at CMU, with Viktor Leis, rebuilt it from the papers (SIGMOD 2018), since Microsoft had not released its code.
+OpenBw-Tree filled the papers' gaps — non-unique keys, iterators, a mapping table that grows by reserving virtual address space —
+and ran 1.1–2.5× faster than their good-faith build of the original design on insert-heavy concurrent workloads. It still underperformed the lock-based
+indexes it was compared with — a B+tree with optimistic lock coupling, Masstree and ART — by 1.5–4.5×. With many threads inserting increasing keys, it averaged more than
+10 aborts per insert as threads fought over one chain head.
+
+Then they removed its features one at a time, single-threaded. Consolidating every chain made reads 23% faster; replacing node IDs
+with raw pointers made reads 18% faster, with 32% fewer L1 and 52% fewer L3 misses on load instructions; in-place leaf updates made inserts 40%
+faster; swapping CAS for a plain store changed almost nothing. Even stripped, it was 15–19% slower than the B+tree with optimistic
+lock coupling. Their conclusion: lock-freedom does not always pay off.
+
+## Where it bites in production
+
+- **Chains are read latency.** Every delta above the wanted record is one more dereference.
+- **Latch-free is not contention-free.** Writers to one page still contend for one slot, and losers redo work instead of waiting.
+  Identity columns and timestamps put every insert on the rightmost leaf — the workload where OpenBw-Tree averaged over 10 aborts
+  per insert.
+- **Big operations lose races.** Splits and consolidations take longer to prepare than a record delta, so on a busy page with small
+  records they fail far more often, and a failed consolidation leaves the chain longer.
+- **Every write allocates.** A delta per update, a page per consolidation, and nothing freed until epochs drain; one thread stalled
+  in an epoch pins everything retired after it entered.
+- **Duplicate keys hurt.** SQL Server warns that many duplicate key values degrade writes to these indexes; add a more selective
+  column to the key.
+- **The mapping table only grows.** OpenBw-Tree's authors know of no lock-free way to shrink it; that means blocking every thread and
+  rebuilding the index.
+
+:::note[What to take forward]
+The Bw-tree makes every change to a page — a record write, a consolidation, a split — a new immutable object published by one CAS on
+a mapping slot, which works only because every link between pages is a logical ID. The price is paid on reads (a mapping lookup per
+level and a walk down each chain), in allocation and deferred reclamation, and in multi-step structure changes other threads must be
+ready to finish. It shipped in SQL Server and DocumentDB, but a careful independent implementation still lost to a B+tree with
+optimistic lock coupling: avoiding latches is not the same as avoiding work.
+:::
