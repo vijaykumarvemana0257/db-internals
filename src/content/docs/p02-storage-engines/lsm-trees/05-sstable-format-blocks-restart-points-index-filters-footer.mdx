@@ -92,7 +92,8 @@ block holds far more entries than the lab's small blocks do, which is where the 
 Every block — data, index and meta — is followed by a **5-byte trailer**: one byte naming the compression
 applied to the block and a 4-byte checksum. The block is compressed as a unit, so a reader decompresses a
 whole block to read any entry in it; the checksum lets it detect a corrupted block before trusting a single
-byte. RocksDB's default is a CRC32C checksum, with other checksum types available, and compression is
+byte. RocksDB's default checksum is XXH3 (`kXXH3`, the default since RocksDB 7.8; CRC32C before that), with
+other checksum types available, and compression is
 configurable per level — typically a fast codec for the upper levels and a stronger one for the bottom.
 
 ## The index block

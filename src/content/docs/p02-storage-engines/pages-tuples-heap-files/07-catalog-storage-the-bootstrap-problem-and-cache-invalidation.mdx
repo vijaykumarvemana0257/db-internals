@@ -233,8 +233,8 @@ connection in every process reparse the entire schema.
   connections × no cache eviction = hundreds of megabytes of `CacheMemoryContext` per backend
   that only goes away when the connection does. `pg_backend_memory_contexts` will show you.
 - **Indexes stuck at `indisvalid = false`.** A cancelled `CREATE INDEX CONCURRENTLY` leaves a
-  `pg_index` row that writers still maintain and the planner never uses: you pay the write cost
-  for nothing. Find them with `SELECT indexrelid::regclass FROM pg_index WHERE NOT indisvalid`,
+  `pg_index` row the planner never uses. If the build had already reached `indisready = true`,
+  writers still maintain it, so you pay the write cost for nothing. Find them with `SELECT indexrelid::regclass FROM pg_index WHERE NOT indisvalid`,
   then `DROP INDEX` and rebuild.
 - **MySQL dictionary cache pressure.** `Table_open_cache_overflows` and
   `Table_open_cache_misses` climbing means `table_open_cache`/`table_definition_cache` are too

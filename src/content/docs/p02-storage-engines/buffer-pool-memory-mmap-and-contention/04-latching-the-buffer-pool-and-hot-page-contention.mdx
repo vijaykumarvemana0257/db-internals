@@ -143,9 +143,12 @@ the key space at once.
 **Upper index levels.** Every descent of every index reads the root. It is read-mostly — the root
 changes only when the tree grows a level — so it is never *blocked* on, and in a pin-based engine
 it is still a write-heavy cache line, for the reason above. Note that the latch *coupling* problem
-is already solved: Lehman and Yao's B-link tree, which both PostgreSQL's nbtree and InnoDB
-follow, adds right-links and high keys so a descent can release the parent before it takes the
-child and never holds two page latches at once. What remains is pure coherence traffic on the
+is already solved: Lehman and Yao's B-link tree, which PostgreSQL's nbtree follows, adds
+right-links and high keys so a descent can release the parent before it takes the child and never
+holds two page latches at once. InnoDB takes a different route — its source calls its index "an
+ordinary B-tree, not a B-link tree" and serializes structure changes with an index-wide latch
+instead; the [B-tree concurrency page](../../../p02-storage-engines/b-tree-concurrency-and-write-optimized-variants/01-b-tree-concurrency-latch-crabbing-and-lehman-yao/)
+compares the two. What remains is pure coherence traffic on the
 shared-acquire path, and that is the thing optimistic latching removes.
 
 **Sequences and counters.** `nextval()` pins and exclusively locks the sequence relation's single

@@ -169,10 +169,13 @@ It builds the index in phases, and between them it must wait for **every transac
 holds a snapshot older than the current phase's point** — otherwise a transaction using an
 older snapshot could insert a row the build has already passed, and the finished index would
 be missing entries. There is no way to hurry this: a `CREATE INDEX CONCURRENTLY` behind one
-`idle in transaction` session sits there indefinitely, holding no interesting lock and making
-no progress. Worse, if it is cancelled or fails, it leaves behind an invalid index
-(`pg_index.indisvalid = false`) that costs maintenance on every write and is used by no query
-until you `DROP` and rebuild it. `REINDEX CONCURRENTLY` and MySQL's online DDL have the same
+`idle in transaction` session that still holds an old snapshot — a `REPEATABLE READ` transaction,
+say, or any transaction that has already written to the table, whose lock the build also waits
+out — sits there indefinitely, making no progress. (An idle `READ COMMITTED` session that has not
+touched the table holds no snapshot between statements, and the build does not wait for it.)
+Worse, if it is cancelled or fails, it leaves behind an invalid index
+(`pg_index.indisvalid = false`) that no query uses until you `DROP` and rebuild it — and if the
+build had got past its first phase, every write keeps paying to maintain it. `REINDEX CONCURRENTLY` and MySQL's online DDL have the same
 dependency for the same reason.
 
 ## Where it bites in production
