@@ -1,0 +1,212 @@
+---
+title: Composite indexes and the leftmost-prefix rule
+description: Why an index on (a, b, c) can seek on a, a+b and a+b+c but only filter on c, how the ESR ordering keeps a scan contiguous and sorted, when skip scan relaxes the rule, and how ASC/DESC and NULLS FIRST/LAST decide whether ORDER BY still needs a sort.
+depth: intermediate
+sidebar:
+  order: 2
+---
+
+import CompositeIndexLeftmostPrefixLab from '../../../../components/viz/CompositeIndexLeftmostPrefixLab';
+
+A composite index is one B-tree sorted by a tuple of columns. A query can jump straight to the part of the tree it
+needs only if its conditions pin down a prefix of that tuple, and it gets rows back already sorted only if its ORDER BY
+follows the tuple in the direction it was built. Get the column order or a single `DESC` wrong and the index is still
+"used" — it just reads far more entries than it returns, or feeds a sort that reads everything before `LIMIT` applies.
+
+<CompositeIndexLeftmostPrefixLab client:visible />
+
+## One sort order, several columns
+
+An index on `(tenant_id, status, created_at)` orders its entries by `tenant_id`, then by `status` among equal
+tenants, then by `created_at`; PostgreSQL's nbtree breaks remaining ties with the heap TID. The descent is the ordinary
+[B+tree search](../../../p02-storage-engines/b-trees-and-variants/01-b-tree-structure-invariants-and-search/),
+comparing tuples column by column.
+
+In the lab's tree, every `tenant_id = 3` entry sits in one contiguous run, and inside it the `'paid'` entries are
+contiguous and ordered by `created_at`. But entries with a given `created_at` are scattered across every tenant and
+status.
+
+That is the leftmost-prefix rule. An index on `(a, b, c)` can seek on equality on `a`, on `a` and `b`, or on all
+three — plus a range on the last column it uses. MySQL's manual puts it as "any leftmost prefix of the index can be
+used by the optimizer to look up rows". PostgreSQL's documentation gives the exact form: equality conditions on
+leading columns, plus any inequality on the first column that has no equality, limit the portion of the index that
+is scanned.
+
+The lab opens on *Equality on a leftmost prefix*: `tenant_id = 3 AND status = 'paid' ORDER BY created_at LIMIT 5`.
+One search lands in leaf 6, the scan reads five entries, and it stops. The rows come out in `created_at` order
+because that is the index's order inside the `(3, 'paid')` run, so the badge says no sort is needed. Set `LIMIT`
+to *none* and the scan reads the whole run, 17 entries, and then stops at the first entry that is no longer
+`(3, 'paid')`.
+
+## Seek keys and in-index filters
+
+A condition that does not fit the prefix is not ignored. It is checked against each index entry inside the range
+the prefix defines. It saves heap visits, but it cannot shrink the range.
+
+nbtree makes this explicit by marking each scan key as *required* to continue the scan or not. The source comment's
+example: for `x = 1 AND y < 4 AND z < 5`, the scan rejects `(1, 2, 7)` but keeps going, because `(1, 3, z)` could still
+match; it stops at `(1, 4, z)`. The `x` and `y` keys end the scan; the `z` key only filters (until PostgreSQL 18's skip
+scan, below).
+
+Choose *A gap: middle column skipped* and keep **PostgreSQL 17**. The index is `(tenant_id, status, created_at)` and
+the query is `tenant_id = 3 AND created_at >= 40`. There is no condition on `status`, so the seek is `tenant_id = 3`
+alone. The scan reads all 27 entries for tenant 3, rejects 13 of them inside the index (orange, struck through), and
+fetches 14 heap rows.
+
+Choose *Range on the leading column*: the index is `(created_at, status)` and the query is
+`created_at > 10 AND status = 'void'`. The range on the first column ends the seek keys, so `status = 'void'` becomes
+a filter: 77 entries read, 66 rejected, 11 rows fetched.
+
+How the engines show it:
+
+- **PostgreSQL** lists every condition on an index column under `Index Cond`, whether it bounds the scan or only
+  filters, and counts nothing for entries rejected inside the index. The plan panel shows
+  `Index Cond: ((created_at > 10) AND (status = 'void'))` for a scan that reads 77 entries to return 11. The tell is
+  buffers against rows; PostgreSQL 18's `EXPLAIN ANALYZE` includes `BUFFERS` by default. Conditions on columns outside
+  the index appear as `Filter`, with `Rows Removed by Filter`, after the heap fetch.
+- **MySQL** calls in-index filtering **Index Condition Pushdown** (`Using index condition`): the storage engine checks
+  the pushed conditions against the index entry before reading the full row. For InnoDB it applies only to secondary
+  indexes, and only to the `range`, `ref`, `eq_ref` and `ref_or_null` access methods. The range optimizer keeps adding
+  key parts while the operator is `=`, `<=>` or `IS NULL`, and stops after `>`, `>=`, `<`, `<=`, `BETWEEN` or `LIKE`.
+  Switch to **MySQL 8.0** and choose *No condition on the leading column*: a full index scan (`type: index`) gets no
+  pushdown, so all 96 rows are fetched and 89 discarded, which is why MySQL would scan the table instead.
+
+## ESR: equality, sort, range
+
+A query with equality conditions, an ORDER BY and a range has two sensible column orders, and they fail in opposite ways.
+
+- **Equality, range, sort (E, R, S).** Seek on the equality columns and the range together. The range is tight, but entries
+  inside it are ordered by the range column, so every match is fetched and sorted before `LIMIT` applies.
+- **Equality, sort, range (E, S, R).** Seek on the equality columns, walk in sort-column order, and check the range as an
+  in-index filter. Rows come out sorted, so the scan stops once it has `LIMIT` of them.
+
+Choose *Range before sort (E, R, S)*: index `(tenant_id, total, created_at)`, query
+`tenant_id = 2 AND total > 100 ORDER BY created_at LIMIT 5`. The scan reads 17 entries, fetches all 17 rows and sorts
+them to return five. Choose *Sort before range (E, S, R)*, index `(tenant_id, created_at, total)`: six entries read, one
+rejected inside the index, five fetched, no sort.
+
+Now edit the WHERE clause to `total > 900` in both. E, R, S reads two entries. E, S, R walks all 20 of tenant 2's entries
+and rejects 18, because it cannot stop until it has found five matches, and there are only two. MongoDB's ESR guideline
+states exactly this trade-off: put sort fields before range fields to avoid an in-memory sort, but put a *very selective*
+range before the sort fields.
+
+Two refinements decide whether the sort is really avoided:
+
+- **Equality columns drop out of the ordering.** A column fixed by `=` has one value in the scanned range, so its position
+  and direction do not matter. PostgreSQL removes such sort keys as redundant (`pathkey_is_redundant` in `pathkeys.c`
+  discards any key whose equivalence class contains a constant). MySQL's manual says the same: the index can serve an
+  ORDER BY that does not match it exactly as long as the unused index columns and any extra ORDER BY columns are constants
+  in the WHERE clause. Try `tenant_id = 2` with `ORDER BY tenant_id DESC, created_at` on `(tenant_id, created_at)`: no sort.
+- **An unconstrained column in front of the sort column breaks the order.** On `(tenant_id, status, created_at)`, the query
+  `tenant_id = 2 ORDER BY created_at LIMIT 5` needs a full sort of 20 rows, because `created_at` is only ordered within each
+  `status`. Remove `status` from the index and the same query reads five entries.
+
+## One composite versus several single-column indexes
+
+With separate indexes on `tenant_id` and `status`, PostgreSQL can answer `tenant_id = 3 AND status = 'paid'` with a
+**BitmapAnd**: scan each index for its own condition, build a bitmap of row locations from each, AND them, and visit the
+heap in physical order. Every entry matching *either* condition is read, the index order is lost, and any ORDER BY needs a
+separate sort, so `LIMIT` cannot stop the scans early.
+
+The last stat tile prices that alternative. For the opening scenario it reads 86 entries (27 for the tenant, 59 for the
+status) to find 17 rows, where the composite read five. PostgreSQL's documentation agrees: a multicolumn index is typically
+more efficient than index combination for queries on both columns; separate indexes pay off when queries also use each column
+alone. MySQL's Index Merge intersection (`Using intersect(...)`) is narrower still: each merged condition must be equality on
+every part of its index, or a range on the InnoDB primary key.
+
+## Skip scan: relaxing the rule for low-cardinality leading columns
+
+An nbtree source comment states the old rule: "Prior to Postgres 18, a qual like `WHERE y = 4` always resulted in a
+full scan." PostgreSQL 18 adds **skip scan**. During preprocessing nbtree adds a *skip array* for every index column that comes
+before the last column with a condition and has no `=` of its own. A skip array behaves like `x = ANY(every possible x)`: the scan
+seeks `(x₁, y = 4)`, then `(x₂, y = 4)`, and so on. A range on a skipped column becomes a *range skip array* whose values are
+limited to the range. With every column now covered by an equality or a skip array, all the conditions can bound the scan.
+
+Choose *No condition on the leading column*: index `(status, created_at)`, query `created_at BETWEEN 20 AND 24`.
+
+- On **PostgreSQL 17** there is no seek at all: 96 entries read, 89 rejected. (The planner would normally prefer a sequential scan.)
+- On **PostgreSQL 18**, a skip array on `status` turns this into one seek per status value: three index searches, seven entries read.
+  `EXPLAIN ANALYZE` in PostgreSQL 18 reports this per index scan node as `Index Searches`.
+
+The benefit depends entirely on how many distinct values are skipped. Build `(total, status)` and query `status = 'void'` on
+PostgreSQL 18: `total` has 91 distinct values among 96 rows, the groups are nearly single entries, and the scan reads all 96. The
+source comment says a skip scan "behaves like a full scan when there's many distinct 'x' values", and the documentation says the
+planner then prefers a sequential scan; it calls skip scan reasonably efficient when the leading column has no more than several hundred
+distinct values. Whether to re-descend or read on to the next group is decided page by page at run time; the lab approximates those
+heuristics, so treat its PostgreSQL 18 search counts as illustrative.
+
+Other engines relax the rule more narrowly. **Oracle's** index skip scan (plan operation `INDEX SKIP SCAN`, hint `INDEX_SS`) logically
+splits the index into one subindex per leading value, and is considered when the leading column is absent from the predicate and has
+few distinct values. **MySQL 8.0.13** added a *Skip Scan range access method* (`Using index for skip scan`), a relative of the GROUP BY
+loose index scan, with strict conditions: one table, no GROUP BY or DISTINCT, a range condition on the column after the skipped prefix,
+and a query that references only index columns — so the lab's `SELECT *` never qualifies.
+
+## Direction is part of the key
+
+Each column of a B-tree index has a direction and a NULL placement. PostgreSQL stores both per column in `pg_index.indoption`:
+`INDOPTION_DESC` (`0x0001`) and `INDOPTION_NULLS_FIRST` (`0x0002`). The defaults, for index columns and ORDER BY alike, are
+`ASC NULLS LAST` and `DESC NULLS FIRST`.
+
+A scan can run backward, but a backward scan reverses **every** column, and every column's NULL placement, at once. In `pathkeys.c`,
+`build_index_pathkeys` flips `reverse_sort` and `nulls_first` together for all key columns when the direction is backward. So an index on
+`(x, y)` serves `ORDER BY x, y` forward and `ORDER BY x DESC, y DESC` backward. It can never serve `ORDER BY x ASC, y DESC`: that needs an
+index declared `(x ASC, y DESC)` or `(x DESC, y ASC)`.
+
+Choose *Mixed directions in ORDER BY*: `(tenant_id, created_at)` with `ORDER BY tenant_id DESC, created_at ASC LIMIT 5`. On PostgreSQL the
+backward scan matches the first sort key, so the plan becomes an **Incremental Sort** with `Presorted Key: tenant_id`. Incremental Sort,
+added in PostgreSQL 13, sorts one group of equal presorted keys at a time. Under a small `LIMIT` it stops after the group that completes the
+limit, plus one row to see that the group has ended. Tenant 4 has 29 rows, so the scan reads 30 entries. On **MySQL 8.0**, which has no
+incremental sort, the same query is a filesort over all 96 rows.
+
+Now click `created_at`'s **ASC** to make it `DESC`. A backward scan of `(tenant_id ASC, created_at DESC)` produces exactly
+`tenant_id DESC, created_at ASC`: the badge turns green and the scan reads five entries. `(tenant_id DESC, created_at ASC)` serves it forward.
+
+MySQL ignored `DESC` in index definitions before 8.0. Since then InnoDB stores descending key parts, `EXPLAIN` reports
+`Backward index scan` for a reversed read, and the manual states the same rule: the index needs "the same homogeneity" of directions as the
+ORDER BY, not the same actual directions.
+
+## NULL placement: the silent disqualifier
+
+Because NULL placement flips with direction, a plain index on a nullable column serves exactly two orderings: `ASC NULLS LAST` forward and
+`DESC NULLS FIRST` backward. Writing the default explicitly changes nothing: `ORDER BY shipped_at ASC NULLS LAST` still uses it. The non-default
+placement is what breaks it.
+
+Choose *DESC NULLS LAST on a default index*: `ORDER BY shipped_at DESC NULLS LAST LIMIT 5` over an index on `shipped_at`. It matches neither
+direction: the badge turns red, and to return five rows the index path reads all 96 entries and sorts them, so the planner drops the
+index for a sequential scan and a top-N sort. `EXPLAIN` never says why.
+
+Two fixes, both in the lab:
+
+- Click the column's **ASC** to make it **DESC** (which defaults to NULLS FIRST), then click **NULLS FIRST** to switch it to
+  NULLS LAST: `CREATE INDEX … (shipped_at DESC NULLS LAST)`. A forward scan reads five entries.
+- Or leave it **ASC** and click **NULLS LAST** to switch it to NULLS FIRST. A backward scan of that is `DESC NULLS LAST`, and also reads five.
+
+A WHERE clause that excludes NULLs does not rescue the default index. In the planner, NULL placement is part of a sort key's identity
+(`make_canonical_pathkey` matches on it), and `build_index_pathkeys` copies the index's placement as declared. Type `shipped_at > 50` into the
+WHERE box: the scan now reads only the ten non-NULL entries above 50, but it still sorts them.
+
+MySQL has no `NULLS FIRST` or `NULLS LAST`: NULLs sort first ascending and last descending, in indexes and ORDER BY alike, so this NULL
+mismatch cannot arise. The usual emulation, `ORDER BY shipped_at IS NULL, shipped_at DESC`, sorts by an expression, which the manual lists
+among the cases where an index cannot provide the order.
+
+## Where it bites in production
+
+- **An index that is "used" but reads the whole tenant.** An `Index Cond` with a leading range, or a skipped middle column, looks
+  identical to a tight seek. Compare buffers with rows returned, and on PostgreSQL 18 read `Index Searches`. The fix is usually
+  reordering columns so equality comes first, not another index.
+- **A latency cliff behind a sort toggle.** A UI that sorts either way, or puts empty values last, generates `DESC NULLS LAST` or
+  mixed-direction clauses, and a fast `LIMIT 20` query becomes a full sort of every matching row. Declare the index to match the orderings
+  you serve, or restrict them; the [list endpoint page](../09-the-list-endpoint-optional-filters-sort-options-and-one-inde/) goes further.
+- **Widening an index in the middle.** Changing `(tenant_id, created_at)` into `(tenant_id, status, created_at)` to help one query breaks
+  every `tenant_id = ? ORDER BY created_at` query that does not also fix `status`. Add new columns at the end, or keep both indexes.
+- **Too many columns.** PostgreSQL allows 32 index columns including `INCLUDE` columns, but its documentation warns that more than three
+  are unlikely to help unless usage is extremely stylized. Every column widens every entry; the cost side is on the
+  [write-cost page](../06-write-cost-hot-and-the-indexes-per-update-meter/).
+
+:::note[What to take forward]
+A composite index is one sort order. Equality on a leading prefix, plus one range on the next column, bounds the scan; every other condition on an
+index column only filters entries inside that range. Put equality columns first, then the sort column, then the range — unless the range is so
+selective that sorting its few matches is cheaper. An index serves an ORDER BY only if, after dropping columns fixed by `=`, the ORDER BY matches its
+declared directions and NULL placements exactly, or all of them inverted. PostgreSQL 18's skip scan and Oracle's index skip scan relax the prefix
+rule, but they pay off only when the skipped leading columns have few distinct values.
+:::

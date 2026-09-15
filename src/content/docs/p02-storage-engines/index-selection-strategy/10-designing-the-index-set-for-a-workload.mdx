@@ -1,0 +1,234 @@
+---
+title: Designing the index set for a workload
+description: Choosing indexes for a whole workload — scoring a set by reads times rate, write and HOT costs, storage and hidden foreign-key lookups, merging candidates, greedy what-if advisors, and hypothetical indexes.
+depth: deep
+sidebar:
+  order: 10
+---
+
+import WorkloadIndexSetLab from '../../../../components/viz/WorkloadIndexSetLab';
+
+Most earlier pages in this module asked about one query: is this index worth building, in what column order,
+covering or partial. A real table serves a dozen query shapes, a stream of writes and a set of constraint checks at
+once, and its indexes are one shared budget. Every insert pays for every index. Every standby stores all of them. Each
+index earns its keep only through the statements the planner actually routes through it.
+
+So the unit of design is the **set**. An index that is excellent for one query can be worthless in a set that already
+serves that query another way. An index no query mentions can be the most valuable one you have.
+
+<WorkloadIndexSetLab client:visible />
+
+## The input: statements with rates
+
+Index-set design starts from an inventory: every statement shape, how often it runs, and what it costs now. In
+PostgreSQL that is `pg_stat_statements`, one row per normalized statement (`queryid`) with `calls`,
+`total_exec_time`, `mean_exec_time`, `rows` and the `shared_blks_hit` / `shared_blks_read` buffer counters. In MySQL
+it is `performance_schema.events_statements_summary_by_digest`, or the slow query log with `long_query_time` lowered far
+enough to catch the frequent fast statements. The
+[tuning workflow page](../../../p03-query-processing/explain-and-query-tuning/08-the-tuning-workflow-find-reproduce-hypothesize-verify-guard/)
+covers collecting them. Keep **rates**, from the difference between two snapshots, not lifetime totals.
+
+The inventory must include writes, with more detail than a read needs: rows per statement and, for every `UPDATE`, which
+columns it changes, because that decides whether an index costs anything.
+
+It must also account for statements that never appear in it. Referential-integrity triggers run their lookups inside the
+parent statement. In PostgreSQL, the after-row triggers fire from `AfterTriggerEndQuery`, called inside
+`standard_ExecutorFinish`, and `pg_stat_statements` raises its nesting level around that phase. Under the default
+`pg_stat_statements.track = top`, the child-side `SELECT 1 FROM ONLY order_items x WHERE $1 = product_id FOR KEY SHARE
+OF x` gets no row of its own. Its time and buffers are added to the parent `DELETE FROM products` entry. It looks like a
+slow delete, not a missing index. Setting `track = all` gives nested statements their own rows.
+
+The lab's inventory is ten queries with rates, three foreign-key lookups, and a write stream scaled by **Write rate**:
+inserts into three tables, 80 status updates and 5 price updates per second, and rare deletes of customers and of never-sold products.
+
+## Scoring a set
+
+Chaudhuri and Narasayya's AutoAdmin index selection tool for SQL Server (VLDB 1997) defined the objective this page uses:
+the **total cost of a configuration** is the sum of the optimizer's estimated costs for every statement in the
+workload — `SELECT`, `INSERT`, `UPDATE` and `DELETE` — subject to constraints such as a maximum number of indexes or a
+storage budget. The lab totals the first three terms below in pages touched per second, and reports storage beside them.
+
+**Reads.** For each query, the pages of the plan the planner would pick given this set, times the query's rate. The
+planner's choice is what counts. `customers(region)` exists in the inherited set, but for `Q7` the region matches about
+10,000 rows, and 10,000 random heap fetches cost more than scanning the table's 12,500 pages in order. The lab's planner scans,
+and the index is worth nothing. PostgreSQL itself would probably pick a bitmap heap scan, which the lab leaves out.
+
+**Constraint lookups.** A foreign key's referenced side always has a unique index. In PostgreSQL the referencing side
+gets none unless you build it, and the documentation warns that a `DELETE` of a parent row "will require a scan of the
+referencing table". The [first page of this module](../01-selectivity-correlation-and-the-decision-to-build-an-index/)
+showed the mechanism; here the arithmetic matters. `ON DELETE CASCADE` multiplies it: one customer delete
+runs one lookup on `orders`, then one lookup on `order_items` for each of the customer's 100 orders. Parent-side checks on
+child inserts probe the parent's primary key, cost the same under every index set, and are counted separately.
+
+**Index maintenance.** Every `INSERT` adds an entry to every index on the table — one root-to-leaf descent each. `UPDATE`
+depends on the engine, covered below. PostgreSQL's `DELETE` writes no index entries (VACUUM
+removes them later); InnoDB delete-marks the secondary entries.
+
+**Storage.** Index bytes, times the number of physical copies. The **Physical standbys** slider multiplies it: a standby
+replays the primary's WAL, so it holds the same indexes. On every copy, the hot part of each index also competes with the
+table for the buffer pool.
+
+The lab's cost model is deliberately small — B-tree seeks, heap fetches interpolated by correlation as PostgreSQL's
+`cost_index()` does, no bitmap or index-only scans.
+
+### The inherited set
+
+The lab opens on a set that grew one ticket at a time. The total is 625,495 pages/s: 604,344 for queries, 17,452 for
+constraint lookups, 3,698 for maintenance.
+
+The table under the map scores each index **leave-one-out**: drop it alone, re-plan everything, and see what comes back.
+It credits an index only with what no other index does as well, so two interchangeable indexes both look worthless;
+drop one at a time. Here it exposes three problems:
+
+- `orders(customer_id)` serves `Q2` and the cascade from customers, yet saves 0 pages. `orders(customer_id, created_at)`
+  would serve both at the same 104 pages. It is a [**redundant prefix**](../06-write-cost-hot-and-the-indexes-per-update-meter/#finding-indexes-that-do-not-pay-for-themselves). MySQL's `sys.schema_redundant_indexes` view uses the
+  same rule: a non-unique index whose columns lead another index is redundant.
+- `orders(total)` serves nothing. `customers(region)` serves nothing either, because the lab's planner prefers a scan.
+- `order_items.product_id` leads no index, so the red arrow in the foreign-key strip is a sequential scan of 1,600,000
+  pages for every product delete. At 36 deletes an hour, that is 16,000 pages/s.
+
+Tick the three flagged indexes in the table and **Drop selected**. Maintenance falls from 3,698 to 2,732 pages/s and storage from 28 GB to 24 GB
+across the primary and one standby, while reads do not move. Then build `order_items(product_id)`: pick
+`order_items`, click `product_id`, **Create**. Constraint lookups fall from 17,452 to 1,452 pages/s — the child-side part
+from 16,012 to 12 — for 640 pages/s of maintenance and 4.2 GB per copy. No query in the inventory would have asked for that
+index.
+
+## From per-query candidates to a shared composite
+
+For each query, the best index under the equality–sort–range rule from the
+[composite-index page](../02-composite-indexes-and-the-leftmost-prefix-rule/) is its natural proposal. The lab lists these
+under **Ideal index for one query**. Add `Q3`'s, `orders(status, created_at)`, and drop `orders(status)`: `Q3` stops sorting
+100,000 rows and reads 54 pages, and the total drops to 108,054. Do the same for `Q8` with `products(category, price)`, and
+the total reaches 40,594.
+
+Adding every proposal is how index sets bloat. SQL Server's missing-index suggestions each come from optimizing a single
+query, with key columns in no particular order, and the documentation warns that they "might offer similar variations of
+indexes on the same table and column(s) across queries".
+
+Combining means **merging**. Keep one index's column order and append the other's missing columns. Add `Q2`'s proposal,
+`orders(customer_id, status)`: `Q2` drops from 104 pages a call to 24, and the total falls to 36,274. Now select
+`orders(customer_id, created_at)`, then `orders(customer_id, status)`, and **Merge 2 selected**. The result,
+`orders(customer_id, created_at, status)`, still seeks and returns rows in order for `Q1`. For `Q2` it seeks on
+`customer_id` and checks `status` inside the index before touching the heap: still 24 pages, one index fewer, and a total
+of 35,794.
+
+The order you merge in matters. Drop the merged index, add the proposals for `Q1` and `Q2` again, and this time select
+`orders(customer_id, status)` first. The result is
+`orders(customer_id, status, created_at)`, whose second column is no longer `Q1`'s sort column. `Q1` goes back to fetching all
+100 of a customer's orders and sorting them, and the total rises to 59,794. A merge is safe when the appended columns only
+act as filters for the absorbed query. If the absorbed query needed its second column to seek a range or deliver an order,
+merging brings back the scan or the sort.
+
+## The engine changes the write term
+
+In **PostgreSQL**, an update is [HOT](../../../p02-storage-engines/pages-tuples-heap-files/04-hot-updates-redirect-line-pointers-and-opportunistic-page-pr/)
+only if it modifies no column referenced by any of the table's indexes (BRIN excepted) and the page has room. The column
+bitmap in `RelationGetIndexAttrBitmap` includes key columns, expression columns and **partial-index predicate columns**, so a
+partial index `WHERE status = 'pending'` counts too. The test is all-or-nothing, and a non-HOT update inserts into every index: once one index on `orders`
+contains `status`, all 80 status updates per second write to all of `orders`' indexes. `products(category, price)` did the same thing quietly
+to the 5 price updates per second.
+
+In **InnoDB**, the clustered record is updated in place but secondary index records never are: the old entry is
+delete-marked and a new one inserted, only in the indexes that contain the changed column. Switch **Engine** to InnoDB in
+the merged state and open **Show the numbers**: `orders(id)`, the table itself, drops to 0, while each index containing
+`status` rises from 480 to 808 pages/s, since every status update writes it twice. InnoDB asks how many indexes contain the
+updated column; PostgreSQL asks whether any does. Taking `status` out of the merged index saves 640 pages/s in InnoDB and
+nothing in PostgreSQL, where `orders(status, created_at)` still holds it. [Write cost and HOT](../06-write-cost-hot-and-the-indexes-per-update-meter/)
+has the full mechanics.
+
+InnoDB changes the constraint term too. It requires an index whose leading columns are the foreign key's columns and
+creates one if none exists: **Reset to inherited set**, and the missing `order_items(product_id)` appears as an automatic
+index. Try dropping
+`order_items(order_id)`, and the lab answers the way the server does:
+`ERROR 1553 (HY000): Cannot drop index ...: needed in a foreign key constraint`.
+
+## Letting an advisor search
+
+With a dozen candidates, the space of sets is already too large to try by hand. AutoAdmin searched it in two steps, a shape
+its successor, SQL Server's Database Engine Tuning Advisor, kept:
+
+1. **Candidate selection.** Find the best configuration for each query on its own, and keep the union. The paper notes that
+   this pruning is safe only for workloads with no updates and no bound on the index count; otherwise an index that is best
+   for no single query can still be best for the set.
+2. **Enumeration.** `Greedy(m, k)` picks the best `m`-index configuration exhaustively, then keeps adding whichever candidate
+   lowers the total cost most, until `k` indexes are chosen or no candidate lowers it. With `m = 0` it is purely greedy.
+
+**Run greedy advisor** does `Greedy(0, k)`. The candidates are every query's proposal, a single-column index for each foreign
+key, and the order-preserving merges of proposals that share a leading column; `k` is the **Index budget per table**. At the
+default settings it adds `order_items(order_id, product_id)` first, because that one index serves `Q4`, `Q5` and the order
+cascade. It ends at 7 indexes and 28,772 pages/s, and the merged composite on `orders` is one of its picks.
+
+Now push **Write rate** to ×25. The advisor rebuilds `orders` with no index containing `status`, so 2,000 status updates per
+second stay HOT. **Apply its set** and open **Show the numbers**: `Q3` now walks `orders(created_at)` backwards and filters on
+the heap, 911 pages a call instead of 54. That assumes, as the planner does, that pending orders are spread evenly in
+time; if they are the newest, the walk is far shorter. At ×100 it also gives up on `customers(region, created_at)` and lets `Q7` scan. Lower the budget to 3 at ×1, and
+`orders(status, created_at)` is what gets squeezed out.
+
+Kossmann and colleagues' comparison of eight algorithms (PVLDB 2020) separates those that weigh pure benefit (AutoAdmin,
+DTA, Dexter, Drop) from those that weigh benefit per byte of storage (Extend, DB2Advis, CoPhy, Relaxation),
+and cites earlier work finding that such algorithms spend on average 90% of their runtime inside the optimizer.
+
+## Validating without building
+
+Each of those optimizer calls is a what-if question: how would this statement be planned if this index existed? Engines answer
+it with **hypothetical indexes**.
+
+**PostgreSQL: HypoPG.** `SELECT * FROM hypopg_create_index('CREATE INDEX ON orders (customer_id, created_at, status)')` defines an
+index that exists only in your backend's private memory, and plain `EXPLAIN` — not `EXPLAIN ANALYZE` — plans with it.
+`hypopg_relation_size()` estimates its size. `hypopg_hide_index()` (added in HypoPG 1.4.0) hides a real index from the planner, which
+is the what-if for a drop. `hypopg_reset()` drops every hypothetical index, and `hypopg_unhide_all_indexes()` restores hidden ones. Other sessions
+never see any of it.
+
+HypoPG gives plans and estimated costs — not maintenance cost, lost HOT updates or runtime. Multiply its cost deltas by the
+rates from `pg_stat_statements` and subtract the write term yourself.
+Dexter automates the first half: it takes queries from `pg_stat_statements`, creates hypothetical single- and two-column indexes,
+and suggests one when `EXPLAIN` cost falls by at least 50% (its default). That is per-query advice, and Dexter never proposes
+dropping an index.
+
+**SQL Server: Database Engine Tuning Advisor.** DTA tunes a whole workload from the Query Store (SQL Server 2016 and later), the
+plan cache, a trace or a script, using the optimizer on hypothetical configurations. `dta -B` caps the storage of its
+recommendations, and `-fx` considers only dropping existing structures. It will not add or drop indexes that enforce
+`PRIMARY KEY` or `UNIQUE` constraints.
+
+**Oracle: SQL Access Advisor** takes a SQL tuning set, the shared SQL area or a hypothetical workload derived from the schema,
+and recommends indexes, materialized views and partitions to create, drop or retain.
+
+**MySQL** has no hypothetical indexes. For drops, `ALTER TABLE ... ALTER INDEX ... INVISIBLE` hides an index from the optimizer
+in place and reversibly. The documentation says an invisible index is still maintained, so it tests the read
+side of a drop, not the write savings.
+
+## Constraints that bound the answer
+
+- **A per-table index budget.** Hard limits are rarely what binds: InnoDB allows 64 secondary indexes and 16 key columns, and a
+  PostgreSQL index can have 32 columns including `INCLUDE`. The practical budget comes from write rate, memory and bloat, and
+  PostgreSQL's documentation says multicolumn indexes "should be used sparingly".
+- **Replicas share the primary's indexes.** A hot standby rejects DDL, so it cannot build an index of its own. An index that only
+  the reporting replica needs is built on the primary, maintained by every write there, and stored and replayed on every standby. A PostgreSQL logical replication subscriber is different: schema and DDL are not replicated, so it can carry indexes the
+  publisher does not have.
+- **Distributed stores charge per index, across partitions.** A global secondary index is partitioned by the indexed value, so a
+  base-table write can mean a write to a different partition. In DynamoDB, index updates consume the index's own write capacity,
+  a change to an indexed key attribute costs two of them (a delete and a put), and an index short of capacity throttles writes
+  to the base table. [Secondary indexes across partitions](../../../p07-replication-partitioning-and-consensus/querying-and-modeling-partitioned-stores/03-secondary-indexes-across-partitions-local-vs-global/)
+  compares local and global designs.
+
+## Where it bites in production
+
+- **Slow parent deletes with nothing in the query log.** Under `track = top` the child-side lookup hides inside the `DELETE`'s
+  entry, multiplied by each cascade level's fan-out. Check every foreign key's referencing columns against the index list.
+- **"Unused" indexes that guard rare operations.** `idx_scan` counts scans since the last statistics reset, and `last_idx_scan`
+  (PostgreSQL 16) records when the most recent one happened. An index used only by a monthly purge or a rare parent delete looks dead until the day it is dropped.
+- **Per-query advice accumulating.** Missing-index DMVs, Dexter and one-ticket-per-index habits each add a nearly redundant composite.
+  Re-score the whole set periodically, leave-one-out, and merge.
+- **Extending an index to reuse it.** Appending `status` to `orders(customer_id, created_at)` looks free for reads. In PostgreSQL,
+  if no other index held `status`, every status update is now non-HOT across all the table's indexes;
+  `pg_stat_user_tables.n_tup_hot_upd` stops climbing.
+- **Trusting estimates as results.** Hypothetical plans rest on the same statistics that produced the slow plan. Build the chosen set
+  on a realistic copy and compare buffers per statement.
+
+:::note[What to take forward]
+Design indexes against the whole workload: rates times plan cost for reads, maintenance for every write, storage on every copy,
+and the foreign-key lookups no inventory shows. Score each index by what the set loses without it, which is how redundant prefixes
+and ignored indexes show up. Merge per-query candidates into shared composites only when the appended columns act as filters. Let
+greedy what-if search propose, validate with hypothetical indexes, and remember the engine: in PostgreSQL one index containing a
+column makes every update of that column write to every index on the table.
+:::

@@ -1,0 +1,222 @@
+---
+title: 'Indexing for hybrid search: which indexes the pipeline needs'
+description: A hybrid query read as an indexing problem — a tsvector GIN index for the text branch, HNSW or IVFFlat for the vector branch, a B-tree for the metadata filter — what each costs in bytes, writes and build work, and why a selective filter over an approximate index silently loses rows unless the index set lets the filter run before or inside the scan.
+depth: deep
+sidebar:
+  order: 8
+---
+
+import HybridIndexSetLab from '../../../../components/viz/HybridIndexSetLab';
+
+A hybrid search query asks one table three questions at once: which chunks match these words, which chunks sit nearest
+this embedding, and which chunks belong to this tenant. Each question needs its own access path. With the wrong index set,
+branches scan instead of seeking, and the vector branch returns fewer rows than it should, with no error anywhere.
+
+This page covers only the indexing side. How the two ranked lists are fused, reranked and evaluated belongs to the
+[hybrid retrieval page](../../../p05-using-the-database-well/vector-and-hybrid-retrieval/02-hybrid-retrieval-and-reranking/).
+
+<HybridIndexSetLab client:visible />
+
+## The query, split into access paths
+
+A typical PostgreSQL shape runs the two branches as separate queries over one `chunks` table and fuses them afterwards:
+
+```sql
+-- text branch
+SELECT id, ts_rank_cd(tsv, q) AS score
+FROM chunks, websearch_to_tsquery('english', $2) AS q
+WHERE tenant_id = $1 AND tsv @@ q
+ORDER BY score DESC LIMIT 20;
+
+-- vector branch
+SELECT id
+FROM chunks
+WHERE tenant_id = $1
+ORDER BY embedding <=> $3   -- cosine distance
+LIMIT 20;
+```
+
+Three predicates, three candidate indexes: a GIN index on `tsv` for `@@`, an HNSW or IVFFlat index on `embedding` for the
+`ORDER BY … LIMIT`, and a B-tree on `tenant_id` for the filter. The lab runs this shape over 6,000 chunks and ten queries,
+with `LIMIT 10`. It starts with one index per search column, **GIN** plus **HNSW**, and nothing on `tenant_id`.
+
+## The text branch: GIN over a stored tsvector
+
+PostgreSQL's documentation calls GIN the preferred text search index: an inverted index with one entry per lexeme and a
+compressed list of the rows containing it. Index a stored generated `tsvector` column rather than a `to_tsvector` expression;
+the [JSONB, arrays and text search page](../07-choosing-the-index-for-jsonb-arrays-and-text-search/) explains why. Posting-list
+internals are on the [GIN page](../../../p02-storage-engines/indexes-beyond-the-b-tree/06-gin-inverted-indexes-and-posting-lists/).
+
+Two properties matter here:
+
+- **The seek is exact.** A bitmap index scan returns every row matching the `tsquery`, so a `tenant_id` filter applied
+  afterwards costs heap fetches but never loses a row. In the lab's default state the text lane reads about 98 heap rows
+  per query to keep one.
+- **It does not rank.** `ts_rank` and `ts_rank_cd` read the `tsvector` of every matching row, which the documentation warns
+  can be I/O-bound. GIN finds candidates; the top-N sort still touches all of them.
+
+Writes are the cost. An insert adds one entry per distinct lexeme: about 18 for the lab's short chunks, far more for real
+paragraphs. With `fastupdate` on (the default) they land in a pending list that is merged later, which trades insert latency
+for merge spikes; [the JSONB page](../07-choosing-the-index-for-jsonb-arrays-and-text-search/) covers that trade-off. Encoded the way
+`ginpostinglist.c` stores them, as varbyte deltas between item pointers (assuming 40 rows per heap page), the lab's postings
+average about 1.5 bytes: about 26 MB per million rows of these chunks.
+
+## The vector branch: HNSW or IVFFlat
+
+pgvector offers two approximate index types, and its README says to pair `ORDER BY` a distance operator with `LIMIT` for either to be used.
+
+### HNSW
+
+HNSW is a layered graph; the algorithm is on the
+[vector index page](../../../p02-storage-engines/tries-learned-and-vector-indexes/04-vector-indexes-ivf-hnsw-and-quantization/).
+In pgvector, `m` (16 by default) caps neighbors per node on upper layers and layer 0 allows `2m`. `ef_construction` (64) is
+the candidate list used while inserting, and `hnsw.ef_search` (40) the candidate list a query keeps.
+
+The on-disk layout explains the size. Each vector is an **element tuple**: a 72-byte header with room for ten heap TIDs,
+then the vector itself (`4 × dimensions + 8` bytes). Its **neighbor tuple** holds 6-byte item pointers for `(level + 2) × m`
+slots, 192 bytes of pointers on layer 0. pgvector keeps both on one 8 KB page when they fit. At 768 dimensions that is two
+vectors per page, about 4 KB per row or 3.8 GB per million rows, more than the 3,080-byte vectors themselves. At 1,536
+dimensions it is one per page. Switch **Embedding dimensions** to compare. `vector` indexes stop at 2,000 dimensions; indexing
+a `halfvec` expression stores half-precision vectors and reaches 4,000.
+
+Inserts are where HNSW is expensive. An insert walks the graph with `ef_construction`, writes its two tuples, then updates
+**every chosen neighbor's** list: an append if it has room, otherwise a heuristic that may replace an existing neighbor. Each
+accepted update rewrites that neighbor's tuple. The lab counts about 24 per insert, so one `INSERT` writes about 26 index
+tuples. Building the lab's graph took 7.0 million distance computations. pgvector notes that builds run much faster while
+the graph fits in `maintenance_work_mem` (a `NOTICE` says when it stops fitting) and can use
+`max_parallel_maintenance_workers`.
+
+### IVFFlat
+
+IVFFlat clusters vectors with k-means and files each row under its nearest center. pgvector's starting points are
+`lists = rows / 1000` up to a million rows, `sqrt(rows)` beyond, and `probes = sqrt(lists)`; the default `ivfflat.probes` is 1.
+Centers come from a sample taken at `CREATE INDEX` time (50 rows per list, at least 10,000), so an index built on a near-empty
+table has centers that describe nothing, which pgvector's FAQ gives as the likely reason for missing results.
+
+An insert appends one tuple to the nearest list, the cheapest vector index to maintain. It is not smaller on disk: each entry
+carries the full vector, two per page at 768 dimensions. What IVFFlat saves is build work (930,000 distance computations in
+the lab against HNSW's 7.0 million) at the price of a worse speed–recall trade-off.
+
+## The filter, and where it can run
+
+The filter can run before the vector search, after it, or inside it. The index set decides which is possible.
+
+### After the index: the ef_search ceiling
+
+pgvector's README is direct: with approximate indexes, filtering is applied *after* the index is scanned. The HNSW scan
+searches layer 0 with `ef_search` candidates and hands them up nearest first. A `Filter` node discards other tenants, `Limit`
+waits for ten survivors, and when the candidates run out the scan ends.
+
+With a filter keeping a fraction *s* of rows, about `ef_search × s` candidates survive. The README's example is a 10% filter
+at the default 40, leaving 4 rows. Move the lab's filter to **10%** and the branch returns 44 of 100 rows. At the default
+**1.5%** it returns 6; the ground-truth grid shows the 94 misses. Each red cell is a row from that tenant that belongs in the
+true top ten and never came back. The fraction of the exact answer returned is recall, and nothing in the result signals the
+loss: you simply get fewer than `LIMIT` rows.
+
+Post-filtering only works with overfetch: to keep ten rows through a filter that passes a fraction *s*, the index must hand
+up about `10 / s` candidates, about 670 at 1.5%. For HNSW that means raising `hnsw.ef_search`, because the scan never hands up
+more than that many tuples however large the `LIMIT` is, and pgvector caps the setting at 1,000. Set it to 200 and the 1.5%
+tenant still gets only 21 rows back. Set it back to 40, then untick **HNSW** and tick **IVFFlat**. IVFFlat hands up every row of
+each probed list, about 1,000 here, so the filter starves later, but it still misses 49 of 100 rows because true neighbors in
+unprobed lists are never read. Tick **HNSW** again and untick **IVFFlat** before reading on.
+
+### Before the index: a B-tree the filter can seek
+
+Tick **B-tree (tenant_id)**. The vector lane becomes an index scan on `tenant_id`, an exact distance for each of the tenant's
+90 rows, and a top-N sort: all 100 rows come back. The text lane improves too, since the planner can `BitmapAnd` the GIN and
+B-tree bitmaps and read about one heap row per query instead of 98. At about 6 bytes per row after B-tree deduplication it is
+the smallest index in the set, and the one that fixes recall. pgvector's README suggests it first: exact indexes work well for
+conditions that match a low percentage of rows.
+
+Pre-filtering is exact, but its cost grows with the qualifying rows, and for a big tenant a graph walk is cheaper. So the
+planner chooses, on cost alone. pgvector's `hnswcostestimate` charges a startup cost for the walk, derived from `m`,
+`ef_search` and the table size, and PostgreSQL scales the rest of the scan by the fraction the `LIMIT` needs, as though the scan
+could keep producing rows. Neither path's cost has a term for recall. The lab's planner is a simplified version of that
+arithmetic, counted in tuples. With the B-tree ticked, slide the filter to **15%**: the planner estimates 580 tuples for HNSW
+against 900 for the B-tree, picks HNSW, and misses 39 rows. The real crossover depends on cost settings and statistics; the
+shape of the failure does not. The plan flips at a selectivity boundary, and recall flips with it.
+
+For the text branch, `btree_gin` offers a single multicolumn GIN index on `(tenant_id, tsv)`; its documentation notes this can
+beat combining two indexes with a bitmap AND.
+
+### Resuming the scan, or filtering inside it
+
+The third option needs engine support: a scan that keeps going until enough rows pass, or a search that checks the filter as
+it walks.
+
+**pgvector iterative index scans** (0.8.0 and later) still filter after the index, but the scan can resume. With
+`hnsw.iterative_scan` set to `strict_order` or `relaxed_order`, the first walk keeps the candidates it discarded, and when the
+executor needs more rows the scan resumes from the nearest `ef_search` of them. Once it has visited roughly
+`hnsw.max_scan_tuples` (20,000) tuples, or used `hnsw.scan_mem_multiplier × work_mem` of memory, it stops exploring the graph
+and only hands up candidates it already holds. `strict_order` drops any tuple that comes back closer than one already
+returned; the README says `relaxed_order` gives better recall. IVFFlat's `ivfflat.iterative_scan = relaxed_order` probes more
+lists, up to `ivfflat.max_probes`. In the lab, untick the B-tree and choose **After, with iterative_scan = relaxed_order**, then
+move the filter: no tenant misses more than one of its 100 true top-ten rows. But at **0.5%** each query visits about 4,960 of the 6,000
+tuples to find ten of the tenant's 30 rows, which a B-tree reads directly. Lower `hnsw.max_scan_tuples` to 2,000 and the scan
+stops exploring early and misses 29.
+
+**Lucene and Elasticsearch.** A `filter` inside the `knn` section is applied *during* approximate search; the documentation
+contrasts it with post-filtering, which can return fewer than `k`. Per segment, Lucene first evaluates the filter through the
+filter field's own index. If no more documents match than the candidates requested (`num_candidates` in Elasticsearch), it scores them exactly. Otherwise it walks the graph
+collecting only accepted documents, with a visit limit of the match count plus one, and falls back to exact search if it
+reaches the limit. Choose **Inside the graph walk**, where the `ef_search` slider becomes `num_candidates`: at 25% and above the walk finishes;
+from 15% down every query falls back.
+Lucene's current source adds an ACORN-1-inspired traversal for restrictive filters, which the lab does not model.
+
+**Qdrant** puts the filter into the graph. With a payload index on the field, filterable HNSW adds extra edges per indexed
+value, but only if the payload index exists before the graph is built; one created after ingestion needs a rebuild. Qdrant 1.16
+adds an ACORN option that explores second-hop neighbors when direct ones are filtered out.
+
+Both engines that filter inside the walk still lean on an index for the filter: Lucene's inverted index on the keyword field,
+Qdrant's payload index. Without one the accept set costs a scan: in the lab, inside-the-walk filtering touches 6,000 more tuples per query when the B-tree is unticked.
+
+### Partial indexes and partitions
+
+For a filter with few distinct values, pgvector suggests a partial HNSW index per value, `WHERE (category_id = 123)`; for many,
+list partitioning. The [partial index page](../04-partial-and-expression-indexes/) calls one partial index per value a bad idea when one
+B-tree led by the column can do the same job; pgvector's HNSW and IVFFlat indexes take a single column, so here nothing can. For tenants pgvector recommends partitions or separate tables, because a shared approximate index lets one tenant's
+vectors affect another's recall and speed. Set the placement back to **After the scan** and tick **Partial HNSW per tenant**: every tenant gets exact filtering at
+approximate-index cost and nothing is missed, for eight graphs of about the same total size and write cost as one. The trap, from
+the same page: implication is proven at plan time, so a generic plan for
+`tenant_id = $1` can never use `WHERE tenant_id = 7`. Partitions sidestep this through partition pruning.
+
+## Reading the scoreboard
+
+Projected to a million rows of 768-dimensional embeddings:
+
+| Index | Serves | Size (1M rows) | Tuples written per insert | Build work in the lab |
+|---|---|---|---|---|
+| GIN on `tsv` | text `@@` | 26 MB for these short chunks | ~18, via the pending list | 106,784 postings |
+| HNSW on `embedding` | vector `ORDER BY … LIMIT` | 3.8 GB | ~26 | 7.0 M distance computations |
+| IVFFlat, `lists = 6` | vector `ORDER BY … LIMIT` | 3.8 GB | 1 | 930,000 distance computations |
+| B-tree on `tenant_id` | the filter; pre-filters both branches | ~5.7 MB | 1 | 6,000 keys sorted |
+| Partial HNSW per tenant | vector, one tenant at a time | 3.8 GB in total | ~29 | 5.5 M distance computations |
+
+The expensive decisions are the vector index and whether tenants share it. The decision that most affects correctness is the
+cheapest: whether the filter has an index at all. Per-index write cost in pages and WAL is on the
+[write-cost page](../06-write-cost-hot-and-the-indexes-per-update-meter/); scoring a whole workload's index set is in
+[designing the index set](../10-designing-the-index-set-for-a-workload/).
+
+## Where it bites in production
+
+- **Short result sets for small tenants.** `LIMIT 20` returns 3 rows and nothing fails. `EXPLAIN ANALYZE` shows an index scan
+  on the HNSW index whose rows plus `Rows Removed by Filter` add up to about `hnsw.ef_search`. Test with your smallest tenant, and
+  alert when a vector query returns fewer rows than it asked for.
+- **Plans that flip with statistics.** The planner picks between the B-tree path and the HNSW path on estimated cost. A tenant
+  growing past the crossover, or stale statistics, silently changes recall.
+- **Iterative scans that walk the whole graph.** They fix recall for rare filter values by visiting most of the index. Watch
+  latency for the smallest tenants, bound it with `hnsw.max_scan_tuples`, and give very selective filters a B-tree or a partition.
+- **IVFFlat built too early.** Centers sampled from a near-empty table stay wrong as data arrives. Build after loading; rebuild
+  when the distribution shifts.
+- **HNSW builds that spill.** A build whose graph stops fitting in `maintenance_work_mem` slows sharply, and pgvector notes that
+  vacuuming HNSW indexes can take a while (reindexing first speeds it up).
+
+:::note[What to take forward]
+A hybrid query needs one access path per predicate: GIN on a stored `tsvector`, HNSW or IVFFlat on the embedding, and an index
+the filter can seek. Exact indexes such as GIN and B-tree can be filtered afterwards without losing rows; an approximate index
+cannot, because after `ef_search` candidates or `probes` lists a selective filter leaves true neighbors unreturned. The fixes are
+index-set and engine decisions: a B-tree for exact pre-filtering, a scan that resumes until enough rows pass (pgvector iterative
+scans), an engine that filters inside the walk (Lucene, Qdrant) and still wants an index on the filter, or partial indexes and
+partitions that give each tenant its own graph. The
+filter's B-tree is the cheapest index in the set and the one that decides whether the results are correct.
+:::

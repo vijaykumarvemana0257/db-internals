@@ -151,6 +151,28 @@
             }
           }
         ]
+      },
+      {
+        "label": "2.9 Tries, Learned and Vector Indexes",
+        "collapsed": true,
+        "items": [
+          {
+            "autogenerate": {
+              "directory": "p02-storage-engines/tries-learned-and-vector-indexes"
+            }
+          }
+        ]
+      },
+      {
+        "label": "2.10 Index Selection and Query-Aware Indexing",
+        "collapsed": true,
+        "items": [
+          {
+            "autogenerate": {
+              "directory": "p02-storage-engines/index-selection-strategy"
+            }
+          }
+        ]
       }
     ]
   }

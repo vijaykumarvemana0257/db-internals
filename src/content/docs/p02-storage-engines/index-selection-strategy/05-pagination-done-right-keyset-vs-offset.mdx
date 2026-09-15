@@ -1,0 +1,216 @@
+---
+title: 'Pagination done right: keyset vs OFFSET'
+description: Why OFFSET pagination reads and discards every earlier row and shifts under concurrent writes, how keyset pagination turns each page into one index range seek on a unique sort key, which predicate forms PostgreSQL and MySQL can actually seek on, and why page counts become estimates.
+depth: intermediate
+sidebar:
+  order: 5
+---
+
+import KeysetOffsetPaginationLab from '../../../../components/viz/KeysetOffsetPaginationLab';
+
+The obvious paging query, `ORDER BY created_at, id LIMIT 20 OFFSET 40000`, makes the database find, read and throw away 40,000 rows
+on every request, so page *n* costs work proportional to *n*. And a position is not a stable address: when rows are inserted or deleted
+above it, the same OFFSET points at different rows, and the user sees some twice and others never.
+
+Keyset pagination (also called seek or cursor pagination) remembers the last key the client saw and asks for the rows *after* it. With the
+right index, every page is one B-tree descent and a short walk along the leaves, however deep it is.
+
+<KeysetOffsetPaginationLab client:visible />
+
+## What OFFSET actually executes
+
+PostgreSQL's `Limit` node (`nodeLimit.c`) is a loop: on the first call it pulls tuples from its
+child and discards them until it has passed `offset` of them, then hands the next `count` upward. The child does not know which
+rows will be thrown away. An Index Scan below it [descends to the first leaf](../../../p02-storage-engines/b-trees-and-variants/01-b-tree-structure-invariants-and-search/),
+follows the right-links along the leaf chain, and fetches the heap tuple for every entry, discarded or not. The manual agrees: "The rows skipped by an OFFSET clause still have to be computed inside the server; therefore a large OFFSET might be
+inefficient." If the child is a Sort, the Limit node passes it a bound of `offset + count` (`compute_tuples_needed`), so the
+bounded top-N sort has to keep that many rows.
+
+The lab's **Cost per request** panel models a one-million-row PostgreSQL 17 table with an index on `(created_at, id)`. Its shape
+comes from a real table: two internal B-tree levels, 261 entries per leaf page and 30 rows per 8 KB heap page. Running
+`EXPLAIN (ANALYZE, BUFFERS)` on that table gave these numbers, and the lab's formula reproduces them to within two buffers:
+
+| Query, all with `LIMIT 20` | Index scan rows | Buffers |
+|---|---|---|
+| `OFFSET 0` | 20 | 4 |
+| `OFFSET 10000` | 10,020 | 375 |
+| `OFFSET 100000` | 100,020 | 3,720 |
+| `OFFSET 500000` | 500,020 | 18,586 |
+| `OFFSET 500000`, index-only (`SELECT id, created_at`) | 500,020 | 1,919 |
+| `OFFSET 100000`, same rows stored in random heap order | 100,020 | 100,404 |
+| Keyset `WHERE (created_at, id) > (…)`, mid-table | 20 | 5 (23 in random heap order) |
+
+Drag **Page** to the far right. At page 50,000 the OFFSET lane reads a million index entries to return 20 and touches 37,168 buffers;
+the keyset lane reads 20 entries and 5 buffers. The log-log chart shows the shape: OFFSET's cost is a straight line of slope one,
+keyset's is flat. Then change **Row access**:
+
+- **Heap fetch, table stored in random order.** The heap is not in index order ([`pg_stats.correlation`](../01-selectivity-correlation-and-the-decision-to-build-an-index/) near zero), so nearly every
+  discarded row lives on a different heap page. OFFSET's buffers now track rows one for one: over a million at the last page.
+- **Index-only scan.** The index covers the `SELECT` list and the visibility map says every page is all-visible, so the heap is never
+  read (see [covering indexes](../03-covering-indexes-and-index-only-scans/)). OFFSET drops to 3,835 buffers at the last page. That is a
+  smaller constant, not a different curve: every discarded entry is still read.
+
+The chart's right-hand axis assumes every buffer is an uncached 20 µs NVMe read. A warm cache lowers both lines without bending OFFSET's.
+
+MySQL has the same shape: the server layer applies the offset to rows InnoDB hands it. On a 200,000-row MySQL 9.1 table with
+`FORCE INDEX`, `LIMIT 100000, 20` incremented `Handler_read_next` 100,019 times; without the hint, the optimizer chose a full table
+scan and a sort limited to 100,020 rows. A **deferred join**, `SELECT e.* FROM events e JOIN (SELECT id FROM events ORDER BY created_at, id
+LIMIT 100000, 20) AS page USING (id)`, does the skipping in a covering index scan and makes only 20 primary-key lookups. The constant
+shrinks; the work is still proportional to the offset.
+
+## What OFFSET does when rows move
+
+A page number is a promise about positions, and positions shift. Switch the lab to **Paging under concurrent writes**. Both readers
+page a feed newest first, `ORDER BY created_at DESC, id DESC`, and the writes you choose land between their requests.
+
+With the default **Inserts at the top, per request** of 3, the lab is already on page 2. Page 1 was rows 1000000 down to 999991. Three
+new rows then arrived at the top, everything moved down three places, and `OFFSET 10` now begins at 999993: page 2 opens with three rows
+the user has already seen. The keyset reader asked for rows after `('20:35:30', 999991)` and starts at 999990. The three new rows sit above
+its cursor, which is correct; they appear when the user goes back to the top.
+
+Now set inserts to 0 and **Deletes of rows already seen** to 2. Two rows the reader had already passed are deleted, the rest shift up
+two places, and OFFSET steps over two rows nobody deleted; the lab lists them under **skipped**. A job that deletes each page it processes and then
+asks for the next offset skips every other page. Keyset is unaffected by both kinds of write: its next page is defined by a key, not a count.
+
+Even with no writes, OFFSET needs a total order: each `LIMIT`/`OFFSET` pair can get its own plan, so the PostgreSQL manual asks for an `ORDER BY`
+that "constrains the result rows into a unique order", and MySQL's manual says tied rows may come back in any order.
+
+## Keyset pagination
+
+Keyset pagination makes the last row of each page the bookmark:
+
+```sql
+-- first page
+SELECT * FROM events ORDER BY created_at, id LIMIT 20;
+
+-- next page: $1, $2 are created_at and id of the last row returned
+SELECT * FROM events
+WHERE (created_at, id) > ($1, $2)
+ORDER BY created_at, id
+LIMIT 20;
+```
+
+With a B-tree on `(created_at, id)`, PostgreSQL uses the row comparison as an index condition. The plan shows
+`Index Cond: (ROW(created_at, id) > ROW(…))`, the scan descends straight to the first entry after the cursor, and the Limit stops it after
+20 rows. The cost is one root-to-leaf descent plus the page, O(log N + m), the same on page 50,000 as on page 2. The index has to match the
+`ORDER BY` column for column, directions included, which is the [composite index](../02-composite-indexes-and-the-leftmost-prefix-rule/) rule.
+In InnoDB an index declared on `(created_at)` alone already qualifies when `id` is the primary key: InnoDB appends the primary key to
+every secondary index, and the optimizer uses it for range access and sorting.
+
+The trade is navigation: there is no "jump to page 4,000", because nothing finds the 80,000th key without counting. The previous page is the
+same query with the comparison and sort flipped and the rows reversed in the application; whether a next page exists is answered by fetching
+`LIMIT 21` and returning 20.
+
+### The tiebreaker is not optional
+
+`created_at` alone is not a key. A cursor that remembers only a shared timestamp cannot say where inside the group it stopped: `created_at < $1`
+skips the unseen rest of the group, and `<=` repeats the part already shown. Appending a unique column, usually the primary key, to both the
+`ORDER BY` and the cursor makes every position unique.
+
+The lab's feed gives three rows each timestamp. Set all three write sliders to 0 and clear **Cursor includes the id tiebreaker**. Page 2 ends at
+999981, and the lab immediately lists 999980 and 999979 as skipped: they share 999981's timestamp, so `created_at < '20:35:26'` can never return them.
+
+The cursor must also carry full precision. PostgreSQL's `timestamptz` resolves to the microsecond and JavaScript's `Date` to the millisecond, so a
+cursor that round-trips through a `Date` loses or repeats rows at page boundaries.
+
+### What keyset guarantees, and what it doesn't
+
+A row that exists for the whole session and whose sort key never changes is returned exactly once, whatever is inserted or deleted around it.
+The guarantee stops at mutable keys: sort by `updated_at` or a score, and a row that changes while the user pages can jump behind the cursor. Turn
+the tiebreaker back on and set **Unseen rows bumped to the top** to 1. Keyset reports one skipped row and no duplicates; OFFSET reports the same skip
+plus a duplicate, because the move also shifted positions.
+
+## Writing the predicate so the index can seek
+
+The row comparison `(created_at, id) > ($1, $2)` means `created_at > $1 OR (created_at = $1 AND id > $2)`. PostgreSQL's manual defines it exactly
+that way: the elements are compared left to right, stopping at the first pair that is unequal or null. On non-null columns the two spellings return the same rows. They
+do not get the same plan.
+
+Choose the `OR` form in the lab's **Keyset predicate** and, on any page but the last, the keyset lane becomes a copy of the OFFSET lane: same entries read, same buffers. That is
+what PostgreSQL 17 did on the real table. The `OR` is not an index condition, so the planner used the index only for its order, started at the first
+entry and applied the predicate as a `Filter`: `Rows Removed by Filter: 500001` and 18,586 buffers, which is the cost of `OFFSET 500000` dressed up as
+keyset. Near the end of the table, with a few hundred rows or fewer past the cursor (the lab's last page), the planner switches to a `BitmapOr` of
+two index conditions plus a `Sort`: 8 buffers. The third form repeats the leading column as a plain bound, `created_at >= $1 AND (created_at > $1 OR (created_at = $1 AND id > $2))`. That bound
+became `Index Cond: (created_at >= …)`, the scan started at the cursor's timestamp, the filter removed that timestamp's two rows up to the cursor, and the
+page cost 5 buffers.
+
+MySQL is the mirror image. Its manual shows `c1 = 1 AND (c2, c3) > (1, 1)` using one column of a three-column key, and all three once rewritten as
+`c2 > 1 OR ((c2 = 1) AND (c3 > 1))`. On the MySQL 9.1 test table even a row comparison covering the index prefix got no range: `(created_at, id) > (…)`
+at row 100,001 ran as a `Filter` over an `Index scan` from the start, with `Handler_read_next` at 100,020. The `OR` form and the leading-bound form each ran
+as an `Index range scan` with `Handler_read_next` at 19.
+
+| Keyset predicate | PostgreSQL 17 | MySQL 9.1 |
+|---|---|---|
+| `(created_at, id) > ($1, $2)` | Index Cond: seek | Filter over an index scan from the start |
+| `created_at > $1 OR (created_at = $1 AND id > $2)` | Filter over an index scan from the start | Index range scan: seek |
+| `created_at >= $1 AND (created_at > $1 OR …)` | Index Cond on `created_at`: seek | Index range scan: seek |
+
+The last form is the portable one. Whatever you write, confirm it with `EXPLAIN`: in PostgreSQL the cursor belongs in `Index Cond` and
+`Rows Removed by Filter` should stay small; in MySQL you want a range scan.
+
+### Mixed directions
+
+For `ORDER BY created_at DESC, id ASC`, no single row comparison describes "after the cursor", because the two columns run in opposite directions.
+`(created_at, id) < ($1, $2)` is still accepted as an index condition on an index declared `(created_at DESC, id ASC)`. It is fast, and wrong. On the test
+table, with the cursor on row 500001, the second of four rows sharing a timestamp, it returned row 500000, which had already been shown, and skipped
+500002 and 500003. Expand the predicate by hand, one direction per column:
+
+```sql
+WHERE created_at <= $1
+  AND (created_at < $1 OR (created_at = $1 AND id > $2))
+ORDER BY created_at DESC, id ASC
+LIMIT 20;
+```
+
+The index must be declared with the same directions, or all of them inverted so a backward scan serves it.
+
+### NULLs
+
+A comparison with a null is null, so the row is filtered out. With a nullable `ts` ordered `ORDER BY ts NULLS LAST, id`, `WHERE (ts, id) > (10, 1)`
+returned the later non-null rows and never the null ones: the pages simply ended early. The expansion has to say where nulls sort. While the cursor's
+`ts` is non-null, add `OR ts IS NULL`; once the cursor's `ts` is null, the next page is `ts IS NULL AND id > $2`. A `NOT NULL` sort column removes the branch.
+
+## The cursor token
+
+Hand the bookmark to clients as an opaque string, not as `?after_created_at=…&after_id=…`; the GraphQL Cursor Connections specification calls a cursor
+"an opaque string". Inside, encode the last row's sort tuple at full precision, the sort and filter it belongs to and a format version.
+Sign it with an HMAC so clients cannot forge it, base64url-encode it, and on the way in reject a cursor issued for a
+different sort or filter. The [list endpoint page](../09-the-list-endpoint-optional-filters-sort-options-and-one-inde/) builds on that.
+
+## Counting without COUNT(*)
+
+"Page 3 of 48,213" needs a total, and an exact total is a full pass. On the test table, `SELECT count(*)` ran as an Index Only Scan over the entire primary
+key, a million entries and 2,737 buffers. InnoDB keeps no stored row count either, because concurrent
+transactions may each see a different number of rows, and counts by traversing the smallest secondary index.
+
+When the number is only for display, use the statistics the planner already keeps:
+
+- **PostgreSQL, whole table.** `pg_class.reltuples` is "only an estimate", updated by `VACUUM`, `ANALYZE` and a few DDL commands such as `CREATE INDEX`,
+  and -1 if the table was never vacuumed or analyzed. The planner scales it by the density `reltuples / relpages` times the current number of pages; you
+  can do the same. After the test table's first `VACUUM ANALYZE` it read 999,998.
+- **PostgreSQL, filtered.** Run `EXPLAIN (FORMAT JSON)` on the query and read the top node's `Plan Rows`. For `created_at >` a mid-table timestamp, the
+  estimate was 493,929 against a true 499,997.
+- **MySQL.** For InnoDB, `information_schema.TABLES.TABLE_ROWS` "may vary from the actual value by as much as 40% to 50%" and is cached for
+  `information_schema_stats_expiry` seconds (86,400 by default). `SQL_CALC_FOUND_ROWS` with `FOUND_ROWS()` is deprecated.
+
+A capped exact count is often the best interface: `SELECT count(*) FROM (SELECT 1 FROM events WHERE … LIMIT 1001) AS t` reads at most 1,001 rows and lets
+you print "1,000+". With keyset pagination the interface usually needs only "is there more", which `LIMIT m + 1` answers.
+
+## Where it bites in production
+
+- **Deep pages get slower in proportion to depth.** A crawler or export job asks for `OFFSET 900000`. Latency tracks the offset parameter, and the index scan
+  node's actual rows equal offset plus limit. Switch to keyset, or cap the offset.
+- **Jobs that delete as they page skip rows.** Deleting processed rows under an advancing OFFSET skips every other page; page on the key instead.
+- **"Keyset" that still walks from the start.** A bare `OR` expansion in PostgreSQL, or a row constructor in MySQL, can read and discard every earlier entry.
+  `Rows Removed by Filter` or `Handler_read_next` growing with depth gives it away.
+- **Duplicates at page boundaries.** A cursor without a unique tiebreaker, or with a timestamp truncated to milliseconds, repeats or loses rows sharing the
+  boundary value, and tests with unique timestamps never show it.
+- **The count costs more than the page.** A 5-buffer keyset page next to an exact `COUNT(*)` still pays a full index pass per request. Estimate the count, cap
+  it or drop it.
+
+:::note[What to take forward]
+OFFSET produces and discards every earlier row, so page *n* costs work proportional to *n*, and it counts positions, so inserts above the reader repeat rows and
+deletes skip them. Keyset pagination seeks past the last key returned, on a unique sort tuple with a matching index: every page is one descent plus the page, and
+every row with an unchanging key is returned once. Write the predicate in a form your engine turns into an index condition (the leading-bound expansion works in both
+engines), expand it by hand for mixed directions and nulls, hand it out as a signed opaque token, and show counts from estimates.
+:::

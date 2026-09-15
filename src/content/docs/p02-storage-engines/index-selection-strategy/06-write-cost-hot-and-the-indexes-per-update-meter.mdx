@@ -1,0 +1,156 @@
+---
+title: Write cost, HOT and the indexes-per-update meter
+description: What each secondary index adds to every INSERT, UPDATE and DELETE, why changing one indexed column makes every index pay, what deduplication, bottom-up deletion and the change buffer recover, and how to find indexes that do not earn their keep.
+depth: deep
+sidebar:
+  order: 6
+---
+
+import IndexesPerUpdateMeterLab from '../../../../components/viz/IndexesPerUpdateMeterLab';
+
+An index pays for itself on the queries that use it. It costs something on every write to the table, whether a query ever uses it or not. Five indexes on a busy table mean five extra B-trees to change on each insert. In PostgreSQL they can also mean five extra B-trees on each update, and five indexes for VACUUM to read end to end.
+
+<IndexesPerUpdateMeterLab client:visible />
+
+## What one write costs, per index
+
+| Operation | PostgreSQL | InnoDB |
+|---|---|---|
+| `INSERT` | a heap tuple, plus one new entry in **every** index | a clustered-index record, plus one entry in every secondary index |
+| `UPDATE`, no indexed column changed | HOT: the heap page only, **if** the new version fits on the same page. Otherwise, a new entry in every index | the clustered record only |
+| `UPDATE` that changes an indexed column | a new entry in **every** index, including the ones whose key did not change | the clustered record, plus a delete-mark and an insert in only the secondary indexes whose key changed |
+| `DELETE` | nothing in any index at the time of the delete | a delete-mark in the clustered index and in every secondary index |
+
+The PostgreSQL rows come from `heap_update`. If the new version fits on the old page and no column used by any index changed value, `update_indexes` is `TU_None`. The check compares old and new bytes, not the SQL, so `SET status = status` blocks nothing. Otherwise it is `TU_All`, and `ExecInsertIndexTuples` inserts into each index on the table. The B-tree documentation says it directly: changing one column covered by one index "always necessitates a new set of index tuples — one for each and every index on the table". Since PostgreSQL 16 the one exception is BRIN: an update that changes only columns used by summarizing indexes can still be HOT.
+
+A PostgreSQL `DELETE` only sets `xmax` on the heap tuple. A `pg_waldump` of one delete on a table with three B-tree indexes shows a 54-byte `Heap DELETE` record, the commit, and nothing else. The index entries still point at the dead tuple, and cleaning them up is deferred.
+
+The lab starts with seven B-tree indexes on `orders`, and its UPDATE sets `status` and `updated_at`, the kind of statement an ORM issues. The meter reads **7**: every UPDATE writes seven index tuples, and HOT is 0%. The detector marks `orders_status_idx` and `orders_updated_at_idx` with **blocks HOT**.
+
+- Uncheck `orders_updated_at_idx` and press **+1 minute**. The meter drops to 6, and HOT stays at 0%, because `orders_status_idx` still blocks it.
+- Set **UPDATE orders SET** to `total, updated_at` and press **+1 minute** again. More than 90% of updates are now HOT, and the meter falls below 0.5.
+
+## Tuples become pages and WAL
+
+Each index tuple is also a WAL record. In the same `pg_waldump` output, inserting a row into a table with a `bigint` primary key and two single-column indexes produced a 143-byte `Heap INSERT` and three `Btree INSERT_LEAF` records of **64 bytes** each. A non-HOT update of one indexed column produced a 72-byte `Heap UPDATE` and the same three 64-byte records. With several indexes, the index records outweigh the heap record.
+
+Pages cost more than records. With `full_page_writes` on (the default), the first change to a page after a checkpoint writes the entire page into WAL, up to 8 KB. `checkpoint_timeout` defaults to 5 minutes. So what an index really costs depends on how many distinct pages it dirties in each interval:
+
+- **Ascending keys** (`id`, `created_at`, `updated_at`) land on the rightmost leaf. Many inserts share a few dirty pages.
+- **Random keys** (a UUID, or `customer_id` first) scatter inserts across the index. Once an interval has more inserts than the index has leaves, nearly every leaf is dirtied, and gets a full-page image, every time.
+
+In the lab, press **+1 minute** ten more times after those steps, then compare **Pages dirtied/min** for `orders_created_at_idx` and `orders_external_ref_key`. Both get one entry per insert and per non-HOT update. The ascending index falls to about 5 pages a minute, and the random-key index stays near 75. The [fill factor page](../../../p02-storage-engines/b-trees-and-variants/04-fill-factor-fragmentation-and-splits-under-load/) covers the rest of the random-key cost: half-empty leaves after splits, and a write working set that spans the whole index.
+
+The **throughput** bar is a model, not a benchmark. It assumes an I/O-bound write path, where throughput is inversely proportional to the WAL bytes plus dirtied 8 KB pages per row write. Its baseline is the same table with no indexes, fed the identical stream of operations. With all seven indexes it sits around 40%. Dropping `orders_updated_at_idx` barely moves it, because an ascending index dirties few pages. Its real cost was blocking HOT: ten minutes after the SET-list change, the gauge is near 54%.
+
+## The heap decides whether the indexes are touched at all
+
+The [HOT updates page](../../../p02-storage-engines/pages-tuples-heap-files/04-hot-updates-redirect-line-pointers-and-opportunistic-page-pr/) explains both HOT conditions. From the index side, the second one matters: when the new version does not fit on its page, the update writes into every index even though no indexed column changed.
+
+The same-page check in `heap_update` compares `PageGetHeapFreeSpace` with the new tuple's size and ignores fillfactor. Fillfactor acts earlier, by stopping inserts from filling the page. That room is reused only when pruning removes old versions, and pruning cannot remove a version the oldest open snapshot might still need. So the fillfactor you need depends on how many versions of hot rows pile up on a page while that snapshot stays open.
+
+Set **UPDATE orders SET** to `total only` and **Oldest open snapshot** to 30 s. Fillfactor applies only to pages written after it changes, so press **Reset table** after each setting, then run 10 minutes. At fillfactor 100 about 91% of updates are HOT, at 90 about 95%, and at 80 about 99%.
+
+Now pick a 10-minute snapshot, like a session left `idle in transaction`. HOT falls to 38% at fillfactor 100, and 70 does no better than 80, at about 69%. No fillfactor holds ten minutes of versions. At fillfactor 100, autovacuum runs every minute: vacuum cannot remove tuples the snapshot might still see, so the dead-tuple count stays over its threshold.
+
+## Where the dead entries go
+
+Every non-HOT update and every delete leaves an index entry pointing at a dead tuple. `VACUUM` removes these entries by reading every index from start to end. Since PostgreSQL 14 it skips that pass when fewer than 2% of the table's pages have dead line pointers. Two B-tree features remove much of this garbage before VACUUM arrives.
+
+**Deduplication** (PostgreSQL 13) stores a run of equal keys once, followed by a sorted array of 6-byte heap TIDs. See the [key layout page](../../../p02-storage-engines/b-trees-and-variants/06-key-layout-prefix-compression-and-suffix-truncation/#deduplication-one-key-many-tids). It shrinks low-cardinality indexes such as `status`, and it absorbs extra versions of the same row.
+
+**Bottom-up index deletion** (PostgreSQL 14) goes after dead versions directly. During a non-HOT update, the executor passes an `indexUnchanged` hint to each index whose key columns are not in the SET list. The hint reads the SET list, not the values, so an ORM that writes every column back denies it to every index. When a leaf is about to split, `_bt_delete_or_dedup_one_page` tries, in order:
+
+1. deleting entries whose `LP_DEAD` bit an earlier index scan set;
+2. if the incoming tuple carries the hint, a bottom-up pass: checking the page's duplicate TIDs against the heap and deleting those no snapshot can still see;
+3. deduplicating the page.
+
+Only if none of these makes room does the page split. The documentation says an index that updates never logically change may "never increase by even one single page/block despite constant version churn".
+
+A measured run on PostgreSQL 17.3 shows where it works and where it stops. The table had 50,000 rows, a `bigint` primary key, an index on `a` and an index on the timestamp `c`, with autovacuum off. It took 50,000 single-row, individually committed `UPDATE … SET c = clock_timestamp()` statements across 5,000 rows. None was HOT, so each wrote three index tuples. Leaf pages:
+
+| Index | Before | After 50,000 updates |
+|---|---|---|
+| primary key `id` (not in the SET list) | 137 | 151 |
+| `a` (not in the SET list) | 137 | 151 |
+| `c` (the updated column) | 42 | 179 |
+
+The two indexes with unchanged keys got the hint and absorbed 50,000 new entries by deleting old versions. The index on `c` never got a hint, because its key changes on every update. Its dead entries wait for VACUUM. Run as ten 5,000-row statements instead, the same updates grew the primary key to 164 pages and `a` to 178, because versions from a running transaction cannot be deleted.
+
+Restore the starting controls (all seven indexes, `status, updated_at`, fillfactor 100, no long snapshot), then switch between **PostgreSQL 12** and **PostgreSQL 14+**, pressing **+1 minute** until minute 60 on each. `orders_pkey` reaches about 455 pages on 12 and 190 on 14+, and `orders_status_idx` about 596 against 134. `orders_updated_at_idx` ends near 468 pages on both, with bloat above 60%: no version gives a hint to an index whose key the UPDATE changes.
+
+## InnoDB: fewer index writes, and the change buffer
+
+InnoDB secondary index entries hold the primary key, not a physical location. An update touches a secondary index only when `row_upd_changes_ord_field_binary` finds that one of its ordering columns changed, and then writes a delete-mark and an insert. An `updated_at` index costs InnoDB two entry changes per update in that one index. It does not force a write to every index. **Show the numbers** under the lab counts entries per operation for both engines.
+
+The **change buffer** avoids reading index pages that are not in memory. If a secondary index leaf is not in the buffer pool, the insert, delete-mark or purge is recorded in the change buffer instead. The change is merged later: when a read brings the page into the buffer pool, when the main thread is nearly idle, or during a slow shutdown. Its limits come from `ibuf_should_try` and the manual:
+
+- **Unique secondary indexes are not buffered**, because checking uniqueness requires reading the page.
+- Clustered, full-text and spatial indexes, and indexes with a descending column, are not buffered.
+- `innodb_change_buffer_max_size` defaults to 25% of the buffer pool, with a maximum of 50.
+- `innodb_change_buffering` defaults to `all` in MySQL 8.0 and `none` in MySQL 8.4.
+
+The manual warns that merging "may take several hours when there are many affected rows and numerous secondary indexes". It also suggests the buffer gains little on SSDs or when data fits in memory. Current MariaDB 10.6 releases also default to `none`, and MariaDB 11.4 no longer has the variable.
+
+## Finding indexes that do not pay for themselves
+
+PostgreSQL counts scans per index in `pg_stat_user_indexes.idx_scan`, and PostgreSQL 16 added `last_idx_scan`. This query lists never-scanned indexes that back no constraint, largest first:
+
+```sql
+SELECT s.relname, s.indexrelname, s.last_idx_scan,
+       pg_size_pretty(pg_relation_size(s.indexrelid)) AS size
+FROM pg_stat_user_indexes s
+JOIN pg_index i USING (indexrelid)
+WHERE s.idx_scan = 0
+  AND NOT i.indisunique
+  AND NOT EXISTS (SELECT 1 FROM pg_constraint c WHERE c.conindid = s.indexrelid)
+ORDER BY pg_relation_size(s.indexrelid) DESC;
+```
+
+Before dropping anything, rule out three traps:
+
+- **Statistics are per server.** A report that runs only on a replica scans the replica's indexes, and the primary records zero. Counters are also reset after a crash, an immediate shutdown, or a restore from a base backup or point-in-time recovery.
+- **A unique index works with zero scans.** The uniqueness check on insert is not an index scan: inserting 1,000 rows into a table with two unique indexes left `idx_scan` at 0 on both. The lab marks `orders_external_ref_key` with **0 scans, but UNIQUE**.
+- **Rare queries still count.** An index used only by a month-end job shows zero scans for most of the month.
+
+The other waste is a **redundant prefix**: `(customer_id)` next to `(customer_id, created_at)`. By the [leftmost-prefix rule](../02-composite-indexes-and-the-leftmost-prefix-rule/), the longer index serves every query the shorter one does. The exception is a shorter index that is unique, [partial, an expression index](../04-partial-and-expression-indexes/) or has [`INCLUDE` columns](../03-covering-indexes-and-index-only-scans/), or that differs in operator class, collation or sort direction. This query excludes all of those:
+
+```sql
+SELECT i.indexrelid::regclass AS redundant, j.indexrelid::regclass AS covered_by
+FROM pg_index i
+JOIN pg_index j ON j.indrelid = i.indrelid AND j.indexrelid <> i.indexrelid
+ AND (j.indnkeyatts > i.indnkeyatts
+      OR (j.indnkeyatts = i.indnkeyatts AND j.indexrelid < i.indexrelid))
+WHERE NOT i.indisunique AND i.indnatts = i.indnkeyatts AND j.indisvalid
+  AND i.indpred IS NULL AND j.indpred IS NULL
+  AND i.indexprs IS NULL AND j.indexprs IS NULL
+  AND (j.indkey::int2[])[0:i.indnkeyatts - 1]      = (i.indkey::int2[])[0:i.indnkeyatts - 1]
+  AND (j.indclass::oid[])[0:i.indnkeyatts - 1]     = (i.indclass::oid[])[0:i.indnkeyatts - 1]
+  AND (j.indcollation::oid[])[0:i.indnkeyatts - 1] = (i.indcollation::oid[])[0:i.indnkeyatts - 1]
+  AND (j.indoption::int2[])[0:i.indnkeyatts - 1]   = (i.indoption::int2[])[0:i.indnkeyatts - 1];
+```
+
+MySQL's `sys` schema has both checks. `sys.schema_unused_indexes` lists indexes with `COUNT_STAR = 0` in `performance_schema.table_io_waits_summary_by_index_usage`, excluding `PRIMARY` and unique indexes. The manual warns it means little until the server has run a representative workload. `sys.schema_redundant_indexes` flags identical indexes, non-unique leading prefixes of another index, and indexes that start with a whole unique index, and prints the `DROP INDEX` statement for each. In PostgreSQL, use `DROP INDEX CONCURRENTLY` so writes are not blocked.
+
+## Measuring bloat, and rebuilding
+
+`pgstattuple` reports a table's `dead_tuple_percent` and `free_percent`. `pgstatindex` reports a B-tree's `leaf_pages`, `avg_leaf_density` and `leaf_fragmentation`. Both can mislead. `pgstatindex` computes density from the free space on each page, so a dead entry counts as used space.
+
+In the run above, before any VACUUM, `pgstatindex` on the `c` index reported 179 leaf pages at **89.92%** density, although about 50,000 of its entries pointed at dead tuples. `pgstattuple` on the heap counted 77 dead tuples, because pruning had already reclaimed the rest. `REINDEX INDEX CONCURRENTLY` rebuilt the index into 52 pages. Judge an index by its size against the rows it covers, or by `pgstatindex` before and after a VACUUM.
+
+`REINDEX … CONCURRENTLY` (PostgreSQL 12+) builds a replacement next to the old index and swaps them. It scans the table twice per index, waits for transactions that could use the old index, cannot run inside a transaction block, and allows one concurrent build per table. If it fails, it leaves an `INVALID` index named `…_ccnew` that, as the manual puts it, "will still consume update overhead". Drop it and retry.
+
+In the lab, with the same starting settings on PostgreSQL 14+, press **Reset table**, run to minute 40 and press **REINDEX CONCURRENTLY**. Every index's bloat drops to about zero, and `orders_external_ref_key` shrinks from about 381 pages to 230. Ten minutes later it is back to 377, and after twenty minutes 445. Random inserts split the leaves the rebuild packed to 90%, in half. A rebuild does not change what random keys do to an index, so rebuilding one on a schedule mostly buys WAL.
+
+## Where it bites in production
+
+- **An `updated_at` index makes every update expensive.** When an ORM sets `updated_at` on every save, an index on it makes every UPDATE on the table write to every index. The symptom is a falling `n_tup_hot_upd / n_tup_upd` ratio, growing indexes and busier autovacuum, not a slow query.
+- **Long transactions stop every cleanup at once.** Pruning, bottom-up deletion and VACUUM all respect the oldest snapshot, so indexes grow while autovacuum loops removing nothing. Check `max(age(backend_xmin))` in `pg_stat_activity` and `xmin` in `pg_replication_slots`.
+- **One huge UPDATE splits more pages than many small ones.** Its own versions cannot be deleted until it commits, so bottom-up deletion cannot help.
+- **Dropping an index because a counter said zero.** Check `last_idx_scan`, and the counters on every replica, first.
+- **A failed concurrent build still costs writes.** Look for `indisvalid = false` in `pg_index`.
+- **Upgrading to MySQL 8.4 turns change buffering off.** An I/O-bound, index-heavy workload that relied on it now reads uncached secondary index pages inside the write itself.
+
+:::note[What to take forward]
+In PostgreSQL, an UPDATE writes to no index or to every index. The deciding questions are whether the UPDATE changes the value of any column an index uses, and whether the new version fits on its page. Deduplication and bottom-up deletion keep indexes whose keys an update did not change from growing. They cannot help an index whose key did change, or remove garbage an open snapshot still needs. Before dropping an index, confirm on every server that it is unused, not unique, and not needed by a rare query. Rebuild when size against row count shows real bloat, not on a schedule.
+:::

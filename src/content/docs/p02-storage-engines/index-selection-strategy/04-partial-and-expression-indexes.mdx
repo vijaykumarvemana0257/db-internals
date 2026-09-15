@@ -1,0 +1,251 @@
+---
+title: Partial and expression indexes
+description: How PostgreSQL decides a partial index is usable by proving the query's WHERE clause implies the index predicate, why expression indexes need a matching expression and IMMUTABLE functions, and what generated columns, MySQL functional key parts, SQLite and SQL Server offer instead.
+depth: intermediate
+sidebar:
+  order: 4
+---
+
+import PartialIndexPredtestLab from '../../../../components/viz/PartialIndexPredtestLab';
+import SoftDeleteIndexSizeLab from '../../../../components/viz/SoftDeleteIndexSizeLab';
+
+An ordinary index holds one entry for every row, keyed on column values. A **partial index** holds entries only for
+rows that satisfy a `WHERE` clause; an **expression index** is keyed on a computed value such as `lower(email)`. Both
+can be far smaller or far more useful than the plain version, and both come with a contract that is easy to break. The
+planner uses them only when it can show, from the query text alone, that the index holds every row the query needs, or
+exactly the value the query compares. When that proof fails, nothing warns you: the plan just never picks the index.
+
+<PartialIndexPredtestLab client:visible />
+
+## What a partial index stores
+
+```sql
+CREATE INDEX orders_live_customer ON orders (customer_id, created_at) WHERE deleted_at IS NULL;
+```
+
+Rows for which the predicate is true get an entry; rows for which it is false **or NULL** do not. The predicate may use
+any column of the table, not just the keys, but no subqueries or aggregates, and every function and operator in it must
+be `IMMUTABLE`.
+
+The common uses are a **hot subset** of a big table (live rows under soft delete, `status = 'pending'` jobs in a queue),
+**conditional uniqueness**, and **excluding common values** that no query would look up through an index anyway. A row
+that fails the predicate is also a row whose insert never touches the index.
+
+## Size is the subset
+
+The second lab builds both versions of the soft-delete index on an `orders` table and runs the query a list page would
+send: one customer's newest 20 live orders.
+
+<SoftDeleteIndexSizeLab client:visible />
+
+The sizes follow from PostgreSQL's page layout. An entry for `(customer_id bigint, created_at timestamptz)` is an
+8-byte index tuple header, 16 bytes of key and a 4-byte line pointer. `CREATE INDEX` fills leaves to fillfactor 90 and
+internal pages to 70, so 261 entries fit per leaf and 203 per internal page. Built for real on PostgreSQL 17, one million
+rows gave a 3,853-page full index and, with 50,067 rows (5%) live, a 194-page partial one — the counts this arithmetic
+gives.
+
+At the default one million rows and **5% live**, the full index is 30 MB and three levels deep; the partial index is
+1.5 MB and two levels. That is more than a disk saving: the small index is far more likely to stay cached, and every
+descent is shorter.
+
+The lookup is where the gap becomes latency. The full index holds all 2,000 of the customer's orders, deleted or not,
+and cannot see `deleted_at`, so the plan is an index scan with `Filter: (deleted_at IS NULL)` and every entry costs a
+heap fetch just to learn whether the row is wanted. In the lab, finding 20 live rows reads 408 entries and discards 388 —
+what `EXPLAIN ANALYZE` reports as `Rows Removed by Filter` — and touches 412 pages. The partial index reads 20 entries, has no
+`Filter` line and touches 22 pages.
+
+Drag **Live rows** down to 1%: the full index reads 1,716 entries. At 0.5% it reads all 2,000 and still returns only 12
+rows. At 100% the two indexes are identical. The full index costs roughly `LIMIT / live fraction` heap fetches; the
+partial index pays off exactly as far as its predicate is selective.
+
+## The contract: the query must imply the predicate
+
+A partial index is only correct for a query if every row the query could return is in the index. PostgreSQL's
+documentation states the rule: the index can be used only if the planner can recognize that the query's `WHERE`
+condition **mathematically implies** the index predicate. It then adds that there is no sophisticated theorem prover
+behind that recognition. The prover is `src/backend/optimizer/util/predtest.c`, and the lab above runs a
+reduction of it.
+
+The planner runs it once per partial index, in `check_index_predicates()`, against the relation's restriction
+clauses plus any join clauses that can be applied to it. If `predicate_implied_by()` fails, the index gets no path at
+all — not a costed-and-rejected one. The only second chance is a `BitmapOr`: for each arm of an `OR` clause, the proof is
+retried with that arm added to the other clauses.
+
+### Before the proof: normalization
+
+Both sides have been through `eval_const_expressions()`. Immutable calls on constants are folded, so
+`lower('Ann@Example.com')` is already `'ann@example.com'`. `archived = false` and `archived <> true` both become
+`NOT archived`, and `NOT (amount <= 500)` becomes `amount > 500` because `>` is the negator of `<=`. The parser has
+already turned `BETWEEN` into two comparisons joined by `AND`. Choose **NOT pushed down before the proof**: the clause
+reaches the prover as `amount > 500` and matches exactly. `now()` is not folded: it is `STABLE`, fixed only when the
+query runs.
+
+### The AND/OR rules
+
+`predicate_implied_by_recurse()` classifies each side as an AND, an OR or an atom, and applies these rules:
+
+| Query clause (A) | Index predicate (B) | A implies B when |
+|---|---|---|
+| AND | atom | any item of A implies B |
+| anything but OR | AND | A implies every item of B |
+| OR | atom or AND | every arm of A implies B |
+| atom | OR | A implies any arm of B |
+| AND | OR | A implies any arm of B, or any item of A implies all of B |
+| OR | OR | every arm of A implies some arm of B |
+
+An `IN (...)` list, internally `= ANY(array)`, counts as an OR of equalities when it has at most `MAX_SAOP_ARRAY_SIZE`
+(100) elements; `NOT IN` becomes an AND of `<>`. Choose **IN list expands to an OR**: `amount IN (600, 700)` proves
+`amount > 500` because each arm does. Edit it to `IN (400, 700)` and the first arm fails.
+
+### Proving one atom from another
+
+For two atoms, `predicate_implied_by_simple_clause()` tries, in order:
+
+1. **`equal()`.** The clause is structurally identical to the predicate. This is how `deleted_at IS NULL` proves
+   itself — and the only way an `IS NULL` predicate is ever proved.
+2. **Strictness.** `foo IS NOT NULL` is implied by any clause strict in `foo`, since such a clause cannot be true when
+   `foo` is NULL. Choose **IS NOT NULL proved by a strict operator**.
+3. **`operator_predicate_proof()`.** Both sides must be binary operators with the same collation, from one btree
+   operator family, with one operand `equal()` and the other a `Const` on both sides. `BT_implic_table` then names a
+   *test* operator, and the planner evaluates `predicate_const test_op clause_const` at plan time.
+
+Choose **Range: amount > 600 proves amount > 500**. Clause `>` against predicate `>` means test with `<=`: `500 <= 600`
+is true, so the index qualifies. Switch to **amount >= 500 does not** — `>=` never implies `>` for the same constant.
+Choose **status = 'paid' proves status \<> 'cancelled'**: `<>` counts as strategy 6, and `'cancelled' <> 'paid'` is
+true. The test operator itself must be `IMMUTABLE`, so a cross-type `timestamptz` against `date` comparison, which
+depends on the session time zone, proves nothing: `created_at > date '2026-09-10'` cannot use an index
+`WHERE created_at > '2026-09-01'`, while `created_at > '2026-09-10'` can.
+
+### Implied clauses leave the plan
+
+Once the index qualifies, any query clause that the *predicate* implies is removed from that index path, since every
+row in the index already satisfies it. In the first scenario `deleted_at IS NULL` disappears, leaving
+`Index Cond: (customer_id = 42)`. Tick **Query is UPDATE / DELETE / FOR UPDATE** and it returns as a `Filter`: for
+result relations and locked rows the quals stay, because EvalPlanQual must recheck them against a concurrently updated
+row version.
+
+### What the prover cannot see
+
+- **Anything not a constant.** Choose **now() in the query is not a constant**: `created_at > now() - interval '7 days'`
+  never proves `created_at > '2026-09-01'`, even on a day when it obviously would.
+- **Bind parameters in a generic plan.** Choose **Bind parameter in a generic plan**: `amount > $1` is a `Param`. A custom
+  plan substitutes the value and the proof succeeds; a generic plan (what `plan_cache_mode = force_generic_plan` forces)
+  never can.
+- **Algebra.** `amount + 0 > 600` and `amount::bigint > 600` are not `amount`, and no rule rewrites them.
+
+## Conditional uniqueness
+
+```sql
+CREATE UNIQUE INDEX accounts_email_live ON accounts (email) WHERE deleted_at IS NULL;
+```
+
+Any number of soft-deleted rows may share an email, but only one live row — the standard answer to re-signup after
+delete. Two consequences trip people up. `INSERT ... ON CONFLICT (email)` fails with `there is no unique or exclusion
+constraint matching the ON CONFLICT specification`; the target must restate the predicate,
+`ON CONFLICT (email) WHERE deleted_at IS NULL`, for inference to pick the partial index. And `REFERENCES accounts(email)`
+fails with `there is no unique constraint matching given keys for referenced table`: a foreign key needs a non-partial
+unique index.
+
+## Expression indexes: the planner matches trees, not meaning
+
+```sql
+CREATE INDEX users_email_lower ON users (lower(email));
+```
+
+The index stores `lower(email)`, computed on every insert and non-HOT update and never during a search. To use it, a
+query clause must compare an operand that is `equal()` to the stored expression tree — the test
+`match_index_to_operand()` makes after normalization. Case and whitespace do not matter, and
+`lower(email) = lower('Ann@Example.com')` matches; its right side even folds to a constant, though it only has to be free
+of the table's columns and of volatile functions. Structure does matter:
+
+- **Different function.** Choose **upper() does not match lower()**. `upper(email)` is a different call, and `ILIKE`
+  is a different operator altogether.
+- **Different operator.** Choose **#>> is not ->>**. An index on `(data->>'sku')` serves `data->>'sku' = 'SKU-5'`.
+  `data #>> '{sku}'` returns the same text but is a different operator, and `(data->'sku')::text` returns a different
+  value — the JSON text, quotes included.
+- **Different operand order or an added cast.** An index on `(amount + 1)` does not serve `1 + amount`: `equal()` does
+  not commute. A cast that calls a conversion function, such as `amount::bigint`, adds a node too; only a
+  binary-compatible relabel (`varchar` to `text`) is stripped before the comparison.
+- **Different collation.** Choose **COLLATE "C" on the comparison**. The expression matches, but the index's collation
+  must equal the comparison's collation, and here it does not.
+
+Unlike a partial index predicate, the comparison value may be a parameter or a `STABLE` expression:
+`lower(email) = $1` uses the index in a generic plan too. A new expression index has no statistics until `ANALYZE` runs,
+so until then the planner falls back to default selectivity estimates for it.
+
+## IMMUTABLE, and the functions that are not
+
+`CREATE INDEX` requires every function, operator and cast in the keys and the predicate to be `IMMUTABLE` — its result
+depends only on its arguments — or an entry computed today could disagree with the same expression tomorrow. The errors
+are `functions in index expression must be marked IMMUTABLE` and `... in index predicate ...`. What PostgreSQL 17's
+catalog records for the usual suspects:
+
+| Expression | Underlying function | Volatility |
+|---|---|---|
+| `created_at::date` (timestamptz) | `date(timestamp with time zone)` | STABLE — depends on `TimeZone` |
+| `date_trunc('day', created_at)` | `date_trunc(text, timestamptz)` | STABLE |
+| `date_trunc('day', created_at, 'UTC')` | `date_trunc(text, timestamptz, text)` | IMMUTABLE |
+| `(created_at AT TIME ZONE 'UTC')::date` | `timezone(text, timestamptz)`, then `date(timestamp)` | IMMUTABLE |
+| `concat(a, ':', b)` | `concat(VARIADIC "any")` | STABLE |
+| `a \|\| ':' \|\| b` (text) | `textcat` | IMMUTABLE |
+| `to_char(created_at, 'YYYY-MM')` | `to_char(timestamptz, text)` | STABLE |
+| `unaccent(name)` | contrib `unaccent(text)` | STABLE |
+| `lower(email)` | `lower(text)` | IMMUTABLE |
+
+Choose **created_at::date is STABLE**, then **AT TIME ZONE 'UTC' fixes it**. The fix is a different expression, so
+queries must use the same form: `created_at::date = '2026-09-01'` still misses. The
+[temporal types page](../../../p01-foundations/sql-semantics-types-and-schema-design/02-temporal-types-instants-civil-time-and-dst/)
+explains why the zone must be named. `concat` is `STABLE` because it formats non-text arguments through output functions
+that depend on settings such as `DateStyle`.
+
+Collation is the other hidden input. `lower()` counts as `IMMUTABLE` because its collation is an input fixed in the index
+definition, but a glibc or ICU upgrade can change what that collation means, leaving the index in an order its own
+comparisons no longer agree with until `REINDEX` — the trap on the
+[collation page](../../../p01-foundations/sql-semantics-types-and-schema-design/04-text-encoding-and-collation/).
+
+## Generated columns, and other engines
+
+A **generated column** gives the expression a name, so queries say `WHERE email_lower = $1` and cannot drift.
+PostgreSQL 12 added `GENERATED ALWAYS AS (...) STORED` columns, indexable like any column, with an immutable generation
+expression; the price is storing the value in every row. PostgreSQL 18 added virtual generated columns and made them
+the default, but `CREATE INDEX` refuses them (`indexes on virtual generated columns are not supported`).
+
+**MySQL** has no partial indexes: its `CREATE INDEX` has no `WHERE`. Generated columns arrived in 5.7.6 and InnoDB
+secondary indexes on *virtual* generated columns in 5.7.8. MySQL 8.0.13 added functional key parts, `INDEX ((col1 + col2))`,
+implemented as hidden virtual generated columns with the same restrictions: no subqueries, parameters, variables, stored
+functions or nondeterministic functions such as `NOW()`. Matching is by identical expression here too — the manual's example is that
+an index on `f1 + 1` is not used for `1 + f1`. JSON adds a collation trap: `->>` returns `LONGTEXT`, which a functional key
+part cannot index, so you index `CAST(data->>'$.name' AS CHAR(30))` — but the cast yields the server default collation while
+`->>` yields `utf8mb4_bin`, so a query on `data->>'$.name'` misses the index unless the key part adds
+`COLLATE utf8mb4_bin` or the query repeats the whole `CAST`.
+
+**SQLite** (partial indexes since 3.8.0) uses two rules only: a query term must appear *exactly* as a term of the index
+predicate, and `z IS NOT NULL` is matched by any comparison on `z`. On SQLite 3.51 an index `WHERE amount > 500` is not
+used for `amount > 600`, which PostgreSQL proves. **SQL Server** filtered indexes allow only simple comparison operators
+in the filter, and no `LIKE`.
+
+## Where it bites in production
+
+- **The query forgot the predicate.** A report or ORM scope omits `deleted_at IS NULL` and the partial index silently
+  leaves the plan: a sequential scan on a query that "has an index". Restate the predicate literally.
+- **Prepared statements.** A server-side prepared statement can end up on a [generic plan](../09-the-list-endpoint-optional-filters-sort-options-and-one-inde/#the-or-null-idiom), where `status = $1` never
+  proves `status = 'pending'`. Put the constants that select a partial index into the SQL text.
+- **Soft deletes stop being HOT.** Every column in an index predicate or expression is in the set of columns that
+  blocks HOT (`RelationGetIndexAttrBitmap`; only summarizing indexes such as BRIN are exempt). With a partial index on `WHERE deleted_at IS NULL`, the
+  `UPDATE ... SET deleted_at = now()` is never a [HOT update](../../../p02-storage-engines/pages-tuples-heap-files/04-hot-updates-redirect-line-pointers-and-opportunistic-page-pr/),
+  so it [writes a new entry into every other index on the table](../06-write-cost-hot-and-the-indexes-per-update-meter/). In a test on PostgreSQL 17, 100 such updates on a table
+  with `fillfactor` 50 were all non-HOT with an index on `customer_id WHERE deleted_at IS NULL`, and all HOT once that
+  index lost its `WHERE` clause. The old
+  version's entry also stays in the partial index until it is cleaned up, normally by `VACUUM`.
+- **One partial index per value.** The PostgreSQL documentation calls a set of per-category partial indexes a bad idea:
+  the planner tests every one for every query, and one index led by the category column does the same job.
+- **Expression drift.** Application code changes `lower(email)` to `lower(trim(email))`. Nothing fails; the query just
+  stops matching. Keep the expression in one place, such as a generated column.
+
+:::note[What to take forward]
+A partial index is used only when `predtest.c` proves, at plan time, that the query's `WHERE` clause implies the index
+predicate — by `equal()` matches, strictness for `IS NOT NULL`, and btree comparisons of constants, with no algebra and
+no `Param` or `now()`. An expression index is used only when the query contains the same expression tree under the same
+collation. Both demand immutable functions, so `timestamptz::date`, `concat` and `unaccent` need immutable rewrites.
+Write predicates and expressions into queries exactly as the index defines them.
+:::

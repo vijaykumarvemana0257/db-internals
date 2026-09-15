@@ -1,0 +1,214 @@
+---
+title: Choosing the index for JSONB, arrays and text search
+description: Picking between jsonb_ops, jsonb_path_ops, expression B-trees, generated columns, array_ops, pg_trgm and tsvector indexes by what each extracts, answers, rechecks and costs per insert.
+depth: deep
+sidebar:
+  order: 7
+---
+
+import JsonbIndexChooserLab from '../../../../components/viz/JsonbIndexChooserLab';
+
+A predicate on a jsonb document, an array or free text has no single obvious index. PostgreSQL offers half a dozen, and
+they differ in three ways that matter: which entries they extract from each row, which operators their operator class
+can answer, and whether an index match must be rechecked against the row. Get the first wrong and every insert writes
+dozens of entries for one lookup. Get the second wrong and the planner cannot use the index at all.
+
+How a GIN index stores and merges its posting lists is covered on the
+[GIN page](../../../p02-storage-engines/indexes-beyond-the-b-tree/06-gin-inverted-indexes-and-posting-lists/). Here the
+question is which index to build.
+
+<JsonbIndexChooserLab client:visible />
+
+The lab models 10,000 rows in 8 KB heap pages. Entry counts come from running each index's extraction rules on every
+row (every 20th for the trigram index on `body`); sizes and page counts are estimates from those counts. A predicate counts as **served**
+when the best plan through a built index reads fewer pages than the page budget, a share of what a sequential scan
+reads. The default of 25% is a rough stand-in for the planner's trade-off at `random_page_cost = 4` and
+`seq_page_cost = 1`; the real crossover is on the [selectivity page](../01-selectivity-correlation-and-the-decision-to-build-an-index/).
+The goal is to serve all four predicates while writing the fewest index entries per insert.
+
+## What each candidate extracts
+
+An index is defined by what it writes for one row. Click any cell in the lab: the trace starts with the entries row 1
+writes into that index.
+
+- **GIN `jsonb_ops`** (the default for `USING gin (data)`) writes an entry for **every key and every scalar value**, at
+  every nesting level. Each entry is the value's text behind a flag byte that says key, string, number, boolean or null.
+  Strings longer than 125 bytes are replaced by a hash. One quirk has real consequences: **string array elements are
+  stored as keys**, so `["sale"]` and `{"sale": …}` produce the same entry. Row 1 in the lab writes 25 entries.
+- **GIN `jsonb_path_ops`** writes **one hash per scalar value**, and each hash mixes in every key on the path to that
+  value. `{"attrs": {"color": "coral"}}` becomes a single entry. Array brackets add nothing to the path. Row 1 writes 13.
+- **B-tree on an expression**, such as `((data->>'sku'))`, writes one tuple per row: the value of that expression.
+- **pg_trgm** lowercases the text, splits it into words at every non-alphanumeric character, pads each word with two
+  spaces in front and one behind, and writes every distinct three-character window. `Slim linen blazer` gives 18.
+- **`tsvector_ops`** writes one entry per distinct lexeme, and **`array_ops`** one per distinct array element.
+
+Across the lab's 10,000 products, `jsonb_ops` averages 24.7 entries per row and about 1.2 MB, and `jsonb_path_ops`
+12.8 entries and 872 KB. The documentation calls a `jsonb_path_ops` index "usually much smaller"; how much depends on
+how many keys your documents carry. Drag **Attribute keys per product** and watch both columns move.
+
+## The operator class decides what can be asked
+
+An index can only answer a predicate whose operator is in its operator class and is applied to exactly the indexed
+expression. This filter is absolute.
+
+| Index | Operators it can answer | Common predicates it cannot |
+| --- | --- | --- |
+| GIN `jsonb_ops` on `data` | `@>`, `?`, `?\|`, `?&`, `@?`, `@@` | `data->>'sku' = …`, ranges on any key, `data->'tags' ? …` |
+| GIN `jsonb_path_ops` on `data` | `@>`, `@?`, `@@` | every key-exists operator (`?`, `?\|`, `?&`) |
+| B-tree on `(data->>'sku')` | `=`, `<`, `>`, `BETWEEN` on that expression | anything else in the document |
+| GIN `array_ops` on `tags` | `&&`, `@>`, `<@`, `=` between arrays | `'x' = ANY (tags)` |
+| pg_trgm GIN or GiST on `title` | `LIKE`, `ILIKE`, `~`, `~*`, `%`, `=` | `@@`; GIN also cannot serve `ORDER BY title <-> 'q'` |
+| GIN on `to_tsvector('english', body)` | `@@` against that exact expression | `to_tsvector(body) @@ …` |
+
+Three traps in that table catch most teams.
+
+**The operator must touch the indexed expression.** In the documentation's own example, a GIN index on `jdoc` cannot
+serve `jdoc -> 'tags' ? 'qui'`, because `?` is applied to `jdoc -> 'tags'`, not to `jdoc`. In the lab, set **Q2** to
+`data->'tags' ? 'clearance'`. Both document-wide GIN indexes turn to ✗, and only `GIN on data->'tags'` serves it. That
+targeted index writes 2.8 entries per row and takes 56 KB. Switch Q2 back to `data @> '{"tags": ["clearance"]}'` and the
+document-wide indexes serve it again, because containment is applied to `data` itself.
+
+**`->>` returns text, and `text =` is in neither jsonb operator class.** So neither can serve `data->>'sku' = 'KT-14242'`.
+Either build a B-tree on the expression, or rewrite the predicate as containment, `data @> '{"sku": "KT-14242"}'`, which
+both GIN classes answer. That rewrite works for equality only. From a jsonpath query, `jsonb_ops` and `jsonb_path_ops` extract
+`accessors_chain == constant` and `exists()` clauses, never a `<` or `>`, so a range on a key such as price needs a B-tree on a cast
+expression.
+
+**`= ANY` is not an array operator.** `'sqlite' = ANY (tags)` compares text to each element with `text =`. `array_ops`
+knows only operators between two arrays, so write `tags @> ARRAY['sqlite']`. Pick the **articles** table: with
+`@>`, the GIN index reads 2 index pages and 50 heap pages; with `= ANY`, every candidate shows ✗. A plain B-tree on `tags`
+orders whole arrays and cannot look inside one.
+
+## Specificity: why `jsonb_ops` loses on shared keys
+
+Both jsonb classes answer `data @> '{"attrs": {"color": "coral"}}'`, but not equally well. The lab opens on exactly that
+cell: on the products table, the `GIN jsonb_ops` row under Q1.
+
+`jsonb_ops` turns the query into three independent entries, `key "attrs"`, `key "color"` and `str "coral"`, and ANDs their
+posting lists. Every product has an `attrs` key and a `color` key, so two of the three lists hold all 10,000 rows. The
+third holds every row with the string `coral` **anywhere**. With six attribute keys, trim and lining colors are drawn
+from the same palette, so 848 rows qualify. Row 1 is one of them: its color is denim, but its trim is coral. All 848
+candidates go to the heap, the recheck keeps 45, and the scan reads 312 of 321 pages.
+
+`jsonb_path_ops` looks up one hash of `attrs.color = "coral"`, finds 45 rows and reads 43 pages. Both classes recheck every
+match. The source comments give the reasons: `jsonb_ops` cannot tell where in the document an entry sat, and
+`jsonb_path_ops` hashes can collide and do not keep the document's full structure. Only the precision of the candidate set differs.
+
+Drag **Attribute keys per product** down to 1. The trim key disappears, `coral` occurs only as a color, and `jsonb_ops`
+serves Q1 within budget. One new key with overlapping values turns the same index from good to useless. Drag the slider back to 6 before reading on.
+
+`jsonb_ops` earns its size when you need key existence. Set Q2 to `data ? 'discount'`: only `jsonb_ops` can use an index at
+all. It finds 79 candidates for 55 matches. The other 24 rows carry the string `discount` in their tags array, which the
+index stored as a key, so the recheck throws them out. With Q1 still in containment form, the cheapest covering set now
+needs both GIN indexes: 60.2 entries per insert. Rewrite Q1 as `data->'attrs'->>'color' = 'coral'` and a one-entry B-tree
+replaces `jsonb_path_ops`, bringing it down to 48.4.
+
+## Expression B-trees and generated columns
+
+For equality, ranges and sorting on one known key, a B-tree on the expression is almost always the answer. It writes one
+tuple per row, returns rows in order, and can be unique. GIN supports only bitmap scans, cannot order its output, and
+cannot enforce uniqueness. In the lab, Q3 through `B-tree on data->>'sku'` reads 3 pages.
+
+The expression must match the query. The rules for which expressions qualify, the immutability traps, and why an indexed
+generated column must be `STORED` are on the [partial and expression indexes page](../04-partial-and-expression-indexes/).
+Choosing between the two adds a twist:
+
+- PostgreSQL **does not substitute** a generated column for its expression. Set Q3 to `sku = 'KT-14242'`: the expression
+  B-tree turns to ✗, and only the generated column's index serves it. With Q3 back on `data->>'sku' = …`, the generated
+  column's index cannot be used. Pick one spelling and use it everywhere.
+- A stored column costs heap bytes on every row, on top of the index.
+
+**MySQL** makes the opposite choice. Its optimizer rewrites a `WHERE`, `ORDER BY` or `GROUP BY` expression that exactly
+matches an indexed generated column's definition into a reference to that column.
+
+## Arrays and text: element, trigram or lexeme
+
+**Array membership** belongs to `array_ops`. `&&` and `@>` need no recheck, because each element is stored exactly. In
+the articles lab, `tags && ARRAY['duckdb', 'clickhouse']` unions two posting lists and returns 52 rows from 4 index pages.
+
+**Substring search** belongs to pg_trgm. A `LIKE` or `ILIKE` pattern gives only the trigrams every match must contain. A
+word next to a `%` gets no padding on that side, so `'%oxford%'` yields `oxf`, `xfo`, `for` and `ord`. The index ANDs
+them and always rechecks, because trigrams do not record order. Back on the products table, switch Q4 to `'%ox%'`. `ox` is under three
+characters, so it yields no trigram at all, and the plan must read the entire index and then every heap page: 368 pages
+against 321 for a sequential scan.
+
+The GiST opclass writes one leaf tuple per row, holding that value's exact trigram set, and keeps a signature on inner
+pages whose length `siglen` sets: 12 bytes by default, up to 2,024. Across the lab's titles nearly every bit of the default
+signature is set, so a `'%oxford%'` search descends into all 118 leaf pages. With Q4 back on `'%oxford%'`, the lab scores GiST at 1 entry per
+insert and 160 pages per lookup: the root, 118 leaves and 41 heap pages. Put the other predicates back on their first
+forms and raise the page budget to 50%: the cheapest set swaps the GIN trigram index, at 21.7 entries per row, for GiST, and drops from 35.6 to 14.8 entries per insert. GiST also answers `ORDER BY title <-> 'query'
+LIMIT 10` nearest-match searches, which GIN cannot.
+
+**Word search** belongs to a tsvector GIN index. A trigram index on `body` serves `body ILIKE`, never `@@`. On the lab's articles
+table it writes 233 entries per row and serves nothing. The expression index must name its configuration,
+`to_tsvector('english', body)`, and only queries that repeat that two-argument call can use it. A stored generated
+`tsvector` column avoids the repetition and saves recomputing `to_tsvector` at recheck, at the cost of storing the vector
+(about 500 bytes per row in the lab).
+
+Recheck depends on the query. `tsvector_ops` stores lexemes without positions or weights, so plain `&` and `|` need no
+recheck, while phrase operators and weighted queries do. Set Q3 to `'xid <-> wraparound'`: the index returns the same 84
+candidates as `'xid & wraparound'`, and the recheck keeps the 49 where the words are adjacent. A stopword between them
+breaks the phrase: `to_tsvector` drops it but still counts its position.
+
+## What the index set costs every insert
+
+The **Entries written per insert** tile is the write side of this choice. A B-tree or GiST index adds one tuple per row. A
+GIN index adds one entry per distinct extracted key: 24.7 for `jsonb_ops`, 21.7 for trigrams on a short title, 32 for
+lexemes of an 80-word body. Each is paid on every `INSERT` and on every `UPDATE` that is not HOT. A non-HOT update inserts into every index on the
+table, including indexes whose columns did not change; the
+[write cost page](../06-write-cost-hot-and-the-indexes-per-update-meter/) measures what that does to throughput.
+
+GIN softens the blow with `fastupdate`, which is on by default. Each row's entries are appended, unsorted, to a
+**pending list**, and moved into the main index in bulk later: when the table is vacuumed or autoanalyzed, when
+`gin_clean_pending_list()` is called, or when the list grows past `gin_pending_list_limit`, 4 MB by default. That last
+case is the problem. In `ginfast.c`, the insert that pushes the list's pages past the limit runs the cleanup itself, before
+it returns. Only one backend does: another insert that finds a cleanup already running skips it and returns.
+
+Switch the lab to **Insert stream** on the products table. With `jsonb_ops`, every 7,457th insert merges about 184,000 pending entries. Choose
+`jsonb_path_ops`: the merges come every 16,360 rows and carry about 210,000 entries. **The limit sets how big each merge is.
+The entries per row set how often it comes.** Switch back to `jsonb_ops` and drop the limit to 1 MB: it merges about
+46,000 entries every 1,857 rows, smaller spikes and more of them. Put the limit back to 4 MB and set **VACUUM or
+autoanalyze every** to 5,000 inserts, and the list is drained in the background before it ever reaches the limit.
+
+The line in the chart is the other cost. Every search must also scan the whole pending list, so reads slow down as it fills. If
+steady latency matters more than insert speed, turn `fastupdate` off for that index. Every insert then pays for its entries directly, with no spikes. `ALTER INDEX … SET (fastupdate = off)` does not flush entries already pending: run
+`VACUUM` or `gin_clean_pending_list()` afterwards.
+
+## The same choices in MySQL and MongoDB
+
+**MySQL** does not index JSON columns directly. You index a scalar extracted from the document, through a generated column
+or, since 8.0.13, a functional key part, which MySQL implements as a hidden virtual generated column. The `CAST` and
+collation trap that catches functional key parts on `->>` is on the
+[partial and expression indexes page](../04-partial-and-expression-indexes/).
+
+For arrays, InnoDB has **multi-valued indexes** since 8.0.17: `CAST(custinfo->'$.zipcode' AS UNSIGNED ARRAY)` writes one index
+record per element, and serves `MEMBER OF()`, `JSON_CONTAINS()` and `JSON_OVERLAPS()`. The limits are strict. An index can
+have only one multi-valued key part. It cannot be covering and supports neither range scans nor index-only scans. An empty
+array writes no records, so that row cannot be found through the index.
+
+**MongoDB** indexes a document path such as `attrs.color` directly, the equivalent of an expression B-tree. An index on a
+field that holds arrays automatically becomes **multikey**, with one key per distinct element. A compound multikey index
+allows at most one array-valued field per document, and an insert that breaks the rule fails. For unpredictable field
+names, a wildcard index, `{ "$**": 1 }`, indexes every path.
+
+## Where it bites in production
+
+- **An index that is never used.** The query applies the operator to a sub-expression (`data->'tags' ? …`), uses `->> =`
+  against a GIN index, uses `= ANY`, or calls one-argument `to_tsvector`. The plan shows a `Seq Scan` with a `Filter`, and
+  the index's `idx_scan` stays at zero. Match the query to the operator class, or index the expression it actually uses.
+- **Containment that reads half the table.** Under `jsonb_ops`, a key that appears in every document contributes a
+  posting list of every row. The plan shows `Bitmap Heap Scan` with a large `Rows Removed by Index Recheck`. If you never
+  use `?`, `jsonb_path_ops` is smaller and more precise.
+- **Short search terms.** `ILIKE '%ab%'` has no trigram, so it degrades to a full index scan plus a full heap scan. Enforce
+  a minimum of three characters in the application.
+- **Insert p99 spikes every few thousand rows.** That is the pending-list cleanup. Raise `gin_pending_list_limit` on that
+  index and make autovacuum more aggressive, or turn `fastupdate` off.
+
+:::note[What to take forward]
+Choose these indexes in order: which predicates the operator class can answer as written, how precise the candidate set
+is, then how many entries each row writes. `jsonb_path_ops` beats `jsonb_ops` for containment and cannot answer `?`. A
+single key's equality, range or sort order belongs to a B-tree on the expression or a stored generated column, spelled
+the way queries spell it. Arrays want `@>` and `&&`, not `= ANY`. Substrings want trigrams of at least three characters,
+and words want a tsvector on a named configuration. Every GIN entry is paid on insert, and with `fastupdate`, in periodic
+foreground merges whose size is set by `gin_pending_list_limit`.
+:::

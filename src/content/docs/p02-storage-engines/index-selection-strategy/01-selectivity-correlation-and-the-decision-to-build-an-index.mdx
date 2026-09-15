@@ -1,0 +1,215 @@
+---
+title: Selectivity, correlation and the decision to build an index
+description: Whether an index is worth building comes down to how many rows a predicate matches and how many heap pages those rows occupy — the PostgreSQL cost formulas that turn those numbers into a plan, why low-cardinality indexes go unused, when CLUSTER beats another index, and the foreign-key lookups that need an index no query names.
+depth: basics
+sidebar:
+  order: 1
+---
+
+import IndexDecisionCrossoverLab from '../../../../components/viz/IndexDecisionCrossoverLab';
+
+An index that exists is not an index that gets used. The planner reads an index only when that is estimated to be
+cheaper than reading the table, and the estimate turns on two numbers: how many rows the predicate matches, and how many
+heap pages those rows are spread across. Build an index the planner will not use and you pay its bytes and an extra
+write on every insert for nothing. Skip one you needed, and the slow query may be one you never wrote — the lookup the
+database runs against a child table every time you delete a parent row.
+
+The lab makes you commit first: pick a predicate, decide whether to **create this index**, **leave it** or **cluster the
+table**, and only then see PostgreSQL's cost curves and a score for your choice.
+
+<IndexDecisionCrossoverLab client:visible />
+
+## Selectivity: how many rows match
+
+The planner does not count matching rows before choosing a plan. It estimates them from the statistics `ANALYZE` stores
+in `pg_statistic` and exposes in `pg_stats`, built from a random sample of `300 × default_statistics_target` rows —
+30,000 at the default target of 100:
+
+- **`most_common_vals` / `most_common_freqs`** — equality on a listed value gets that value's frequency.
+- **`n_distinct`** — a value not in the list gets what the MCVs leave, spread evenly:
+  `(1 − sum of MCV frequencies − null_frac) ÷ (n_distinct − number of MCVs)`. A negative `n_distinct` is a fraction of
+  the row count, so `-1` means unique.
+- **`histogram_bounds`** — equal-population buckets over the non-MCV values, used for ranges.
+
+The lab's **Predicate on orders** list names the statistic behind each estimate. `customer_id = $1` is not an MCV, so with
+50,000 distinct customers it matches roughly 20 of the table's 1,000,000 rows; `status = 'shipped'` is the most common value,
+at 62%. How these estimates are built and how they fail belongs to [the cost-based optimization module](../../../p03-query-processing/cost-based-optimization/03-single-column-cardinality-estimation/). Here the estimate is
+taken as correct, and the question is what it implies.
+
+## Correlation: how many pages those rows touch
+
+A matching row costs a read only if its page has not been read already, so the second number is a page count. It depends on
+whether rows with nearby key values sit on nearby pages.
+
+`pg_stats.correlation` measures that, from −1 to +1: near ±1 the physical row order follows the column's sort order, near 0 it
+is unrelated. `ANALYZE` computes it from the same sample, correlating each sampled value's rank with the rank of its physical
+position. A table filled in `created_at` order and never updated has a correlation near 1 on `created_at`; the
+[heap file page](../../../p02-storage-engines/pages-tuples-heap-files/03-heap-file-organization-and-free-space-management/)
+showed how churn destroys it.
+
+Scattered rows cover pages quickly. For `t` matching rows in a table of `T` pages, PostgreSQL estimates the distinct pages
+with Mackert and Lohman's `2Tt ÷ (2T + t)`. At `t = T`, one matching row per page on average, that is two thirds of the table.
+Choose **Custom range**, set **Rows matched** to 1% and **Rows still in key order** to 0%: the 10,000 matching rows land on
+6,377 of the 10,000 heap pages, close to the formula's 6,667. At 100% the same rows occupy 100 pages.
+
+The default preset, `created_at in one month, after years of updates`, is the painful middle: 8.3% of the rows, correlation
+0.35, and 9,958 of the 10,000 pages hold at least one match. An index can find those rows quickly. It cannot make them occupy
+fewer pages.
+
+## Three plans, and where they cross
+
+The planner prices each path in units where one sequential page read costs 1.0 (`seq_page_cost`) and picks the cheapest. With
+the defaults — `random_page_cost = 4.0`, `cpu_tuple_cost = 0.01`, `cpu_index_tuple_cost = 0.005`,
+`cpu_operator_cost = 0.0025` — the formulas in `costsize.c` are:
+
+| Path | I/O cost | CPU cost |
+|---|---|---|
+| **Seq Scan** | every page × `seq_page_cost` | every row × (`cpu_tuple_cost` + filter) |
+| **Index Scan** | the matching fraction of the index's pages × `random_page_cost`, plus heap I/O interpolated by **correlation²** between Mackert–Lohman pages × `random_page_cost` (correlation 0) and one random read followed by a sequential run (correlation ±1) | matching rows only |
+| **Bitmap Heap Scan** | index pages as above, plus Mackert–Lohman pages read once each in block order, at `random_page_cost − (random_page_cost − seq_page_cost) × √(pages ÷ T)` per page | matching rows, condition rechecked |
+
+Three details carry most of the behavior. Correlation is **squared**, so 0.35 buys only 12% of the way from random toward
+sequential. A bitmap heap scan collects the matching TIDs first and reads pages in block order, and its price per page falls toward
+`seq_page_cost` as it covers more of the table. And a sequential scan pays CPU for **every** row, which for this table of narrow rows costs more than
+its I/O.
+
+Pick **Create this index** on the default preset. The planner chooses a Bitmap Heap Scan and reads 10,189 pages instead of the
+Seq Scan's 10,000: 9,958 heap pages plus 231 index pages. The chart gives the cheapest plan at every selectivity for this
+correlation: Index Scan below 0.027%, Bitmap Heap Scan up to 41%, Seq Scan above.
+
+Now untick **enable_bitmapscan**. A plain Index Scan on this scattered heap loses to the Seq Scan above 1.1%, and your index is
+not used at all. The lab prices serial plans only; with PostgreSQL 17's default `max_parallel_workers_per_gather = 2`, a Parallel
+Seq Scan takes over even earlier, below 1% on this table. This is the case the folk rule "an index stops helping after a few
+percent" describes: the plain index scan's crossover on an uncorrelated table. The bitmap heap scan exists to push that crossover out, and correlation pushes it further —
+choose `created_at in the last day (append-only)`, correlation 0.99, bet again, and a plain Index Scan beats the Seq Scan up to 59%.
+
+### random_page_cost moves the lines
+
+`random_page_cost = 4.0` says a random read costs four sequential ones. On SSDs, and when most pages are cached, that overstates
+the penalty. With **enable_bitmapscan** ticked again, bet on the default preset and drag **random_page_cost** to 1.1: the Seq Scan crossover moves from 41% to 63%,
+and at 8.3% the plan flips from Bitmap Heap Scan to Index Scan. The pages are the same; the order is not. The bitmap scan read them
+in 43 sequential runs, while the index scan makes about 73,000 non-sequential fetches, jumping to a new page for nearly every row.
+That trade is right on storage where random and sequential reads cost about the same, and wrong where they do not. Set it back to
+4.0 before moving on.
+
+`effective_cache_size` (default 4 GB) matters less than its reputation. In the cost model it enters only through that Mackert–Lohman
+page estimate, only when the table is larger than its pro-rated share of the cache, and mostly for scans repeated inside a nested
+loop. It changes nothing in this lab.
+
+:::caution[The estimate is the x-coordinate]
+Every curve here is exact arithmetic on an estimated row count. If `rows=` in `EXPLAIN` is off by 10×, the plan was chosen at the
+wrong point on the chart, and no index design fixes that. Check estimated against actual rows before deciding an index "is not
+being used".
+:::
+
+## Booleans and status columns
+
+Choose `is_archived = false` (98%) or `status = 'shipped'` (62%) and bet on the index. The planner picks a Seq Scan anyway: for
+`shipped`, its best index path is estimated at 29,258 against the Seq Scan's 22,500. The lab sizes the index at 21 MB as if every key
+were distinct; B-tree deduplication (PostgreSQL 13+) packs a real one-million-row status index into about 7 MB. Either way it adds a
+second B-tree write to every insert and is never read for these values.
+
+The planner can still use such an index for a **rare** value, because the MCV list says it is rare: `status = 'pending'` matches
+3,981 rows (0.4%), and a Bitmap Heap Scan reads 3,325 pages instead of 10,000. But the index holds an entry for all 1,000,000 rows,
+99.6% of which no query looks up through it. A partial index, `CREATE INDEX ... ON orders (created_at) WHERE status = 'pending'`,
+holds only the rows the query can use; see [Partial and expression indexes](../04-partial-and-expression-indexes/).
+
+## MySQL: the 30% rule that no longer exists
+
+InnoDB stores each table as a B-tree on its primary key, so there is no separate heap whose order drifts. A secondary-index range
+finds each row's primary key and then descends the clustered index for the row. Disk-Sweep Multi-Range Read is the counterpart of
+the bitmap heap scan: it collects keys from the index, sorts them, and reads rows in primary-key order (`mrr` and `mrr_cost_based`
+are on by default).
+
+You will still hear that MySQL switches to a table scan when an index matches more than 30% of rows. The reference manual puts that in
+the past tense: a fixed percentage *once* decided, and the optimizer now also weighs table size, row count and I/O block size.
+
+When the optimizer misjudges, `FORCE INDEX (idx)` acts like `USE INDEX` except that a table scan is assumed to be very expensive, so it
+happens only if the named index cannot be used at all. Since MySQL 8.0.20 the index-level optimizer hints `INDEX`, `JOIN_INDEX`,
+`GROUP_INDEX` and `ORDER_INDEX` are the intended replacement, and the manual expects `FORCE INDEX` to be deprecated. Its first suggestion
+is still `ANALYZE TABLE`: a forced index is a decision frozen at today's data distribution. PostgreSQL has no index hints in core;
+`enable_seqscan` and `enable_bitmapscan` are for experiments like the one above.
+
+## When clustering beats indexing
+
+Back to the default preset, where the index could not reduce the pages read. Bet on **Cluster the table**. `CLUSTER orders USING
+orders_created_at_idx` rewrites the heap in index order, making the correlation 1.0, and the planner now picks an Index Scan that reads
+1,063 pages: 832 heap pages in one run plus the index, against 10,189 with the index alone.
+
+That is when clustering wins: **a wide range over a scattered heap**. The index finds the rows; only a physical reorder puts them on
+fewer pages. For `customer_id = $1` the index reads 22 pages and clustering would read 5 — not worth rewriting a table for.
+
+PostgreSQL's documentation spells out the price:
+
+- **It needs the index.** `CLUSTER` reorders by an existing index; it does not replace one.
+- **It takes an `ACCESS EXCLUSIVE` lock** for the whole rewrite, blocking reads as well as writes, and needs room for a full copy of
+  the table and its indexes. The lab counts 15,490 pages written up front: the heap and both B-trees.
+- **It is a one-time operation.** New and updated rows are not placed in order. A `fillfactor` below 100 helps updated rows stay on
+  their page; run `ANALYZE` afterwards so the planner sees the new correlation.
+
+On the default preset, drag **Rows changed since CLUSTER**. At 10% the correlation drops to 0.90 and the Index Scan reads 6,220 pages; at 30% it is 0.70 and
+the plan is back to a Bitmap Heap Scan over 9,493. The lab sends every changed row to a random page, which is pessimistic for a table
+with `fillfactor` room, but a cluster order clearly needs a maintenance plan. `pg_repack` can reorder a table online, taking an
+exclusive lock only at the start and the end.
+
+A table also has only **one** physical order. Clustering `orders` by `customer_id` makes customer lookups local and destroys the
+`created_at` correlation that made recent-order ranges cheap. InnoDB makes the choice once, at the primary key, and keeps it: the
+clustered index *is* the physical order.
+
+## The reads you never wrote: foreign keys
+
+PostgreSQL enforces a foreign key with system triggers from `ri_triggers.c`. On the parent table they are `AFTER ... FOR EACH ROW`
+triggers, so every deleted parent row, and every update that changes a referenced key, runs one query against the child:
+
+| `ON DELETE` | Query run once per parent row |
+|---|---|
+| `NO ACTION`, `RESTRICT` | `SELECT 1 FROM ONLY orders x WHERE $1 = customer_id FOR KEY SHARE OF x` |
+| `CASCADE` | `DELETE FROM ONLY orders WHERE $1 = customer_id` |
+| `SET NULL` | `UPDATE ONLY orders SET customer_id = NULL WHERE $1 = customer_id` |
+
+(`ONLY` is dropped when the child is partitioned.) The existence check stops at the first match, which fails the delete. So when a
+delete *succeeds* under `NO ACTION`, every check found nothing — and proving "nothing" without an index means reading the whole child.
+PostgreSQL does not create that index for you, and neither does SQL Server.
+
+Switch the lab to **Foreign-key lookups**. Deleting 10 customers with `ON DELETE CASCADE` down to `order_items`, with no child indexes,
+issues 1,010 lookups and examines 4,010,000,000 child rows. The cascade multiplies: each customer's lookup scans all of `orders`, and
+each of the 1,000 orders it deletes fires its own scan of `order_items`. Tick **Index orders(customer_id)** and the count barely moves,
+to 4,000,001,000. Tick **Index order_items(order_id)** as well and it collapses to 5,000 rows, exactly the rows being deleted. Under
+`NO ACTION` without indexes, 10 checks read 10,000,000 rows to delete customers that have no orders at all; with the index, 30 index
+pages and no heap rows.
+
+Other engines differ in how much of this they let you get wrong:
+
+- **Oracle** takes a full table lock on the child when its foreign-key column is unindexed and a session deletes or changes a parent key.
+  Other sessions can query the child but not modify it. The lock is taken and released once per parent row, so the lab's Oracle cascade
+  counts 1,010. With the index, no full table lock is taken.
+- **MySQL InnoDB** requires an index whose leading columns are the foreign-key columns, creates one automatically if none exists,
+  and may silently drop it later if you add another index that can enforce the constraint.
+
+The rule: **index the child side of every foreign key you delete or re-key through**, even when no application query filters on it. Any
+B-tree whose leading columns are the foreign-key columns works, as [the leftmost-prefix rule](../02-composite-indexes-and-the-leftmost-prefix-rule/)
+explains.
+
+## Where it bites in production
+
+- **A slow `DELETE` of one row.** `EXPLAIN ANALYZE` on the delete prints a line like
+  `Trigger for constraint orders_customer_id_fkey: time=… calls=…` holding almost all the time. `pg_stat_statements` tracks only
+  top-level statements by default, so the child scans never get their own entry, while `pg_stat_user_tables.seq_scan` and
+  `seq_tup_read` climb on a table nothing else scans.
+- **Indexes that are never read.** An index on a column whose common values match most rows costs a write on every insert and
+  buffer-pool space. [Write cost and the indexes-per-update meter](../06-write-cost-hot-and-the-indexes-per-update-meter/) shows how to
+  find them.
+- **Plans that change without a deploy.** Updates and deletes free space, the free space map fills it with new rows out of order, and
+  one day `ANALYZE` records a lower correlation: a year-old Index Scan becomes a Bitmap Heap Scan. The index did not change; the heap
+  order did.
+- **`random_page_cost` at the spinning-disk default.** Index plans are priced as if random reads cost four sequential ones. Lowering it
+  is often right on SSDs, but it changes which plans do random I/O; measure on your own storage.
+- **Forced plans that outlive their data.** A `FORCE INDEX` added when a predicate matched 1% of rows keeps forcing it at 40%.
+
+:::note[What to take forward]
+An index pays off only when the planner's cheapest plan uses it, and that depends on selectivity and on how many heap pages the
+matching rows occupy, which `pg_stats.correlation` predicts. On a scattered heap a plain index scan loses early; the bitmap heap scan
+extends the range but cannot read fewer pages than the rows occupy, so a wide range over a scattered heap needs a physical reorder, not
+another index. Low-cardinality columns are worth indexing only for rare values, usually as a partial index. And index the child side of
+every foreign key you delete through: those lookups run once per parent row and multiply down every cascade.
+:::

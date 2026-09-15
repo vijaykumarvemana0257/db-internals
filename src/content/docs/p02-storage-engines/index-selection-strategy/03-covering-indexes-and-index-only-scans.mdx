@@ -1,0 +1,255 @@
+---
+title: Covering indexes and index-only scans
+description: When an index can answer a query without reading the table — every referenced column stored in it, INCLUDE payload columns and what they cost, the visibility-map check behind PostgreSQL's Heap Fetches, and InnoDB's implicit primary key and PAGE_MAX_TRX_ID.
+depth: intermediate
+sidebar:
+  order: 3
+---
+
+import IndexOnlyScanVisibilityLab from '../../../../components/viz/IndexOnlyScanVisibilityLab';
+
+An ordinary index scan reads twice for every row: once for the index entry, then again for the row
+it points to. The entries for one key sit side by side in a leaf page, but the rows are scattered
+across the table, so the second read is the slow, random one. A covering index stores every column
+the query needs, so the second read can be skipped. Whether it actually *is* skipped gets decided
+at run time, one entry at a time, by visibility bookkeeping the index knows nothing about.
+
+<IndexOnlyScanVisibilityLab client:visible />
+
+## What makes an index covering
+
+PostgreSQL's documentation states two requirements. First, the index access method must be able to
+hand back the stored value. B-tree always can. GiST and SP-GiST can for some operator classes. GIN
+cannot, because an entry holds only part of the original value. Second, **the query may reference
+only columns stored in the index**, and that means every clause, not just the select list. The
+planner's `check_index_only` (in `indxpath.c`) collects the columns used by the target list and by
+the restriction clauses. It considers an Index Only Scan only if all of them are columns the index can
+return.
+
+The lab's table is `orders (id, customer_id, created_at, status, amount_cents, note)`. It has an
+index on `customer_id`, and every query asks for customer 42's twelve orders. With the default query,
+`SELECT created_at, amount_cents`, the plan is an **Index Scan**: twelve entries, twelve trips to the
+heap, nine different heap pages. Set `created_at` and `amount_cents` to **INCLUDE**. The plan becomes
+an **Index Only Scan** with `Heap Fetches: 0`, and the lines now stop at the visibility map
+instead of running on into the heap.
+
+Three consequences follow directly from the rule:
+
+- `SELECT count(*) … WHERE customer_id = 42` needs no column but `customer_id`, so the bare index
+  already covers it. Pick it in the lab.
+- `SELECT *` needs every column, so no reasonable index covers it. An ORM that loads whole entities
+  turns every covering index back into an ordinary one.
+- A column that appears only in `WHERE` still has to be in the index. `AND status = 'open'` makes
+  `status` a required column.
+
+Two refinements. For an expression index on `f(x)`, the planner checks whole *columns*, so
+`SELECT f(x) … WHERE f(x) < 1` is not index-only unless `x` is stored too; the documented workaround
+is `INCLUDE (x)`. And since PostgreSQL 9.6 a partial index's predicate need not be stored: an index
+built `WHERE success` can serve `AND success` index-only, because every entry already satisfies it.
+Both index kinds have their own [page](../04-partial-and-expression-indexes/).
+
+## INCLUDE: payload that is not part of the key
+
+`INCLUDE` arrived in PostgreSQL 11 for B-tree and is now supported by GiST and SP-GiST as well. It
+stores extra columns in the index as **non-key columns**:
+
+```sql
+CREATE INDEX orders_customer_idx ON orders (customer_id) INCLUDE (created_at, amount_cents);
+```
+
+A non-key column is carried, never searched. It cannot appear in an index search condition. It needs
+no operator class, so any type will do. It cannot be an expression. And uniqueness ignores it:
+`CREATE UNIQUE INDEX … (customer_id) INCLUDE (created_at)` enforces uniqueness on `customer_id`
+alone. `UNIQUE` and `PRIMARY KEY` constraints accept an `INCLUDE` clause too, which is how a primary
+key can also cover a hot query.
+
+Before `INCLUDE`, the trick was to append payload as trailing key columns, as in
+`(customer_id, created_at, amount_cents)`. That still works, and in the lab's size model it produces
+leaf tuples of exactly the same width. Three things differ:
+
+- Trailing key columns cannot enforce uniqueness on the leading columns alone.
+- Key columns are part of the sort order, which is sometimes exactly what you want. That trade-off
+  is covered on the [composite index page](../02-composite-indexes-and-the-leftmost-prefix-rule/).
+- [Suffix truncation](../../../p02-storage-engines/b-trees-and-variants/06-key-layout-prefix-compression-and-suffix-truncation/)
+  *always* strips non-key columns from the pivot tuples in upper levels. It strips trailing key
+  columns only when the remaining prefix happens to be enough to separate two pages.
+
+The difference also shows up in the plan. Pick the `status = 'open'` query and make both `created_at`
+and `status` INCLUDE columns. The Index Only Scan reads all 12 entries and reports
+`Rows Removed by Filter: 8`, because a non-key column can only be filtered. Make `status` a **key
+column** instead and it moves into the `Index Cond`: the scan reads just the 4 matching entries.
+
+SQL Server has the same feature under the same keyword: included (nonkey) columns on nonclustered
+indexes, which do not count toward its limits of 32 key columns and 1,700 bytes of key. MySQL has no
+`INCLUDE` clause at all.
+
+## The visibility map decides whether "index-only" is true
+
+A PostgreSQL index entry holds no visibility information. It has no `xmin` and no `xmax`, just a key
+and a 6-byte TID. Whether a row version is visible to your snapshot is recorded only in the heap
+tuple. So before an index-only scan can return a row, it needs some way to know the heap tuple is
+visible without reading it.
+
+That way is the **visibility map**'s all-visible bit, one per heap page (an all-frozen bit sits
+beside it), meaning *every tuple on this page is visible to every current and future transaction*. The
+[heap-file page](../../../p02-storage-engines/pages-tuples-heap-files/03-heap-file-organization-and-free-space-management/)
+shows how that fork is laid out. The executor loop, `IndexOnlyNext` in `nodeIndexonlyscan.c`, does
+this for each TID the index returns:
+
+1. Check `VM_ALL_VISIBLE` for the TID's heap block.
+2. **Bit set:** build the result row from the index tuple. The heap is not touched.
+3. **Bit clear:** add one to the Heap Fetches counter and fetch the heap tuple to test its
+   visibility. If no version is visible, skip the entry. If one is, the output values *still* come
+   from the index tuple.
+
+That loop explains two things in `EXPLAIN (ANALYZE)` output. `Heap Fetches` counts **index
+entries**, not pages: three entries pointing into one unmarked page count three. And the plan node
+does not change with what it finds, so an Index Only Scan whose `Heap Fetches` equals its row count
+has done an ordinary index scan's work plus a visibility-map probe per row.
+
+Try it. Press **Reset table**, go back to the first query with `created_at` and `amount_cents` as
+INCLUDE and `status` not in the index, set **Writes hit** to *customer 42*, and press **UPDATE
+status of 5 orders**. Five rows on four heap pages change, those four pages lose their bits, and the
+next run reports `Heap Fetches: 7` of 12. The two extra fetches are customer 42 rows that merely
+share a page with an updated one. Press **VACUUM** and the count returns to 0.
+
+The bit's life cycle, from the source:
+
+- **Cleared** by any insert, update or delete on the page. `heap_update` clears it on the old page
+  and, if the new version lands on a different page, on that one too.
+- **Set** by `VACUUM`, and by `COPY … FREEZE`. PostgreSQL 19, not yet released as this is written,
+  also lets a query that does not modify the table mark a page all-visible when it prunes that page.
+- **Set only when it is true.** VACUUM marks a page all-visible only if every tuple's inserting
+  transaction precedes `OldestXmin`, the oldest transaction any open snapshot could still need, and
+  no recently dead versions remain on the page.
+
+That last rule is how a long-running transaction quietly switches index-only scans off. Tick
+**Long-running transaction open**, update customer 42 again, and press VACUUM. The message counts the pages it had to leave clear, and the heap fetches stay. Untick it, press VACUUM again, and the bits
+are set.
+
+Now switch **Writes hit** to *random orders* and keep updating. Bits clear on pages all over the
+table, and customer 42 pays for some of them. A heap page holds rows that were inserted around the
+same time, not rows with nearby keys, so any write to any row on a page takes the index-only path
+away from every other row there.
+
+### The planner works from last VACUUM's count
+
+The planner costs this from a statistic, not from the map. `table_block_relation_estimate_size` in `tableam.c`
+sets `allvisfrac` to `pg_class.relallvisible` divided by the table's current page count, and `cost_index` multiplies its estimate of heap pages fetched by
+`(1 − allvisfrac)`. It applies that table-wide fraction to whichever pages the query happens to touch.
+`relallvisible` is updated by VACUUM, ANALYZE and a few DDL commands such as CREATE INDEX. The lab's
+**All-visible pages: now / planner** tile shows the gap. After that first update it reads 33 / 37 of
+37: four bits are gone, and the planner still costs the scan as if nothing had changed.
+
+## INCLUDE columns are indexed columns
+
+An update can be
+[HOT](../../../p02-storage-engines/pages-tuples-heap-files/04-hot-updates-redirect-line-pointers-and-opportunistic-page-pr/),
+meaning no new index entries and the new version chained on the same page, only if no indexed column
+changed (BRIN columns excepted since PostgreSQL 16). `RelationGetIndexAttrBitmap` in `relcache.c`
+builds that set from *every* index column, key or not. Its comment says why: non-key columns are in the index, so an update must not miss them.
+Cover a query by including a column that changes, and every update to that column writes a new entry
+into every B-tree index on the table.
+
+Reset the table, pick the `status = 'open'` query, INCLUDE `created_at` and `status`, and update
+customer 42's orders. The index grows from 12 entries to 17, and the scan fetches 12 of them from the
+heap. 5 of those are dead versions it has to step over. VACUUM removes the 5 dead entries and sets
+the bits. The full write-cost accounting is on the
+[write-cost page](../06-write-cost-hot-and-the-indexes-per-update-meter/).
+
+## Every payload byte is stored again
+
+A B-tree leaf tuple is an 8-byte `IndexTupleData` header (a 6-byte heap TID and a 2-byte `t_info`),
+then the column values with their alignment padding, rounded up to 8 bytes. Each tuple also needs a
+4-byte line pointer. The lab's size model applies that to the table at 10 million rows and 12 orders
+per customer, with the index built by `CREATE INDEX` at the default leaf fillfactor of 90:
+
+| Index | Leaf bytes per row | Size |
+|---|---|---|
+| `(customer_id)` | 7.7 | 82 MB |
+| `(customer_id) INCLUDE (created_at)` | 28 | 301 MB |
+| `(customer_id) INCLUDE (created_at, amount_cents)` | 36 | 387 MB |
+| `(customer_id) INCLUDE (created_at, amount_cents, note)` | 164 | 1.7 GB |
+| the table itself | 196 | 1.9 GB |
+
+The first jump is not the 8 bytes of a timestamp. The bare index is small because B-tree
+**deduplication** stores each customer's twelve TIDs in one posting list, at 6 bytes per duplicate
+instead of a whole tuple each. `INCLUDE` indexes never deduplicate: `_bt_allequalimage` returns false
+as soon as an index has non-key columns. Drag **Orders per customer** and the ratio between the first
+two rows moves from about 2.5× at 4 orders to about 4.3× at 40.
+
+There is also a hard ceiling. A B-tree tuple may not exceed about a third of a page, which is 2,704
+bytes on 8 KB pages, and a tuple over that fails with
+`index row size … exceeds btree version 4 maximum 2704`. The PostgreSQL documentation's own advice is
+blunt. Be conservative with payload columns, especially wide ones. And there is little point
+including them unless the table changes slowly enough that the heap is not being visited anyway.
+If it is, reading the column from the heap costs nothing extra.
+
+## InnoDB: the primary key is already covered
+
+In InnoDB the table *is* the clustered primary-key B-tree. A secondary index record stores the
+indexed columns plus **the primary key columns**, and InnoDB uses that key value to find the row.
+That makes the lookup a second full descent of the clustered index rather than a single TID
+dereference, as the
+[page-anatomy page](../../../p02-storage-engines/pages-tuples-heap-files/01-page-anatomy-and-the-slotted-page/)
+explains. So for InnoDB, covering means *the indexed columns plus the primary key*. Switch the lab to
+**MySQL InnoDB**, pick `SELECT id, status`, and make `status` a key column: `Using index`, and no
+lookups. PostgreSQL would need `id` in the index as well. With no `INCLUDE` clause, payload columns
+have to be key columns, and `EXPLAIN` marks a covered read with **Using index** in `Extra`.
+
+InnoDB has no visibility map, but it has the same problem. A secondary record carries no transaction
+id, so it cannot tell a reader whether its snapshot sees it. InnoDB's answer is a field in every
+secondary index page header: `PAGE_MAX_TRX_ID`, the highest id of any transaction that modified a
+record on that page. Writes only ever raise it. In `row_search_mvcc`, a non-locking read of a secondary
+record calls `lock_sec_rec_cons_read_sees`. That returns true only if `PAGE_MAX_TRX_ID` is below the
+read view's `up_limit_id`, the smallest id among read-write transactions that were active when the
+view was created. When the check fails, InnoDB goes to the clustered record for each record it reads
+from that page, rebuilding an older version from undo if it has to, even though the query is covered.
+
+It is the same idea as the visibility map, with three differences you can see in the lab:
+
+- **The granularity follows the key.** A secondary leaf page holds neighboring key values, not
+  whatever was inserted at the same time. Writes to customers far away in key order never touch
+  customer 42's page.
+- **Only writes to the secondary index count.** An InnoDB update that changes no indexed column
+  never touches the secondary indexes. Reset the table, take `status` back out of the index (keep
+  `created_at` and `amount_cents`), pick the first query and update customer 42's orders: no secondary record changes, and the read stays
+  at zero lookups.
+- **Nothing has to run to clear it.** The check passes once the page's last modifier is older than
+  every transaction that was active when the reader's view opened, so a long-running read-write
+  transaction pins it. Tick **Long-running transaction open**, make `status` a key column, and update
+  customer 42's orders again. The page check fails, and the covered query makes 17 clustered lookups: 12 live
+  rows plus 5 delete-marked old records, 51 pages with the lab's 3-level clustered index. **Purge**
+  does not help, because the check compares against the read view, and only committing the long
+  transaction moves that.
+
+`EXPLAIN` says `Using index` the whole time. The fallback is decided page by page at run time, so the
+plan cannot show it.
+
+## Where it bites in production
+
+- **`Heap Fetches` close to the row count on an Index Only Scan.** The visibility map is falling
+  behind the write rate. Lower `autovacuum_vacuum_scale_factor` for that table, or run VACUUM after
+  bulk changes. Before PostgreSQL 13, an insert-only table was never vacuumed because of its inserts,
+  so its bits stayed clear until an anti-wraparound VACUUM. `autovacuum_vacuum_insert_threshold` (default 1000) fixed that.
+- **The newest rows are the expensive ones.** Queries for recent data land on exactly the pages
+  written since the last VACUUM. The table can be mostly all-visible, and `relallvisible` can say so,
+  while the hot query does a heap fetch per row.
+- **A long transaction switches covering indexes off.** A session idle in a transaction that holds a snapshot or an
+  xid holds back `OldestXmin` in PostgreSQL, and in InnoDB a transaction that has written holds back
+  `up_limit_id`. Nothing errors and no plan changes. Latency just goes up.
+- **`SELECT *` from the ORM.** The covering index exists, the query needs one more column, and the
+  plan silently goes back to an Index Scan. Select only the columns you use.
+- **Covering columns that change.** INCLUDE a frequently updated column and its updates stop being
+  HOT, so each one writes to every index. Include columns that are read together and rarely written.
+
+:::note[What to take forward]
+An index covers a query when every column the query references, in the select list and in WHERE, is
+stored in it. INCLUDE adds payload without making it part of the key, at the price of the column's
+bytes, B-tree deduplication and HOT eligibility. In PostgreSQL, covering only makes the index-only
+path possible: each entry still needs its heap page's visibility-map bit, which VACUUM sets only
+once no old snapshot needs the page, and Heap Fetches tells you how often the bit was missing.
+InnoDB's secondary records already carry the primary key. Its equivalent check compares the leaf
+page's PAGE_MAX_TRX_ID with the read view, and it clears on its own unless a long transaction holds
+it back.
+:::

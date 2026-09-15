@@ -1,0 +1,216 @@
+---
+title: 'The list endpoint: optional filters, sort options and one index set'
+description: Choosing one index set for an endpoint whose optional filters and sort options multiply into dozens of query shapes, and why (col = $1 OR $1 IS NULL) loses the seek under a generic plan.
+depth: deep
+sidebar:
+  order: 9
+---
+
+import ListEndpointIndexSetLab from '../../../../components/viz/ListEndpointIndexSetLab';
+
+Almost every product has an endpoint like `GET /tickets?status=open&assignee=me&sort=priority`. The tenant and
+status are always there. Assignee and customer are optional. The UI offers five sort orders. To the application it is
+one endpoint. To the planner, every combination the client can send is a **different query** with a different best
+index, and the table can only carry a handful of indexes before its writes suffer.
+
+This page treats the endpoint as one indexing problem: which shapes seek, which walk and filter, which scan, and which ways
+of writing the query throw the seeks away.
+
+<ListEndpointIndexSetLab client:visible />
+
+## One endpoint is many queries
+
+With *k* optional filters, each present or absent, there are 2<sup>k</sup> filter combinations. Multiply by *m* sort
+orders and you have 2<sup>k</sup> × *m* query shapes. The lab's endpoint has two optional filters and five sorts: 20 shapes.
+An admin grid with six optional filters and five sorts has 320, and letting users flip each sort's direction doubles that.
+
+A B-tree serves a shape fully only when **equality columns lead, sort columns follow, and the scan is one contiguous
+range** (the [leftmost-prefix page](../02-composite-indexes-and-the-leftmost-prefix-rule/) has the full rule). One index
+serves several shapes, never all, and every index is written on each INSERT and each non-HOT UPDATE
+([write cost and HOT](../06-write-cost-hot-and-the-indexes-per-update-meter/)). So the goal is not an index per shape. It is:
+
+1. make the shapes that carry the traffic **index-served**;
+2. make every other shape at least **seek on the mandatory prefix**, so its cost is bounded by one tenant's matching rows,
+   not by the table;
+3. never write the query in a way that stops the planner from using what you built.
+
+The scoreboard grades each shape by what its work scales with. **Index-served**: the scan seeks every equality filter and reads
+rows already in ORDER BY order, so it stops after about `LIMIT` rows. **Filtered after seek**: an index narrowed the search,
+but rows are then filtered, fetched or sorted in proportion to how many match. **Sequential scan**: work proportional to the table.
+Buffers count what PostgreSQL reads: index pages above the leaf, each leaf walked, and a heap page whenever an index scan's next row is
+on a new page (bitmap and sequential scans read each heap page once). For each shape the lab runs every candidate path and keeps the one
+with the fewest buffers; PostgreSQL chooses from cost estimates, so its choice can differ.
+
+Choose **No secondary index**: every cell reads all 5,000 heap pages of the 100,000-row table to return at most 25 rows.
+
+## Mandatory filters lead
+
+Every request carries `tenant_id`, `status` and "not deleted". They are equalities, so they go first — the first rule of MongoDB's
+ESR guideline (Equality, Sort, Range), and a direct consequence of how a B-tree orders its keys.
+
+"Not deleted" works better as a **partial-index predicate** than as a key column. As a column, `deleted_at` only widens every
+entry. As `WHERE deleted_at IS NULL`, deleted rows are not in the index at all, and since that predicate implies the query's
+`deleted_at IS NULL`, PostgreSQL drops the clause from the scan ([partial indexes](../04-partial-and-expression-indexes/)).
+
+Choose **(tenant_id, status)**. Every cell is "filtered" at 3,049 buffers: a bitmap heap scan over the tenant's 4,784 live open
+tickets, then a sort, because the index holds no sort column. The cost is bounded, but it grows with the tenant.
+
+Choose **(tenant_id, status, created_at, id)**. *Newest first* drops to 17 buffers: a backward scan reads 25 entries and 14 heap
+pages, then stops. *Oldest first* reads the same index forward for 25. The trailing `id` is the unique tiebreaker. Without it,
+rows with equal `created_at` have no defined order, and a keyset cursor cannot resume between them.
+
+The optional filters are not in this index, so they become **Filters** applied after each heap fetch. *assignee = me, newest first*
+walks until 25 of the assignee's tickets turn up, discarding 914 rows: 544 buffers. *assignee + customer* matches only 3 rows, so the
+walk never reaches 25 and covers the tenant's whole range: 3,059.
+
+## Where the optional filters go
+
+An optional column has three possible homes.
+
+**Before the sort column.** Choose **Optional column before the sort**: `(tenant_id, status, assignee_id, created_at, id)`.
+*assignee = me* is index-served in both date orders, 27 and 29 buffers. But the *no optional filter* row falls to 3,064, because
+without an equality on `assignee_id` the index is ordered by assignee first and by date only within each assignee. MongoDB's guideline
+says it exactly: an index supports a sort on a subset of its keys only when the query has equality conditions on every key before the
+sort keys. PostgreSQL reaches the same answer because a column fixed by an equality clause drops out of the ordering comparison (a
+redundant pathkey) — and an absent filter fixes nothing. The unfiltered newest-first view is often the landing page, and this design makes it sort the whole tenant.
+
+**After the sort columns.** Choose **(tenant_id, status, created_at, id)** again and add `assignee_id` as a fifth column. The check now
+runs **inside the index**. In the documentation's words, equality on leading columns limits the portion of the index scanned; constraints
+on columns to the right are checked in the index, saving heap visits without narrowing the range. *assignee = me, newest first* still reads
+939 entries, but the 914 that fail cost no heap page: 33 buffers instead of 544. EXPLAIN prints both kinds under the same `Index Cond`
+label; the lab's plan pane separates the conditions that bound the range from those checked inside it. (PostgreSQL 18's skip scan can
+also narrow the range when the column before has few distinct values; the model leaves it out.)
+
+**Its own index.** `customer = Acme` matches 96 open tickets. Choose **Three indexes**: `ix_created`, `ix_assignee` and a plain `(customer_id)`.
+*customer = Acme* becomes a BitmapAnd with `ix_created`: 96 rows fetched and sorted, 129 buffers. The sort is unavoidable: PostgreSQL's
+documentation notes that a bitmap visits rows in physical order, so `ix_created`'s date order is lost. *assignee + customer* ANDs
+`ix_assignee` with it for 10. Both are graded "filtered", and both are cheap: a sort of 96 rows is fine, a sort of the biggest tenant is not.
+
+The pattern: give the **hot shape** its own composite with the optional equality before the sort, keep a composite that serves the shape
+**without** that filter, and let selective, low-traffic filters ride on a narrow index plus a small sort.
+
+## Sort orders and declared direction
+
+*Newest* and *oldest* are one index read in two directions. The support queue is different: urgent first, oldest first within each
+priority, `ORDER BY priority DESC, created_at, id`. A B-tree scan can run backward, but [a backward scan inverts **every** column](../02-composite-indexes-and-the-leftmost-prefix-rule/#direction-is-part-of-the-key) —
+PostgreSQL's `build_index_pathkeys` flips each key's direction and NULL placement together. So `x ASC, y DESC` can only come from an index
+declared `(x ASC, y DESC)` or `(x DESC, y ASC)`.
+
+Choose **Four: + priority queue**. `ix_priority` is `(tenant_id, status, priority DESC, created_at, id)`. *Priority, oldest first* is a
+forward scan at 28 buffers. *Priority, newest first* gets only the priority part in order, so PostgreSQL (13 and later) runs an
+**Incremental Sort** one priority group at a time: all 261 urgent tickets fetched and sorted to return 25. Toggle `priority` to `ASC`
+in the editor and the two cells swap: 27 for newest-first, 261 for oldest-first. MySQL can do this only since 8.0; earlier versions ignored `DESC` in index definitions.
+
+*Recently updated* is the expensive sort to index. Choose **Five: + recently updated**: that cell drops from 3,059 buffers to 28. Now read
+the write meter. An update that changes any indexed column cannot be HOT
+([HOT updates](../../../p02-storage-engines/pages-tuples-heap-files/04-hot-updates-redirect-line-pointers-and-opportunistic-page-pr/)),
+and every update sets `updated_at`. So every update now adds an entry to all five indexes: 5,000 index entries per 1,000 writes, against 1,948 with
+four (the lab assumes 200 inserts and 800 updates per 1,000 writes). Three to four already costs more than the fourth index's own entries (1,380 to 1,948): indexing `priority` makes priority
+changes non-HOT for every index.
+
+## The OR-null idiom
+
+The convenient way to write optional filters is one static statement:
+
+```sql
+WHERE tenant_id = $1 AND status = $2 AND deleted_at IS NULL
+  AND (assignee_id = $3 OR $3 IS NULL)
+  AND (customer_id = $4 OR $4 IS NULL)
+```
+
+Whether it can seek depends on one thing: does the planner know `$3` when it builds the plan?
+
+**A custom plan knows.** PostgreSQL passes the bound values marked as constants (`PARAM_FLAG_CONST`), and `eval_const_expressions`
+substitutes them. With `$3 = 107`, `107 IS NULL` folds to false, the OR drops that arm, and `assignee_id = 107` remains — the clause
+dynamic SQL would have written. With `$3` NULL, the OR folds to true and disappears.
+
+**A generic plan does not.** It must be correct for every value. An OR reaches an index as a BitmapOr, which needs an index for every arm,
+or, since PostgreSQL 18, as an array comparison when every arm compares one column with a constant. `$3 IS NULL` fits neither, so the clause
+stays a Filter. Nor is `assignee_id` fixed by an equality, so `ix_assignee` cannot supply date order either.
+
+PostgreSQL uses the generic plan whenever `plan_cache_mode = force_generic_plan`. Under the default `auto`, the first five executions of a
+prepared statement get custom plans, and after that the generic plan wins if its estimated cost is below the custom plans' average, which
+includes a charge for planning. PL/pgSQL statements are prepared statements too. SQL Server caches and reuses plans by default; `OPTION (RECOMPILE)`
+builds a throwaway plan from the current parameter values.
+
+In the lab, keep **Four** and **once, for any values (generic)**, and set the **assignee filter** to **OR $n IS NULL**. *assignee = me,
+newest first* goes from 27 buffers to 544: the plan pane shows `ix_created` scanned backward with the OR as a Filter removing 914 rows.
+Cells with the same P tag share one statement text and one plan. Index-served shapes drop from 5 to 3. Set both filters to OR-null and the
+20-shape total goes from 4,543 buffers to 35,821. Switch to **per execution (custom)** and every number returns to its dynamic-SQL value. The
+lab gives each generic plan its best case, the single plan with the fewest buffers across its shapes; a real one is chosen from estimates and can be worse.
+
+What replaces the idiom:
+
+- **Dynamic SQL per shape.** A builder appends `AND assignee_id = $n` only when present, takes column names and sort keys from a whitelist,
+  and always binds values. Each shape is its own statement with its own cached plan, and there are at most 2<sup>k</sup> × *m* of them.
+- **Per-shape partial indexes, carefully.** Choose **Partial index WHERE status = 'open'**, which adds `ix_my_open` on
+  `(tenant_id, assignee_id, created_at, id) WHERE deleted_at IS NULL AND status = 'open'`. The generic plan never uses it (544 buffers); the
+  custom plan does (27). The documentation is explicit: [implication is proved at planning time](../04-partial-and-expression-indexes/#what-the-prover-cannot-see), so a parameterized `status = $2` never implies
+  `status = 'open'`. Put such predicates into the statement text as whitelisted literals.
+- **Generated columns** for filters on expressions: a stored generated column turns `lower(email)` or a JSON field into a plain column the
+  builder compares with `=` and an index can lead with ([expression indexes](../04-partial-and-expression-indexes/)).
+
+## Cursors carry the whole sort
+
+[Keyset pagination](../05-pagination-done-right-keyset-vs-offset/) makes page *n* a seek past the last row seen:
+`(created_at, id) < ($c, $i)`. PostgreSQL compares row constructors left to right and can use the comparison as an index condition on a
+B-tree whose columns match. So the cursor must hold the last row's value for **every** sort column plus the tiebreaker, and it means
+something only for the sort and filters that produced it.
+
+A mixed-direction sort cannot be one row comparison. The priority queue expands to:
+
+```sql
+AND priority <= $3
+AND (priority < $3 OR (created_at, id) > ($4, $5))
+```
+
+The first line is logically redundant, but it is the part that bounds the scan: an inequality on the first column without an equality.
+The OR is checked row by row. `(priority, created_at, id) < (…)` is valid SQL that returns the wrong pages.
+
+In the lab, select *no optional filter, newest first* and press **Fetch page 1**, then **Next page**: page 2 arrives and the SQL pane
+shows the keyset predicate. Press **Fetch page 1** again, click *Oldest first* and press **Next page**. The cursor is rejected because it
+records its sort. A server that trusted the tuple and bound it to the new sort's columns would return 24 rows the client has already seen
+and never show the other 4,759. Repeat with *Recently updated*: no duplicates, 533 rows skipped, and every page looks plausible. Put the
+sort, a hash of the filter values and the tuple in the token, sign it, and answer a mismatch with a restart at page 1.
+
+## Counts
+
+A total count runs the same WHERE with no LIMIT, visiting every matching row on every page load — for the unfiltered shape, the
+4,784-row cost of the bitmap cells, paid again each time. Three ways out:
+
+- **Cap it**: `SELECT count(*) FROM (SELECT 1 FROM tickets WHERE … LIMIT 1001) s` stops after 1,001 matching rows and renders "1,000+".
+- **Estimate it**: show [the planner's row estimate](../05-pagination-done-right-keyset-vs-offset/#counting-without-count) for the shape as "about 4,800".
+- **Maintain it**: per-(tenant, status) counters updated in each writing transaction. Exact, but every writer for a busy tenant now
+  updates, and row-locks, the same counter row.
+
+## When it stops being an indexing problem
+
+You have outgrown composites when each new optional filter needs its own index or accepts a filtered walk, when users sort by arbitrary
+columns, when filters include ranges on several columns at once, or when tenant skew makes "bounded by the tenant" mean millions of rows.
+
+PostgreSQL's general answer is single-column indexes combined by BitmapAnd: any filter combination works, but every matching row is fetched
+and sorted. A search engine is built for this shape. Elasticsearch indexes most fields by default, so any filter combination is an
+intersection of per-field index lookups, and it sorts from **doc values**, a columnar copy of each field built at index time. The price is a second
+system, a refresh delay, and a list view eventually consistent with the database. A columnar replica is the other exit for filter-heavy
+reporting screens, since it reads only the columns a query references. Keep B-tree indexes for the shapes your main screens use and send
+the long tail elsewhere; [designing the index set for a workload](../10-designing-the-index-set-for-a-workload/) weighs them against write cost.
+
+## Where it bites in production
+
+- **Fast in testing, slow after deploy.** From a prepared statement's sixth execution the plan cache may switch to the generic plan, which cannot
+  seek an OR-null filter. The query is fast in psql with literals and slow from the application. Reproduce with
+  `SET plan_cache_mode = force_generic_plan`, `PREPARE` and `EXPLAIN EXECUTE`: the plan shows `$n` and the OR as a Filter.
+- **The largest tenant.** "Filtered after seek" cells cost in proportion to a tenant's matching rows: fine for the median tenant,
+  pathological for the largest. Test with the biggest tenant's ID.
+- **The landing page loses its order.** An optional column placed before the sort column serves the filtered shape and turns the
+  unfiltered default view into a sort of the whole tenant.
+- **Sorting by `updated_at`.** If every update sets it, its index makes every update non-HOT, adding an entry to every index on the table.
+- **Cursors reused across sort changes.** Pages skip or repeat rows. Tag, sign and validate the token.
+
+:::note[What to take forward]
+Optional filters and sort options multiply into 2<sup>k</sup> × *m* query shapes, so design an index set, not an index per query.
+Lead with the mandatory equalities, put "not deleted" in the partial predicate, then the sort columns and a unique tiebreaker. Put an
+optional column before the sort only for a hot shape, and keep another index for the shape without it. `(col = $1 OR $1 IS NULL)` seeks
+only in a custom plan, so build one statement per shape. Cursors must carry and check the full sort tuple. When shapes outgrow a handful of
+composites, the list belongs in a search engine or a columnar replica.
+:::

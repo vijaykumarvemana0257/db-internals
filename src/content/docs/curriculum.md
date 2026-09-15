@@ -5,7 +5,7 @@ tableOfContents: false
 ---
 
 12 parts · 104 modules · 716 pages.
-**89** are written so far; the rest are specified and queued.
+**104** are written so far; the rest are specified and queued.
 
 ## Part 1 — Foundations: Machines, Data and the Shape of an Engine
 
@@ -173,26 +173,26 @@ The single-node storage substrate in depth: page layout, buffer management, B-tr
 
 *advanced* — Trie- and radix-shaped structures, succinct encodings, learned models and approximate-nearest-neighbour graphs are where access-method design has moved, and each one's real cost shows up after the first build — in updates, drift and rebuilds.
 
-- SP-GiST, tries and adaptive radix trees <span class="pending">soon</span>
-- Succinct and learned indexes: rank/select, Elias-Fano and RMI <span class="pending">soon</span>
-- Why high dimensions break indexes: distance concentration and intrinsic dimension <span class="pending">soon</span>
-- Vector indexes: IVF, HNSW and quantization <span class="pending">soon</span>
-- How churn degrades a vector index: tombstones, merges and centroid drift <span class="pending">soon</span>
+- [SP-GiST, tries and adaptive radix trees](../p02-storage-engines/tries-learned-and-vector-indexes/01-sp-gist-tries-and-adaptive-radix-trees/)
+- [Succinct and learned indexes: rank/select, Elias-Fano and RMI](../p02-storage-engines/tries-learned-and-vector-indexes/02-succinct-and-learned-indexes-rank-select-elias-fano-and-rmi/)
+- [Why high dimensions break indexes: distance concentration and intrinsic dimension](../p02-storage-engines/tries-learned-and-vector-indexes/03-why-high-dimensions-break-indexes-distance-concentration-and/)
+- [Vector indexes: IVF, HNSW and quantization](../p02-storage-engines/tries-learned-and-vector-indexes/04-vector-indexes-ivf-hnsw-and-quantization/)
+- [How churn degrades a vector index: tombstones, merges and centroid drift](../p02-storage-engines/tries-learned-and-vector-indexes/05-how-churn-degrades-a-vector-index-tombstones-merges-and-cent/)
 
 ### 2.10 Index Selection and Query-Aware Indexing
 
 *advanced* — Choosing composite, covering and partial indexes against real predicates, sort orders and write costs is the most common daily database decision, and getting it wrong is the leading cause of both slow queries and write-amplified, bloated tables; it sits at the end of Part 3, after the planner modules, because every judgement call here is read straight off the cost model and cardinality estimates taught in cost-based-optimization and off the real plans, buffer counts and workload inventories the learner has just learned to collect and read in explain-and-query-tuning.
 
-- Selectivity, correlation and the decision to build an index <span class="pending">soon</span>
-- Composite indexes and the leftmost-prefix rule <span class="pending">soon</span>
-- Covering indexes and index-only scans <span class="pending">soon</span>
-- Partial and expression indexes <span class="pending">soon</span>
-- Pagination done right: keyset vs OFFSET <span class="pending">soon</span>
-- Write cost, HOT and the indexes-per-update meter <span class="pending">soon</span>
-- Choosing the index for JSONB, arrays and text search <span class="pending">soon</span>
-- Indexing for hybrid search: which indexes the pipeline needs <span class="pending">soon</span>
-- The list endpoint: optional filters, sort options and one index set <span class="pending">soon</span>
-- Designing the index set for a workload <span class="pending">soon</span>
+- [Selectivity, correlation and the decision to build an index](../p02-storage-engines/index-selection-strategy/01-selectivity-correlation-and-the-decision-to-build-an-index/)
+- [Composite indexes and the leftmost-prefix rule](../p02-storage-engines/index-selection-strategy/02-composite-indexes-and-the-leftmost-prefix-rule/)
+- [Covering indexes and index-only scans](../p02-storage-engines/index-selection-strategy/03-covering-indexes-and-index-only-scans/)
+- [Partial and expression indexes](../p02-storage-engines/index-selection-strategy/04-partial-and-expression-indexes/)
+- [Pagination done right: keyset vs OFFSET](../p02-storage-engines/index-selection-strategy/05-pagination-done-right-keyset-vs-offset/)
+- [Write cost, HOT and the indexes-per-update meter](../p02-storage-engines/index-selection-strategy/06-write-cost-hot-and-the-indexes-per-update-meter/)
+- [Choosing the index for JSONB, arrays and text search](../p02-storage-engines/index-selection-strategy/07-choosing-the-index-for-jsonb-arrays-and-text-search/)
+- [Indexing for hybrid search: which indexes the pipeline needs](../p02-storage-engines/index-selection-strategy/08-indexing-for-hybrid-search-which-indexes-the-pipeline-needs/)
+- [The list endpoint: optional filters, sort options and one index set](../p02-storage-engines/index-selection-strategy/09-the-list-endpoint-optional-filters-sort-options-and-one-inde/)
+- [Designing the index set for a workload](../p02-storage-engines/index-selection-strategy/10-designing-the-index-set-for-a-workload/)
 
 ### 2.11 Column Stores, Compression and Columnar Formats
 
