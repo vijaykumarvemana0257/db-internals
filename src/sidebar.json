@@ -173,6 +173,17 @@
             }
           }
         ]
+      },
+      {
+        "label": "2.11 Column Stores, Compression and Columnar Formats",
+        "collapsed": true,
+        "items": [
+          {
+            "autogenerate": {
+              "directory": "p02-storage-engines/column-stores-analytical-storage"
+            }
+          }
+        ]
       }
     ]
   }

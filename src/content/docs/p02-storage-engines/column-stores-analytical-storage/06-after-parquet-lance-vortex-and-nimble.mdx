@@ -1,0 +1,194 @@
+---
+title: 'After Parquet: Lance, Vortex and Nimble'
+description: What Parquet's row groups, pages and Thrift footer cost for point lookups, wide ML tables and many small files, and how Lance's per-row addressing, Nimble's flat FlatBuffer metadata and Vortex's cascading encodings with pushed-down execution answer it — against the ecosystem gravity that keeps Parquet the default.
+depth: deep
+sidebar:
+  order: 6
+---
+
+import AfterParquetAccessLab from '../../../../components/viz/AfterParquetAccessLab';
+
+Parquet was designed to scan a few columns of a very large table, sequentially, from a distributed filesystem. Big row groups,
+pages decoded whole and one footer that describes everything suit that job. The workloads that grew after 2022 are different. A training table has thousands of feature columns and a query reads ten of them. A
+vector search returns a hundred row ids, and the engine must then fetch those rows' text and embeddings from object storage, where
+every byte range is a separate request.
+
+Three formats were built around those workloads, each attacking a different assumption. **Lance** makes individual rows cheap to
+address. **Nimble**, from Meta, shrinks the metadata a wide file carries. **Vortex** treats encodings as a tree that the reader can
+execute lazily, pushing work into the compressed form. This page takes the Parquet anatomy from the
+[previous page](../05-open-formats-parquet-orc-arrow-and-nested-data-dremel/) as known and measures what each of these changes.
+
+<AfterParquetAccessLab client:visible />
+
+The lab writes one dataset three ways: a million rows of `id`, `text` of about 1.2 KB per value, a 768-dimension float32 embedding,
+and float32 features. It is a model built from each format's specification and reference writer, not a benchmark, and every format
+stores the same bytes per value, so the differences come from layout alone.
+
+## What Parquet's layout costs
+
+### The footer is one Thrift message
+
+The [footer](../05-open-formats-parquet-orc-arrow-and-nested-data-dremel/#parquet-file-anatomy) is one `FileMetaData` message in Thrift's
+compact protocol. `FileMetaData.row_groups` lists every `RowGroup`, and each `RowGroup.columns` lists a `ColumnChunk` per leaf column, whose
+`ColumnMetaData` repeats the physical type, encodings, `path_in_schema` strings, codec, sizes, page offsets and optional statistics. The
+footer therefore grows as **row groups × columns**.
+
+The compact protocol writes variable-length integers and field headers, so a reader cannot jump to row group 57, column 1,203. It
+decodes from the start: with a conventional generated parser, as the arrow-rs maintainers note, a query that reads 10 of 1,000 columns
+still parses 990 unneeded `ColumnChunk`s. In a 2024 study by parquet-rs contributors, each extra column in a 10-row-group file added about
+700 bytes of metadata without statistics, and parquet-rs 51.0.0 decoded metadata at roughly 100 MB/s. A custom Thrift parser in parquet crate 57.0.0 made decoding
+more than three times faster. The lab's defaults — about 100 bytes per `ColumnChunk` and 100 MB/s — come from those measurements,
+and the speed slider models the faster parser.
+
+Fetching it costs requests too: Arrow C++ reads the last 64 KB (`kDefaultFooterReadSize`) and issues a second request for the whole
+footer when it is larger.
+
+Choose **Narrow projection**, **2,000** columns and **128 MB (parquet-java)** row groups. In the model, at about 12 KB per row, parquet-java's
+128 MB `DEFAULT_BLOCK_SIZE` cuts the million rows into 87 row groups, so the footer lists 174,000 column chunks: about 19 MB to decode,
+186 ms of the 202 ms estimated decode time, to read 11 MB of data. Switch to **1,048,576 rows**, the Arrow C++ and parquet-rs default,
+and the footer shrinks to 258 KB. On a wide table, row-group size is a metadata setting as much as a scan setting.
+
+### The page is the smallest thing a reader can fetch
+
+Values inside a data page are encoded — the RLE/bit-packing hybrid, dictionary indices, delta — and then compressed as one unit. To
+return one value, a reader [decompresses the whole page](../04-block-compression-lz4-zstd-trained-dictionaries-and-hole-pun/#block-size-is-a-read-latency-decision). Parquet-java closes a page at 1 MB or 20,000 rows (`DEFAULT_PAGE_SIZE`,
+`DEFAULT_PAGE_ROW_COUNT_LIMIT`); parquet-rs and Arrow C++ 23.0 and later use the same limits.
+
+The footer alone locates only column chunks: `data_page_offset` plus `total_compressed_size`. Without more metadata, a reader that
+wants row 13,090 fetches the whole chunk. Choose **Point fetch** and untick **Parquet page index**: to return 100 rows, Parquet reads
+3.4 GB, 2.9 GB of it the embedding column chunk, and spends an estimated four seconds decoding.
+
+The [page index](../05-open-formats-parquet-orc-arrow-and-nested-data-dremel/#page-index-and-bloom-filters) fixes the addressing: its
+`OffsetIndex` gives every page's offset, size and first row, and pages must start on row boundaries. Tick it again: Parquet now reads 99 embedding pages of 341 rows and 93
+text pages of 1,747 rows, 195 MB in total, to return about 360 KB of values. The zoom strip shows why: the unit
+around the requested row is a page, and the page is sized for scans. Smaller pages would help, but page size applies to every reader of the file,
+including the scans the format was built for.
+
+### Many small files multiply both
+
+Every file has its own footer, so every file a query touches costs at least one request and one footer decode. Choose **Narrow projection**,
+**2,000** columns and **1,000** files. The data is still 11 MB. Parquet now decodes 252 MB of footers, about 2.5 of its 2.53 seconds.
+
+Table formats soften this. Iceberg manifests record each data file's `file_size_in_bytes` and per-column `lower_bounds` and `upper_bounds`, so
+a planner can prune files without opening them and fetch a footer without first asking for the file's size. The survivors still need their footers.
+
+## Lance: rows you can address
+
+### The file format
+
+The Lance file specification removes the row group altogether. Each column is split into its own pages — the spec recommends about 8 MB —
+and different columns can have different numbers of pages. Every page records the row offset of its first row. The tail of the file holds one
+standalone protobuf **column descriptor** per column, a column-metadata offset table with a position and size for each, an offset table for global
+buffers, one usually holding the schema, and a fixed footer ending in `LANC`.
+
+That per-column split means a reader need not decode metadata for columns it will not read. When a query projects fewer than a quarter of a
+file's columns, Lance's dataset reader loads a lightweight `FileMetadataIndex` — the offset table, not the decoded descriptors — and fetches only
+the descriptors it needs. It first reads one block from the end:
+4 KB on local disk, 64 KB on cloud storage in `lance-io`. In the lab's **Narrow projection** over **2,000** columns and 128 MB row groups,
+Lance decodes 31 KB (mostly the 16-byte-per-column offset table) where Parquet decodes 19 MB.
+
+From file format 2.1, a page's **structural encoding** decides how rows are found:
+
+- **Mini-block** is the default for small values such as integers and short strings. Values are cut into mini-blocks of a power-of-two count, at
+  most 4,096 by default (`LANCE_MINIBLOCK_MAX_VALUES`) and under 32 KB compressed. Two bytes per mini-block record its size and value count, and
+  that lookup is loaded into the reader's search cache when the column is first opened. A point read decodes one mini-block.
+- **Full-zip** is used above 256 bytes per value — embeddings, long text. Repetition and definition levels are zipped together with each value, and
+  compression must be per value so individual values stay addressable. A non-nullable fixed-width value is a flat buffer, so its location is
+  `row × width`. Variable-width values get a **repetition index**: one offset per row, byte-packed. A lookup costs two requests — the index entry,
+  then the value — unless the whole index is loaded into memory.
+- **Blob** layout, for values of about 1 MB and up, stores each value out of line and keeps only its position and size in the page.
+
+Back to **Point fetch** with the defaults. Lance reads exactly 100 embeddings (300 KB), makes 200 requests for the 100 text values, and reads 85
+mini-blocks of `id`: 1.7 MB in all, against Parquet's 195 MB. It issues more requests — 387 — but each is tiny, and object stores serve range
+requests in parallel. In the zoom strip, Lance's bands shrink to single rows.
+
+### The dataset around the files
+
+A Lance dataset is a sequence of **versions**. Each version is an immutable manifest in `_versions/` that lists **fragments**. A fragment holds one or
+more data files, each storing a subset of the columns, plus an optional deletion file: an Arrow IPC list of deleted offsets, or a Roaring bitmap, which suits
+dense deletes.
+
+That layout is what makes **re-embedding** cheap. Adding or recomputing a column means writing one new data file per fragment and committing a new manifest;
+the text and features are never rewritten, and the previous version remains readable. In Iceberg or Delta Lake, adding a column is a metadata change,
+but filling it in for existing rows writes those rows, every column of them, into new Parquet files.
+
+Rows are addressed as `(fragment_id << 32) | local_row_offset`. Vector indexes (IVF_PQ, IVF_HNSW_SQ, IVF_SQ, IVF_RQ, IVF_FLAT) and scalar indexes (B-tree,
+bitmap, zone map, Bloom filter, full-text) live in `_indices/` and return those addresses. A vector search followed by a fetch of the matching rows is
+exactly the lab's point fetch. For multimodal data, blob v2 columns (file format 2.2 and later) hold either inline bytes or a URI with an optional byte
+range, and `take_blobs` hands back a file-like handle that can stream or seek.
+
+## Nimble: metadata sized for wide tables
+
+Nimble — formerly Alpha — is Meta's format for tables with thousands to tens of thousands of columns, typical of feature engineering and training data.
+It answers the footer problem with a different metadata shape rather than a different access path.
+
+Nimble files are organized as stripes of **streams**. The footer, a FlatBuffer, points to a stripes section (row counts, offsets, sizes) and to
+**stripe groups**. A stripe group is `stripe_count` plus two flat `uint32` arrays, `stream_offsets` and `stream_sizes`, laid out stripe × stream: eight
+bytes per stream per stripe before compression, with no path strings, encoding lists or statistics. Each metadata section can be compressed on its own.
+Schema, column statistics, chunk statistics and indexes are named optional sections, located by the footer and loaded separately. For the lab's 2,000 columns
+as one stream each in 87 stripes, that is about 1.3 MB of offsets and sizes before compression, where the lab's Parquet estimate is 19 MB.
+
+The encodings are not in the footer at all. Every encoding written into a stream starts with a prefix — one byte of encoding type, one of data type, then a row count — and
+encodings nest: a dictionary encoding's alphabet and indices are each encoded again, and each level can be compressed. The default
+`ManualEncodingSelectionPolicy` scores candidates by estimated size times a read factor that favors fast decoding. The reader speculatively reads the last 8 MB
+of a file (`kInitialFooterSize`) to get the postscript, footer and nearby metadata in one request.
+
+Nimble is closely tied to Velox, offers no stability or versioning guarantees yet, and asks developers to use its one library rather than
+reimplement the specification.
+
+## Vortex: encodings the reader can execute
+
+Vortex, a Linux Foundation project, starts from arrays rather than files. An in-memory Vortex array is a tree of encodings. The documentation's example is a
+dictionary-encoded string column whose codes are run-end encoded, whose run ends are frame-of-reference over bit-packing, and whose dictionary values are Arrow-style
+string views. Compressed encodings include ALP for floats, FSST for strings, FastLanes bit-packing, frame of reference and delta, run-end, sparse and PCodec — the
+cascading approach of BtrBlocks, covered on the [encodings page](../02-lightweight-encodings-rle-dictionary-delta-bit-packing-for-a/). Each logical type has one
+**canonical** encoding that matches Arrow's layout, so a fully decoded array converts to Arrow without copying.
+
+Execution is deferred. When an operation reaches an encoded array, Vortex looks for a kernel that works on the compressed form: a scalar function over a dictionary
+array is pushed into the dictionary values, one over a run-end array is pushed into the run values, and slicing a run-end array is a binary search over its run ends.
+Only when no kernel exists is the array decoded to canonical form. Scans push down further: filter conjuncts are reordered by observed selectivity, zone-map statistics
+rule out row ranges before data is read, and the DuckDB integration can hand FSST-compressed strings to DuckDB without decompressing them.
+
+A Vortex file starts and ends with `VTXF`; before the trailing magic sit a version tag, the postscript length and a postscript locating the dtype, the **layout** tree,
+file statistics and a footer holding the segment map. There are no row groups in the specification: the layout tree — flat, struct,
+chunked, dictionary and zoned layouts — decides. The metadata is FlatBuffers, and the reader walks layout children and struct field types lazily. The format has been
+backward compatible since 0.36.0; forward compatibility, planned through decoders embedded as WebAssembly, is not implemented yet.
+
+So a Vortex point read costs whatever the writer's layout makes it cost. The default `WriteStrategyBuilder` splits rows into 8,192-row blocks, computes zone-map statistics per block,
+and coalesces blocks into segments of at least 1 MB uncompressed; for wide fixed-width types it shrinks the block to `ceil(1 MB / value size)` rows. A reader never reads
+less than one segment. In the lab's **Point fetch**, Vortex reads 99 embedding segments of 342 rows — about what Parquet reads with its page index — and 72 text segments of
+8,192 rows, 338 MB, because a string has no fixed size to shrink the block by. A custom layout strategy can cut smaller segments.
+
+## Why Parquet stays the default
+
+The Iceberg specification's data file formats are `parquet`, `orc` and `avro`; Delta Lake writes Parquet. Spark, Trino,
+DuckDB and the cloud warehouses all read Parquet, and catalogs, governance tools and compaction services are built around it. Vortex lists integrations with DuckDB,
+DataFusion, Spark and Trino, with Iceberg support still marked as coming. Lance brings its own table format. Nimble is one library.
+
+Parquet also keeps absorbing the criticisms: the page index, Bloom filters, size statistics and faster footer parsers. FlatBuffers have been proposed as an alternative footer
+encoding, but changing the footer means every reader in the ecosystem must change with it.
+
+A practical rule: keep tables that many engines share in Parquet. Reach for Lance when the workload is vector search, row-level fetches and frequent column backfills. Consider
+Vortex where you control the readers and decode speed dominates. Nimble is, for now, a format for Velox-based systems.
+
+## Where it bites in production
+
+- **Point lookups on Parquet without a page index read whole column chunks.** Arrow C++ writes it by default since 20.0 and parquet-rs
+  writes the `OffsetIndex` unless told not to, but PyArrow's `write_table` still defaults to `write_page_index=False`. Expect whole-page reads even then.
+- **Byte-sized row groups on wide tables inflate every footer**, as the 2,000-column example showed. Watch query planning time, not just
+  scan time.
+- **Small files multiply footer cost.** A job over thousands of files can spend more time fetching and decoding footers than reading data. Compact files, and let table-format
+  statistics prune files before footers are opened.
+- **Many tiny requests have their own limits.** Lance's per-row reads and Vortex's 1 MB segments rely on parallel range requests. Readers coalesce nearby ranges — Vortex's object-store
+  reader merges ranges within 1 MB up to 16 MB with 192 concurrent reads by default, Arrow C++ pre-buffering merges gaps under 8 KB up to 32 MB — but per-prefix request-rate limits still apply.
+- **Lance row addresses move.** Compaction and materialized deletes rewrite data files, which changes row addresses and requires index maintenance; stable row ids are optional.
+  A variable-width full-zip column costs two requests per row unless its repetition index sits in memory.
+- **Young formats move fast.** Vortex's segment sizes are writer policy, not a format guarantee, and without forward compatibility a reader older than the writer can meet encodings it
+  cannot decode. Nimble makes no stability promise. Pin library versions on both sides.
+
+:::note[What to take forward]
+Parquet's cost for new workloads is structural: the page is the smallest fetchable unit, and the footer is one Thrift message that grows as row groups × columns and must be decoded
+whole. Lance removes row groups and makes rows addressable — mini-blocks for small values, per-row offsets for large ones — and builds a versioned dataset where a new embedding column
+is one new file per fragment. Nimble shrinks wide-table metadata to flat offset arrays and moves encoding choices into the streams. Vortex makes encodings an executable tree and lets its writer choose
+the layout. All three fight the same gravity: Parquet is what every engine and catalog already reads.
+:::

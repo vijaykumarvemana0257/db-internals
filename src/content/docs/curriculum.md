@@ -5,7 +5,7 @@ tableOfContents: false
 ---
 
 12 parts · 104 modules · 716 pages.
-**104** are written so far; the rest are specified and queued.
+**112** are written so far; the rest are specified and queued.
 
 ## Part 1 — Foundations: Machines, Data and the Shape of an Engine
 
@@ -198,14 +198,14 @@ The single-node storage substrate in depth: page layout, buffer management, B-tr
 
 *advanced* — Analytical storage wins not by clever execution but by what it refuses to read: columnar layout touches only projected columns, lightweight encodings shrink them enough to scan in cache and evaluate predicates without decoding, entropy sets the floor those encoders are chasing and explains why ordering beats codec tuning, block compressors and open formats like Parquet/ORC/Arrow — plus the post-2022 successors aimed at random access, wide schemas and fast decode — decide what a reader must fetch over a network, semi-structured JSON either shreds into typed sub-columns or costs 10-100x to scan, and sort keys plus min/max metadata skip most blocks outright — these are the primitives every analytical engine and table format in the next module is built out of.
 
-- Columnar layouts: NSM, DSM, PAX and row groups <span class="pending">soon</span>
-- Lightweight encodings: RLE, dictionary, delta, bit-packing, FOR and friends <span class="pending">soon</span>
-- Entropy and the limits of compression: what ratio should you expect? <span class="pending">soon</span>
-- Block compression: LZ4, ZSTD, trained dictionaries and hole punching <span class="pending">soon</span>
-- Open formats: Parquet, ORC, Arrow and nested data (Dremel) <span class="pending">soon</span>
-- After Parquet: Lance, Vortex and Nimble <span class="pending">soon</span>
-- Shredding JSON into columns: VARIANT, dynamic columns and variant Parquet <span class="pending">soon</span>
-- Sort keys, clustering and multi-dimensional data skipping <span class="pending">soon</span>
+- [Columnar layouts: NSM, DSM, PAX and row groups](../p02-storage-engines/column-stores-analytical-storage/01-columnar-layouts-nsm-dsm-pax-and-row-groups/)
+- [Lightweight encodings: RLE, dictionary, delta, bit-packing, FOR and friends](../p02-storage-engines/column-stores-analytical-storage/02-lightweight-encodings-rle-dictionary-delta-bit-packing-for-a/)
+- [Entropy and the limits of compression: what ratio should you expect?](../p02-storage-engines/column-stores-analytical-storage/03-entropy-and-the-limits-of-compression-what-ratio-should-you-/)
+- [Block compression: LZ4, ZSTD, trained dictionaries and hole punching](../p02-storage-engines/column-stores-analytical-storage/04-block-compression-lz4-zstd-trained-dictionaries-and-hole-pun/)
+- [Open formats: Parquet, ORC, Arrow and nested data (Dremel)](../p02-storage-engines/column-stores-analytical-storage/05-open-formats-parquet-orc-arrow-and-nested-data-dremel/)
+- [After Parquet: Lance, Vortex and Nimble](../p02-storage-engines/column-stores-analytical-storage/06-after-parquet-lance-vortex-and-nimble/)
+- [Shredding JSON into columns: VARIANT, dynamic columns and variant Parquet](../p02-storage-engines/column-stores-analytical-storage/07-shredding-json-into-columns-variant-dynamic-columns-and-vari/)
+- [Sort keys, clustering and multi-dimensional data skipping](../p02-storage-engines/column-stores-analytical-storage/08-sort-keys-clustering-and-multi-dimensional-data-skipping/)
 
 ### 2.12 Analytical Storage Engines
 

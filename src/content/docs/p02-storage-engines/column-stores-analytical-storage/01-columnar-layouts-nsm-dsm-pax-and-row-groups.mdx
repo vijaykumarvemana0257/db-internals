@@ -1,0 +1,228 @@
+---
+title: 'Columnar layouts: NSM, DSM, PAX and row groups'
+description: How NSM pages, DSM column files, PAX minipages and file-scale row groups decide which bytes a scan reads and which cache lines it touches, and how columns are rejoined by position, early or late.
+depth: basics
+sidebar:
+  order: 1
+---
+
+import ColumnarLayoutScanLab from '../../../../components/viz/ColumnarLayoutScanLab';
+
+An analytical query reads a few columns of a wide table and a large share of its rows. A row store keeps each
+row's values together, so it pays for every column on every scan. A column store keeps each column's values
+together, so it reads only the columns the query names — and then has to put rows back together.
+
+Every columnar layout answers two storage questions: what unit is read from storage, and how bytes are arranged
+inside that unit. The executor answers a third: when to stitch columns back into rows. The
+[row, column and key-value models page](../../../p01-foundations/anatomy-of-a-database-engine/03-row-column-and-key-value-physical-models/)
+introduced the vocabulary. This page measures it: the lab stores one million rows of a 20-column orders table
+three ways and runs the same scan against each.
+
+<ColumnarLayoutScanLab client:visible />
+
+The lab counts four things:
+
+- **Bytes read** — what storage has to deliver.
+- **Byte ranges** — how many separate reads that takes, before a reader merges nearby ones. Each is a seek on a
+  disk or a GET on object storage.
+- **Cache lines touched** — distinct 64-byte lines of memory that hold a value the scan reads.
+- **Positional stitches** — values fetched by row number to rebuild a row.
+
+The model has no compression, no zone maps and no indexes, so every layout reads the whole filter column.
+[Encodings](../02-lightweight-encodings-rle-dictionary-delta-bit-packing-for-a/) and [data skipping](../08-sort-keys-clustering-and-multi-dimensional-data-skipping/) come later in this module.
+
+## NSM: the row is contiguous
+
+The N-ary storage model is the ordinary slotted page. The lab's NSM page follows PostgreSQL: a 24-byte page
+header, a 4-byte line pointer per tuple, and tuples made of a 23-byte header (padded to 24) followed by the
+attributes in declaration order, each padded to its type's alignment. The orders row has 153 bytes of values,
+168 after padding and 192 with its header, so 41 rows fit on an 8 KB page (the
+[tuple layout page](../../../p02-storage-engines/pages-tuples-heap-files/02-tuple-layout-headers-null-bitmaps-alignment-and-varlena/)
+covers those bytes).
+
+The page is the unit of I/O, so a scan reads every page however few columns it needs. The default query sums
+`total_cents` and `quantity` where `order_date` matches 1% of rows. NSM reads all 24,391 pages: 191 MB.
+
+In memory, NSM costs more than it looks. PostgreSQL's `slot_deform_heap_tuple` extracts attributes in order, from the first up to the one it needs, and remembers how
+far it got. A sequential scan runs the WHERE clause first (`ExecQual`), which deforms each tuple up to the
+highest attribute the clause references. Only for rows that pass does the projection (`ExecProject`) deform
+further, up to the highest attribute the SELECT list needs. The NSM page map shows the result: in every tuple,
+some bytes are marked *read only to reach a later attribute*.
+
+For the default query that costs 1,010,050 cache lines: one line per row to reach `order_date`, the fifth
+attribute, plus a second line for each of the 10,050 matching rows. Now choose **Filter on the wide comment
+column**. `comment` is the 19th attribute and ends 177 bytes into the tuple, so every row costs three lines and
+NSM touches 3,000,000. In a row store, an attribute's position is a CPU cost.
+
+## DSM: the column is contiguous
+
+The decomposition storage model — Copeland and Khoshafian, SIGMOD 1985 — splits an *n*-attribute relation into
+*n* sub-relations. As the PAX paper describes it, each sub-relation holds a logical record id (a surrogate) and
+one attribute value, stored in ordinary slotted pages. A query that needs several attributes rebuilds rows by
+joining the sub-relations on the surrogate.
+
+Reading only the needed sub-relations is the point, and it works. Set **Query** back to **Sum 2 columns, 1% of
+rows match**: the column-chunk layout reads 15 MB against NSM's 191 MB. Storing the surrogate is the problem. Tick
+**Store a row id with every value**: every value gains a 4-byte id, the query reads 27 MB instead of 15, and the
+whole column file grows from 146 MB to 222 MB — larger than the NSM table it replaced. Untick it again: the rest
+of this page quotes the lab without stored ids.
+
+Abadi, Madden and Hachem measured this in *Column-Stores vs. Row-Stores: How Different Are They Really?*
+(SIGMOD 2008). They emulated a column store inside a row store: one table per column, each with an integer
+position column added. On the 60-million-row SSBM `lineorder` table, one such column table took 0.7–1.1 GB even
+after compression — about 8 bytes of tuple overhead per row plus 4 bytes each for the record id and the value.
+The whole 17-column table took about 4 GB compressed, so, as the authors note, scanning just four emulated
+columns takes as long as scanning the entire table. The same integer column took 240 MB in C-Store.
+
+### Virtual ids: the position is the key
+
+Column stores drop the stored id. Every column of a table is kept in the same row order, so the *i*-th value of
+every column belongs to row *i*. C-Store calls this a **storage key**. In its read-optimized store, storage keys
+are numbered 1, 2, 3, … and "are not physically stored, but are inferred from a tuple's physical position in the
+column". Finding row *i* in a fixed-width column is `start + i × width`: array indexing, not a join.
+Variable-width columns add an offset array, and Parquet's nullable and nested columns add definition and
+repetition levels; the [open formats page](../05-open-formats-parquet-orc-arrow-and-nested-data-dremel/) covers both.
+
+A join index is needed only when two sets of columns are stored in *different* orders. C-Store stores
+**projections**: groups of columns sorted on the same key, where one column may appear in several projections
+with different sort orders. Inside a projection, reconstruction is positional. Between projections, a join index
+maps each row to its segment and storage key in the other projection — and the paper warns that join indexes are
+very expensive to maintain under updates. Inside a Parquet row group, a DuckDB row group or a ClickHouse part,
+every column shares one row order, so reconstruction there is always positional.
+
+## PAX: columnar inside the page
+
+*Weaving Relations for Cache Performance* (Ailamaki, DeWitt, Hill and Skounakis, VLDB 2001) kept NSM's page and
+changed only what happens inside it. A PAX page stores the same records NSM would, but groups each attribute's
+values into its own **minipage**. The page header records the number of attributes, their sizes, where each
+minipage starts and how many records the page holds. Fixed-width values go in F-minipages, with a presence bit
+vector for nullable attributes. Variable-width values go in V-minipages, with an offset to the end of each
+value. The *i*-th value in every minipage belongs to record *i*.
+
+The paper states that PAX does not affect I/O, and the lab agrees: PAX holds the same 41 rows per page and reads
+the same 191 MB. What changes is memory. A cache line of `order_date` values holds 16 dates, not one date
+surrounded by other attributes. For the default query PAX touches 317,075 cache lines to NSM's 1,010,050. In the
+page maps, NSM's needed bytes run down the whole page, tuple after tuple; PAX's sit in three narrow bands.
+
+In the paper's Shore implementation, PAX saved at least 75% of NSM's data-cache stall time and ran range
+selections on memory-resident relations 17–25% faster. Its scan operator also did what the rest of this page is
+about: it read each predicate attribute's minipage in sequence and fetched projected values only for qualifying
+records, by computed offset.
+
+## Row groups: PAX at the scale of a file
+
+An 8 KB page is too small a columnar unit: every column is still interleaved with the others once per page, so a
+scan still reads all of them. Modern formats apply PAX's idea to a much larger
+horizontal unit and store columns apart inside it.
+
+Parquet's specification defines the hierarchy. A file holds one or more **row groups**. A row group holds exactly
+one **column chunk** per column, contiguous in the file. A column chunk is divided into **pages**, the indivisible
+unit of encoding and compression. Chunks are written in order — column 1 to column N of the first row group, then
+the next row group — and the file metadata, written last, records where every chunk starts. A reader fetches that
+footer first and then reads only the chunks it needs.
+
+| System | Horizontal unit | Inside it | Default size |
+|---|---|---|---|
+| Parquet (parquet-java) | row group | a column chunk per column, cut into pages | 128 MB row groups (`DEFAULT_BLOCK_SIZE`), 1 MB pages |
+| Parquet (Arrow C++) | row group | a column chunk per column, cut into pages | at most 1,048,576 rows per row group, 1 MB pages |
+| ORC | stripe | index and data sections divided by column | 64 MB stripes (`orc.stripe.size`), a row index every 10,000 rows |
+| DuckDB | row group | column segments stored in 256 KB blocks | 122,880 rows — 60 vectors of 2,048 |
+| ClickHouse MergeTree | part | a file per column (Wide) or one shared file (Compact), read in granules | granules of up to 8,192 rows (`index_granularity`) |
+
+ClickHouse's part plays the row group's role. A part of at least `min_bytes_for_wide_part` (10 MB by default) is
+stored **Wide**, one file per column. Smaller parts are **Compact**, with all columns in one file, which the
+documentation recommends for small, frequent inserts. Each part is divided into **granules**, the smallest set of
+rows ClickHouse reads, and every column stores a mark per granule so a reader can seek straight to it.
+
+Row group size does not change how many bytes a scan reads. It changes how the reader gets them. Move **Row group
+size** in the lab. At 8,192 rows the default query needs 369 byte ranges. At DuckDB's 122,880 it needs 27. With
+one row group for the whole table — plain DSM — it needs 3. The three needed columns are not adjacent in the
+schema, so each row group adds three separate ranges.
+
+Parquet's specification recommends large row groups, 512 MB to 1 GB, for larger sequential reads, and notes that they need more buffering on the write path. It names the row group as the unit of parallelism and notes that smaller row groups make a file more
+resilient to corruption. Per-row-group statistics are also one level of min/max skipping, covered in
+[sort keys and data skipping](../08-sort-keys-clustering-and-multi-dimensional-data-skipping/).
+
+## Early and late materialization
+
+Somewhere between the scan and the client, columns become rows. Abadi, Myers, DeWitt and Madden framed the choice
+in *Materialization Strategies in a Column-Oriented DBMS* (ICDE 2007):
+
+- **Early materialization** adds a column to an intermediate tuple as soon as it is read. The scan reads blocks of
+  every needed column, stitches them into rows, and then applies the predicates.
+- **Late materialization** scans each predicate column and outputs *positions* — a list, a bitmap or ranges.
+  Predicates on several columns combine by intersecting position lists. Only then does it re-access the other
+  columns, extract the values at those positions and build rows.
+
+Early is the lab's default. The column-chunk layout stitches all 1,000,000 rows from three columns — 2,000,000
+positional lookups — before the filter discards 99% of them. Switch **Materialization** to **Late**. Stitches fall
+to 20,100 (10,050 matches × 2 columns), and cache lines fall from 250,000 to 81,537, because most lines of
+`total_cents` and `quantity` hold no matching value.
+
+The bytes read do not move: still 15 MB. The stat under the figure says why: 246 of 246 granules of the other
+columns are read. A granule of 8,192 rows is read whole or not at all, and at 1% selectivity essentially every
+granule contains a match. Scattered matches make late materialization a CPU and cache win, not an I/O win.
+
+Two things change that:
+
+- **Rare matches.** Drag **Rows matching** down to 0.001%. Ten rows match, 20 of the 246 granules are read, and the
+  scan reads 4.8 MB: all of `order_date` plus those 20 granules.
+- **Clustered matches.** Return to 1% and choose **Clustered**, which models a range predicate on the column the
+  table is sorted by. The 10,000 matches fill the first two granules of each column: 4 of 246 granules, 4.0 MB.
+
+Sorted data makes matching positions contiguous, which is one reason sort keys matter so much, in C-Store's
+projections and in the engines that followed.
+
+Late materialization is not free. The ICDE paper found it an order of magnitude faster on some workloads and
+slower on others. It must re-access columns it has already scanned, which is cheap when the blocks are still in
+memory and positions are sorted but expensive after a join has reordered them. The paper's heuristic: materialize
+late when the output is aggregated, when predicates are selective, or when columns use lightweight compression;
+otherwise materialize early. The lab does not charge for the position list or the second pass, so early never
+wins in it. At 100% of rows matching, the two strategies merely tie.
+
+### What engines actually do
+
+**ClickHouse** materializes late at granule granularity with `PREWHERE`. It first reads only the columns the
+condition needs, then reads the other columns only for blocks that contain at least one matching row. The
+optimizer moves eligible `WHERE` conditions into `PREWHERE` automatically (`optimize_move_to_prewhere`) and
+evaluates several conditions one column at a time, typically starting with the cheapest column to read. For
+`ORDER BY … LIMIT` queries with a small limit, **lazy materialization** goes one step further: after filtering, ClickHouse reads the
+sort column, sorts and applies the limit, and only then reads the remaining columns for the surviving rows
+(`query_plan_optimize_lazy_materialization`).
+
+**DuckDB** does it per vector inside the row-group scan. For each 2,048-row vector, the scan evaluates the
+filtered columns first and builds a selection vector. If no row survives, the other columns skip the vector;
+otherwise they are fetched through the selection vector. For top-N queries (`ORDER BY … LIMIT`) and fixed-size
+`SAMPLE`s of at most `late_materialization_max_rows` rows (50 by default), and for some `LIMIT … OFFSET` queries,
+DuckDB's late-materialization optimizer runs the operator over only the columns it needs plus the row id, then
+semi-joins on the row id to fetch the rest.
+
+## Where it bites in production
+
+- **`SELECT *` against a column store.** Choose **SELECT * for one customer (10 rows)**. Early materialization
+  reads all 146 MB and performs 19,000,000 stitches to return ten rows. Late materialization reads 19 MB: all of
+  `customer_id`, plus one granule of each of the other 19 columns per matching row — 190 granules, which at the default
+  122,880-row row groups take 161 separate ranges. On object storage each range is a request unless the reader
+  merges nearby ones. A point lookup costs a granule per column, which is why
+  row-shaped lookups belong in a row store.
+- **Tiny row groups and small parts.** Writers that flush every few thousand rows turn one read into hundreds:
+  the default query goes from 27 byte ranges to 369 as row groups shrink from 122,880 rows to 8,192.
+- **Huge row groups.** Writers buffer more before each flush, and parallelism and min/max skipping get
+  coarser.
+- **Late materialization that saves no I/O.** With scattered matches, even a 1% predicate reads every granule of
+  the projected columns. When I/O dominates, cluster by the predicate column.
+- **Filters on late, wide attributes in a heap table.** PostgreSQL deforms every attribute before the one a
+  predicate needs: in the lab, filtering on the 19th column costs three cache lines per row where filtering on the
+  fifth costs one.
+- **Row stores imitating column stores.** One table per column stores an id and a tuple header beside every
+  value, so four such tables weigh as much as the whole compressed table.
+
+:::note[What to take forward]
+A columnar layout is two decisions: the unit read from storage, and how bytes are arranged inside it. NSM keeps
+rows together, so a scan reads every column and walks attributes in memory. PAX keeps the page but groups values
+by column, which cuts cache lines without changing I/O. DSM and row groups store columns apart, so a scan reads
+only the columns it names, and row group size trades byte ranges and writer memory against parallelism and
+skipping granularity. Columns are rejoined by position, not by stored ids. Late materialization defers that
+stitching until predicates have produced positions: it saves CPU whenever predicates are selective, but saves I/O
+only when matches are rare or clustered.
+:::

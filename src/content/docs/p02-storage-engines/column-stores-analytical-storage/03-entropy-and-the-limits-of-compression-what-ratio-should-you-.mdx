@@ -1,0 +1,226 @@
+---
+title: 'Entropy and the limits of compression: what ratio should you expect?'
+description: Why Shannon entropy is the floor under every lossless column encoding, why order-0 coders stop at H₀ while sorting lowers the floor itself, why Huffman rounds and arithmetic coding does not, why random ids and encrypted bytes never shrink, and how to read measured compressed sizes as information estimates.
+depth: intermediate
+sidebar:
+  order: 3
+---
+
+import EntropyFloorLab from '../../../../components/viz/EntropyFloorLab';
+
+A codec benchmark tells you how much smaller one file got. It does not tell you whether a different codec, a higher level,
+or a week of tuning could do better. That question has an answer, and it comes from information theory: every column carries
+a certain amount of information, no lossless encoding can store less, and a good encoder is already close. Once you are near
+that floor, the only way down is to change what the encoder sees. Usually that means changing the column's order.
+
+<EntropyFloorLab client:visible />
+
+## The floor: entropy
+
+Take a column whose values occur with frequencies p₁, p₂, …, p_K. Its **zero-order entropy** is
+
+```
+H₀ = −Σ pᵢ · log₂ pᵢ      bits per value
+```
+
+A value that appears half the time is worth 1 bit, one that appears a quarter of the time is worth 2, and H₀ is the average.
+Sixteen equally common values give exactly 4 bits. Make them skewed, and most rows hold one of a few common values, so H₀
+falls. The lab's default column — 16 distinct codes drawn from a Zipf distribution with skew 2 — has H₀ = 1.97 bits per value.
+
+Shannon's source coding theorem says no uniquely decodable code has an expected length below the entropy of its source. H₀
+is that bound for any encoder that codes **each value on its own**, with a fixed code per value. Such a coder cannot know
+anything about a row's neighbours.
+
+Real columns are not a bag of independent values. **Conditional entropy** measures what is left once you know the previous
+value:
+
+```
+H₁ = H(Xᵢ | Xᵢ₋₁) = −Σ p(a, b) · log₂ p(b | a)
+```
+
+Conditioning never adds uncertainty, so H₁ ≤ H₀. Conditioning on the previous k values gives Hₖ, which can only fall further
+as k grows. For a stationary source that sequence converges to the **entropy rate**: the true floor, which no encoder beats
+on average, whatever model it uses.
+
+The lab draws three lines from the column it generated:
+
+- **H₀**, from the column's value histogram. For the random-id column every value is distinct, so the histogram says nothing
+  about the 2⁶⁴-value domain; the lab uses the 64 bits each id carries.
+- **H₁**, measured on the column as stored.
+- **The information floor**: the entropy of the stored column. The lab builds every column the same way — independent draws,
+  then each block sorted — so this can be calculated from the column's value frequencies, and the next sections explain how.
+
+One caution about measured Hₖ. The plug-in estimate counts how often each value follows each context, and it collapses when
+contexts are rare. If every context appears once, every "next value" looks certain, and the estimate is 0. Pick **4,096
+distinct values** with skew 0 in arrival order. The true H₁ is 12 bits, but the raw estimate under **Show the numbers** is
+4.04, because each of the 4,096 contexts is seen only about 16 times. A model with that many contexts costs more to describe
+than it saves. The lab never lets the H₁ line fall below the information floor.
+
+## Coders that reach H₀
+
+In arrival order the lab's rows are independent draws, so H₁ = H₀ and H₀ is the floor. The two **order-0 entropy coders**
+show how close a real encoder gets.
+
+**Huffman coding** builds the optimal prefix code: each value gets a whole number of bits, shorter codes for common values.
+Its average length L satisfies H₀ ≤ L < H₀ + 1. The loss comes from rounding each ideal length −log₂ p up or down to an integer,
+and it is worst when one value dominates. A value with probability 0.9 is ideally worth 0.15 bits, but no Huffman code is
+shorter than 1 bit.
+
+**Arithmetic coding** does not assign codewords to values. It narrows one interval for the whole message, and an ideal
+implementation's output stays within about two bits of −log₂ of the message's probability. That lets it spend fractional bits per
+value. **Asymmetric numeral systems** (ANS) reach the same efficiency by a different construction; the lab runs a static rANS coder.
+
+Set the lab to **2 distinct values** and **skew 3**. H₀ is 0.508 bits. rANS lands at 0.509. Huffman spends exactly 1.00 bit per
+value — no better than bit-packing a boolean. At **16 values, skew 3**, Huffman spends 1.32 bits against rANS's 0.957 and an H₀
+of 0.952.
+
+Zstandard uses both. RFC 8878 specifies Huffman coding, with codes of at most 11 bits, for literal bytes, and FSE —
+"an entropy codec based on ANS" — for literal lengths, match lengths and offsets. Both stages see bytes and match
+descriptions, never your column's values.
+
+Static coders also pay for their model: the decoder needs the frequency table. The lab charges Huffman and rANS 17 bits per
+distinct value for its count. At **4,096 values, skew 0**, that is 1.06 bits per value, so both land at 13.0 bits against an H₀
+of 12. With few distinct values the table is noise; with many, it is a real cost.
+
+The practical consequence: once an order-0 coder sits on H₀, **no other order-0 coder can help**. At 16 values and skew 0, bit-packing,
+Huffman and rANS all land within 0.02 bits of 4.00.
+
+## Lightweight encodings are already near the floor
+
+The encodings from the [previous page](../02-lightweight-encodings-rle-dictionary-delta-bit-packing-for-a/) are not entropy coders,
+but for many analytical columns they come close to one. Bit-packing costs ⌈log₂ K⌉ bits per value, which *is* H₀ when K is a power of
+two and the values are uniform. The gap to H₀ is the column's skew: in the default column, 4.00 bits against 1.97.
+
+That gap is what a block compressor's entropy stage collects. In the default state, the RLE/bit-packing hybrid stores 3.96 bits per
+value, and running ZSTD level 3 over those bytes brings it to 2.25 — most of the way to H₀. Now choose **skew 0**: the hybrid is at
+4.02 bits and ZSTD cannot improve it, because bit-packed uniform codes already look random byte by byte. The RFC recommends storing a
+block as a Raw_Block whenever the compressed form would be larger.
+
+ZSTD on PLAIN integers does worse than you may expect. In the default state it reaches 4.21 bits per value, behind simple bit-packing.
+At **4,096 values, skew 0**, PLAIN → ZSTD needs 16.3 bits at level 1, 16.7 at level 3 and 15.5 at level 19, while bit-packing
+stores 12. Step through the levels: they move the bar a few percent, because a longer match search cannot find structure that is not
+there.
+LZ4, with no entropy stage at all, needs 26.0.
+
+This is the division of labor the next pages build on: encodings turn values into a dense form close to H₀, and the block compressor
+collects the remainder. The [block compression page](../04-block-compression-lz4-zstd-trained-dictionaries-and-hole-pun/) covers the
+compressors themselves.
+
+## Order moves the floor
+
+Sorting does not change a column's histogram, so it cannot change H₀. What it destroys is **ordering information**. A block of W
+values in which value v appears n_v times can be arranged in W! / ∏ n_v! distinct orders. In arrival order, the column had to record
+which one occurred. Once the block is sorted, there is only one order left. The floor falls by
+
+```
+log₂( W! / ∏ n_v! )   bits per sorted block
+```
+
+The lab computes the expected value of that term from the column's value frequencies and subtracts it from H₀ to get the
+information floor. For a low-cardinality column, almost all of H₀ is ordering information.
+
+Return to the default column and choose **Sorted per 1,024**:
+
+- **H₀ stays at 1.97 bits.** The values are the same.
+- **The information floor falls to 0.055 bits.** H₁ falls to 0.082: after a value, the next one is almost always the same value.
+- **Huffman and rANS do not move** (2.03 and 1.97). They code each value alone, so they cannot see the order.
+- **Encoders that exploit neighbours follow the floor down.** The RLE/bit-packing hybrid reaches 0.404 bits, PLAIN → ZSTD 3 reaches
+  0.310, and the hybrid followed by ZSTD reaches 0.206.
+
+The best measured ratio over PLAIN is now 155×, and the floor allows 586×. In arrival order the floor allowed 16.3×. **No codec swap
+gets a column from 16× to 155×. Sorting does.** Choose **Fully sorted** and the floor drops to 0.0015 bits per value; the hybrid
+encodes 65,536 values in 51 bytes.
+
+Which encoder collects the reduction depends on the *shape* of the new structure. Choose **256 distinct values, skew 0, Sorted per
+1,024**. The floor falls from 8 bits to 0.745, but runs average just 4.1 values, and Arrow's [RLE/bit-packing encoder](../02-lightweight-encodings-rle-dictionary-delta-bit-packing-for-a/#runs-rle-and-parquets-hybrid) only starts a
+run on a group of 8 equal values. The hybrid stays at 7.88 bits. DELTA_BINARY_PACKED, which stores the small differences between
+sorted neighbours, reaches 2.42; the hybrid followed by ZSTD reaches 2.36.
+
+### What real engines do with this
+
+**ClickHouse** MergeTree tables store each data part's rows sorted by the table's key, so the key order sets the order of every column. Its guide to primary
+keys loads the same 8.87 million rows into two tables. With `PRIMARY KEY (URL, UserID, IsRobot)`, cardinalities in descending order,
+the `UserID` column compresses from 33.83 MiB to 11.24 MiB. With `(IsRobot, UserID, URL)`, ascending, it compresses to 877.47 KiB — a
+ratio of 39 instead of 3, from reordering alone. Leading with a low-cardinality column creates long runs in which the next column is
+locally sorted. The same guide warns that a UUID or hash as the first key column hurts the compression of the table's other columns.
+
+**Parquet** records an optional `sorting_columns` list in each row group's metadata, and writers that sort rows before writing a
+row group get runs in its column chunks. A **Redshift** compound sort key, the default sort type, orders rows by its columns in the
+order they are listed, just like a ClickHouse key, and its documentation calls run-length encoding best suited to values that repeat consecutively,
+for example in a table sorted by those values.
+
+Choosing the sort key across several columns, and keeping data clustered as it changes, is the topic of the
+[sort keys and clustering page](../08-sort-keys-clustering-and-multi-dimensional-data-skipping/).
+
+## Data that will not compress
+
+Switch the column to **Random 64-bit ids**. Each value is one of 2⁶⁴ equally likely numbers, so it carries 64 bits. Every bar stays at
+or above 64.0 bits at every ZSTD level, and LZ4 does no better. Huffman and rANS are worse, at 97.0 bits: every value is distinct, so
+the model has to list all of them.
+
+This is not a weakness of the codecs. There are 2ⁿ possible n-bit inputs and fewer than 2ⁿ shorter outputs, so no lossless compressor
+can shrink every input. Whatever it shrinks, it must grow something else. The same holds for:
+
+- **UUIDv4.** RFC 9562 fills 122 of its 128 bits with random data. Stored as a 16-byte binary value it is essentially incompressible.
+  Stored as 36 characters of text, a codec can at best recover the waste of spelling 122 bits in hex.
+- **Encrypted data.** A modern cipher's output is designed to be indistinguishable from random bytes. Compress before you encrypt,
+  never after.
+- **Already compressed payloads** such as JPEG images or gzip blobs inside a column. Their redundancy was removed once already.
+
+Codecs bound the damage rather than failing. zstd can store a block that would grow as a raw block, and both libraries publish worst-case bounds:
+lz4.h defines `LZ4_COMPRESSBOUND(isize)` as `isize + isize/255 + 16`, and zstd.h's `ZSTD_COMPRESSBOUND` adds about `srcSize >> 8`.
+You still pay the CPU to find out.
+
+Now sort the random ids. **Fully sorted** removes exactly the ordering information: log₂(65,536!) / 65,536 = 14.6 bits per value,
+which by Stirling's approximation is about log₂ N − 1.44 for N distinct values. The floor is 49.4 bits. DELTA_BINARY_PACKED stores
+the gaps between neighbours and reaches 51.1. ZSTD stays at 64.0 at every level: LZ matching and byte-level entropy coding cannot
+subtract one number from another. Sorting within 1,024-value blocks removes only 8.56 bits per value.
+
+A time-ordered UUIDv7, whose first 48 bits are a Unix timestamp in milliseconds, shows both effects in one value. Inserted in time
+order, the timestamp prefix is nearly sorted and delta-friendly. The remaining 74 bits stay incompressible wherever the generator fills
+them with random data; RFC 9562 also lets it spend some of them on a counter or a sub-millisecond clock.
+
+## Measured size is an information estimate
+
+A good encoder's output is an upper bound on the information a column carries. When encoders built on different models — an entropy
+coder, a delta encoding, an LZ codec — converge on the same size, you are probably near the floor, and further codec work is unlikely to
+pay. When they disagree, structure is present that some encoder is missing. On sorted random ids every bar but one sits at 64 bits or
+more; only DELTA_BINARY_PACKED finds the 51.
+
+Engines expose the numbers you need:
+
+- **ClickHouse** reports `data_compressed_bytes` and `data_uncompressed_bytes` per column in `system.columns`. The guide's comparison
+  above is exactly that query.
+- **Parquet** stores `total_uncompressed_size` and `total_compressed_size` per column chunk. The "uncompressed" size counts pages before
+  the block codec but after encoding, so the ratio between the two shows only what the codec added. A dictionary-encoded column can look
+  barely compressed even when its encodings did most of the work.
+- **Redshift**'s `ANALYZE COMPRESSION` samples rows — 100,000 per slice by default, set with `COMPROWS` — and reports an estimated
+  reduction for each column compared with RAW. It takes an exclusive table lock while it runs.
+
+Bits per value turns directly into storage and scan cost. At the default column's 1.97 bits, a billion rows are about 246 MB; as PLAIN
+INT32 they are 4 GB. A scan reads the compressed size of every projected column, so the same arithmetic sizes query I/O and network
+transfer from object storage.
+
+Whatever tool produces the estimate, the sample must keep the physical order. Rows picked at random break up the runs of a sorted or
+clustered column and measure something much closer to its arrival-order floor. Compress contiguous blocks instead.
+
+## Where it bites in production
+
+- **Raising the ZSTD level on a high-entropy column.** CPU goes up and the size barely changes. At 4,096 uniform values, level 1 to 19
+  moves PLAIN → ZSTD from 16.3 to 15.5 bits, still worse than 12-bit bit-packing.
+- **A high-cardinality column at the front of the sort key.** A UUID, a hash or a URL first leaves every other column in effectively
+  random order. The ClickHouse guide measured a 13× difference in one column's compressed size from key order alone.
+- **Compressing encrypted or pre-compressed blobs.** Pure CPU cost. Store them uncompressed, or move them out of the column store.
+- **Sort-key columns that compress far better than their neighbours.** Redshift warns that range-restricted scans can perform poorly when
+  sort key columns are compressed much more highly than other columns. With `ENCODE AUTO` disabled it assigns RAW to sort key columns,
+  and `ANALYZE COMPRESSION` returns their existing encoding without analysing them.
+- **Ratios that decay.** A column that compressed well when it was loaded in sorted order compresses worse as unsorted inserts
+  accumulate. The information in each value did not change; the ordering information came back.
+
+:::note[What to take forward]
+Entropy is the floor. H₀ bounds any coder that encodes values independently: Huffman stays within a bit of it, and arithmetic coding
+and ANS reach it. Lightweight encodings already sit close for low-cardinality columns, and a block compressor mostly collects what is
+left. Sorting leaves H₀ unchanged but removes ordering information, which for low-cardinality columns is nearly all of it — a bigger
+lever than any codec or level. Random ids, ciphertext and compressed payloads carry their full width in information and cannot shrink.
+Read measured compressed size, taken on data in its physical order, as an estimate of how much information a column really holds.
+:::

@@ -1,0 +1,219 @@
+---
+title: 'Shredding JSON into columns: VARIANT, dynamic columns and variant Parquet'
+description: How ClickHouse JSON, Snowflake VARIANT and the Parquet Variant shredding spec turn schema-less documents into per-block typed sub-columns plus a fallback blob — and why a path that misses the limit, changes type or arrives late can cost a walk of that blob on every query.
+depth: deep
+sidebar:
+  order: 7
+---
+
+import JsonShreddingDriftLab from '../../../../components/viz/JsonShreddingDriftLab';
+
+A JSON column stored as one text or binary document per row gives up every advantage this module has built. A filter on
+one field must read and parse every document to find that field. Dremel-style shredding, from the
+[open formats page](../05-open-formats-parquet-orc-arrow-and-nested-data-dremel/), fixes that only when the schema is
+declared up front — which is exactly what semi-structured data lacks.
+
+So engines **infer** the columns. They watch which paths occur, store the common ones as typed sub-columns, and keep the
+rest in a fallback blob. The inference runs separately for each block of data — a ClickHouse part, a Snowflake
+micro-partition, a Parquet file — so one table can hold a path as a typed column in one block and inside a blob in the next.
+A query's cost depends on which of the two it meets.
+
+<JsonShreddingDriftLab client:visible />
+
+## The common shape: sub-columns plus a fallback
+
+All three designs keep one invariant: **within a block, each path's values live in exactly one place**, a sub-column or the
+fallback. The Parquet spec says a partially shredded object's `value` "must never contain fields represented by the Parquet
+columns in `typed_value`". That is what lets a reader answer from the sub-column alone. The engines differ in everything else:
+
+| Decision | ClickHouse `JSON` | Snowflake `VARIANT` | Parquet Variant, written by Spark 4.1 |
+|---|---|---|---|
+| Unit of inference | each data part | each micro-partition | each file |
+| Which paths get columns | first come, up to `max_dynamic_paths` (1024) | up to 200 elements per partition | fields in ≥10% of the first 4,096 rows, within `maxSchemaWidth` (300) |
+| A path whose type changes | one `Dynamic` sub-column holding several types | not extracted | an untyped `value`-only column |
+| JSON `null` | same as a missing key | element not extracted | stored in `value` as Variant null |
+| Fallback | shared data, a `Map(String, String)` | the rest of the document, parsed | the enclosing object's `value` binary |
+
+The lab applies each rule to the same documents, with limits shrunk so a few dozen documents reach them. The limit slider
+shows each engine's real default.
+
+## ClickHouse: dynamic paths and shared data
+
+ClickHouse's `JSON` type, production-ready since 25.3, takes optional parameters:
+
+```sql
+CREATE TABLE events (
+  doc JSON(max_dynamic_paths = 1024, max_dynamic_types = 32,
+           user_id UInt64, SKIP debug, SKIP REGEXP '^props\.tmp_')
+) ENGINE = MergeTree ORDER BY tuple();
+```
+
+A path with a **type hint** (`user_id UInt64`) always gets its own typed sub-column. Every other path is **dynamic**. As
+ClickHouse parses a block, each new path becomes a sub-column of type `Dynamic`, until the block holds `max_dynamic_paths` of
+them. Every further new path in that block goes to **shared data**, which in memory is a `Map(String, String)` from flattened
+path to binary-encoded value. `JSONDynamicPaths(doc)` and `JSONSharedDataPaths(doc)` show which is which.
+
+The lab opens on that case with the limit scaled to 6. Part 1 has five paths, so `amount` gets a sub-column. In part 2 the new
+`device.os` and `device.app` keys come before `amount` in the first document and take the last two slots, so `amount` spills. The
+note reports that `amount` is a sub-column in 1 of 4 parts and that a filter on it reads 1.7 KB, 8.8× what a typed column of the
+same values costs. Nothing gives the path you query most priority. The first paths to arrive win.
+
+Two behaviours set ClickHouse apart:
+
+- **`Dynamic` absorbs type drift.** Each value carries a type discriminator, and up to `max_dynamic_types` (32) types are kept as
+  separate variants. Pick **JSON nulls and mixed types**: `zip` holds integers and strings and stays one sub-column, marked "2 types".
+- **`null` is not stored.** The docs say `null` and a missing key "are considered equivalent": `'{}'::JSON = '{"a": null}'::JSON`.
+
+### How shared data is read
+
+A filter on an overflowed path costs whatever the part's shared-data serialization makes it read. The MergeTree setting
+`object_shared_data_serialization_version` picks one of three:
+
+- **`map`** stores one Map column. Reading one path reads every path's entries and filters in memory.
+- **`map_with_buckets`** hashes paths into several Map columns — 8 by default in compact parts, 32 in wide parts — and reads one bucket.
+- **`advanced`** stores extra structure so a read touches only the requested path. It writes slowly and uses more space, so the docs
+  advise against it for freshly inserted parts; `object_shared_data_serialization_version_for_zero_level_parts` sets those separately.
+
+Switch **Shared data serialization**. The same `amount` filter reads 1.7 KB with `map`, 1.0 KB with `map_with_buckets` and 359 B with
+`advanced`.
+
+### Merges decide again
+
+When merged parts hold more paths than the limit, ClickHouse "tries to keep paths that contain the largest number of non-null values"
+and moves the rarest to shared data. Choose **Path explosion: user-defined keys**. Each event carries five random `props.flag_N` keys
+ahead of `user.plan`, so after `ts` and `event` rare flags take the four remaining slots, and `user.plan`, present in 40 of 48 documents, sits in shared data in all four parts.
+Its filter reads 4.3 KB, 63% of the raw JSON text. Tick **Merge all parts into one** and `user.plan` becomes a sub-column: 232 B.
+
+Changing `max_dynamic_paths` on an existing column is an `ALTER TABLE … MODIFY COLUMN` mutation that rewrites every part. To change the
+limit for new parts only, use `merge_max_dynamic_subcolumns_in_wide_part`, `merge_max_dynamic_subcolumns_in_compact_part` or the session
+setting `max_dynamic_subcolumns_in_json_type_parsing`; none of them can exceed the type's `max_dynamic_paths`.
+
+## Snowflake VARIANT: extraction per micro-partition
+
+The 2016 Snowflake SIGMOD paper describes the mechanism. For each table file the system analyses the documents, infers types, and
+finds the "frequently common" typed paths. It removes those from the documents and stores them in the same compressed columnar format
+as relational data, with min/max metadata for pruning. Projections and casts are pushed into the scan, so a query extracting two paths
+reads two columns and casts them straight to SQL types.
+
+Snowflake's current documentation gives the extraction rules:
+
+- At most **200 elements per partition** are extracted by default.
+- An element containing **even one JSON `null`** is not extracted (a missing value is fine), so that VARIANT `null` stays distinct from SQL `NULL`.
+- An element with **more than one type**, such as `{"foo": 1}` and `{"foo": "1"}`, is not extracted.
+- A query on an element that was not extracted "must scan the entire JSON structure, and then for each row traverse the structure".
+
+Switch the lab to **Snowflake VARIANT** with **JSON nulls and mixed types**. `zip` is not extracted because it mixes numbers and strings;
+`coupon` is not extracted because some rows set it to `null`. A filter on either reads the whole rest of the documents, 602 B, where a filter on the
+extracted `total` column reads 294 B. If your nulls just mean "absent", the file format option `STRIP_NULL_VALUES = TRUE` removes them at load.
+
+Because extraction is per file, a path may have column metadata in some files and not in others. The paper's answer is a Bloom filter over the
+**paths** present in each file, which lets the optimizer skip files that do not contain the queried path. Choose **Events whose schema drifts**
+and filter on `userId`, which replaced `user_id` halfway through: the first two partitions are skipped unread.
+
+JSON has no date type, and the docs say dates and timestamps in a VARIANT are stored as strings. For better pruning they recommend flattening
+date strings, numbers held in strings, and arrays into typed relational columns.
+
+## Variant in Parquet: an open encoding and a shredding spec
+
+Parquet's **Variant** logical type is the open version of this design. Spark 4 reads and writes it, and Iceberg v3 uses its encoding. An
+unshredded Variant is two binary columns. **`metadata`** is a dictionary of every field name in the value. **`value`** is a
+self-describing binary tree whose objects list field ids sorted by name, so a reader can binary-search a key instead of scanning text.
+Still, a filter on one field reads every row's `value`.
+
+**Shredding** adds an optional `typed_value` next to a `value`, recursively:
+
+```text
+optional group event (VARIANT(1)) {
+  required binary metadata;
+  optional binary value;              -- fields that were not shredded
+  optional group typed_value {
+    required group event_ts {
+      optional binary value;          -- event_ts values that are not timestamps
+      optional int64 typed_value (TIMESTAMP(true, MICROS));
+    }
+  }
+}
+```
+
+The pair encodes four states. `typed_value` alone means the shredded type. `value` alone means a value of any type, including JSON `null`
+stored as Variant null `00`. Both null means the field is missing. Both set is legal only for a **partially shredded object**, whose `value`
+holds the unshredded fields.
+
+The spec draws a sharp line for skipping: `typed_value` statistics may skip files, row groups or pages **only when the matching `value`
+column is all null**. One stray string in `value` and the typed min/max no longer covers every row. Iceberg's manifests follow suit: variant
+bounds are keyed by normalized path such as `$['event_type']` and "must not be written to describe values with mixed Variant types".
+
+### What Spark chooses to shred
+
+The spec leaves the choice of fields to the writer. In Spark 4.1, with the internal setting `spark.sql.variant.inferShreddingSchema`
+(default `true`), the Parquet writer:
+
+1. buffers the **first 4,096 rows** of each file, or 64 MB, before creating the file writer;
+2. merges the types seen for each field — integers and decimals merge, any other mismatch makes the field an untyped `value`-only column;
+3. drops fields present in fewer than **10%** of those rows;
+4. spends `spark.sql.variant.shredding.maxSchemaWidth` (300) on one column per field plus one per `typed_value`, **in alphabetical order**.
+   Fields left when the budget runs out stay in their parent's `value`.
+
+That schema then serves the whole file. Switch the lab to **Spark → Parquet variant**. With **JSON nulls and mixed types**, `zip` becomes a
+`value`-only column while `coupon` is typed, because nulls merge with any type. With **Events whose schema drifts**, set **Documents per file**
+to 24: `geo` first appears after the second file's buffered rows, so `geo.city` sits in the top-level residual `value` and its filter reads 1.2 KB, 9.7× a typed column.
+The lab buffers 10 rows instead of 4,096, but the effect holds at scale: a path that starts after row 4,096 of a file is invisible to that file's schema.
+
+Two consequences are easy to miss. The budget is spent alphabetically, so on a very wide object `zone_id` can lose its column to fields you
+never query. And "different files may contain conflicting shredding schemas", so typed statistics can skip only the files whose schema shredded that path.
+
+## BigQuery's JSON type
+
+BigQuery's `JSON` type accepts documents without a schema. Its documentation says BigQuery can then "encode and process each JSON field
+individually", but does not publish inference limits like the other three. Two documented constraints matter: a nesting limit of 500, and no
+partitioning or clustering on a JSON column, since equality and comparison are undefined for the type.
+
+## Path explosion, drift and metadata
+
+Every shredded path costs something in **every block** that has it. A Parquet footer holds a schema element per node, and each row group holds a
+`ColumnChunk` with `ColumnMetaData` and statistics for every leaf column. A shredded field adds two leaves, so Spark's default budget of 300 means
+roughly 300 extra column-chunk entries per row group, [decoded with the footer](../06-after-parquet-lance-vortex-and-nimble/#the-footer-is-one-thrift-message) before any data is read. In ClickHouse each dynamic path is its own set
+of sub-column streams in every part. The docs give that as the reason for the limit: "an enormous number of different sub-columns" can "make the table unusable".
+
+Explosion usually comes from data stored in keys: user ids, flag names or tags used as object keys. Fix the shape rather than the limit. Move the key into
+a value (`[{"flag": "x", "on": true}]`), declare a map column, or drop the noisy subtree with ClickHouse's `SKIP REGEXP`.
+
+Drift is the slow version of the same problem. A renamed key splits one field across two paths. A field that becomes `"12.50"` instead of `12.5` gets a second
+type inside ClickHouse's `Dynamic`, loses extraction in Snowflake, and falls back to `value` in Parquet.
+
+## When to promote a path to a real column
+
+Shredding is best effort. A declared column is a guarantee. Promote a path when latency-sensitive queries filter, join or group on it.
+Promote it when it drives pruning, clustering or partitioning ([sort keys and zone maps](../08-sort-keys-clustering-and-multi-dimensional-data-skipping/)):
+BigQuery cannot partition or cluster on a JSON column, a Snowflake clustering key needs the path cast to a type (`v:"Data":id::number`), and a
+ClickHouse skip index takes a type-hinted path or a cast such as `json.b::String`. And promote it when it is at risk of overflow because it
+arrives late, sits among many sibling keys, or drifts in type or nullness.
+
+In ClickHouse, add a type hint such as `JSON(amount Decimal(18, 2))` or a regular column. Typed paths are stored apart from dynamic paths and do not count
+toward `max_dynamic_paths`. Changing hints on an existing column rewrites parts, unless the experimental `allow_experimental_json_lazy_type_hints` makes it a
+metadata-only change that casts old parts at query time. In Snowflake, flatten the element into a relational column at load. With Parquet Variant, write the
+field as its own top-level column, outside any per-file inference.
+
+Tick **Promote the filter path to a typed column** on the default ClickHouse view. The `amount` filter drops from 1.7 KB to 196 B, and part 2 no longer
+needs shared data, because a type-hinted path never competes for a dynamic slot.
+
+The **Rows/s at 1 GB/s** tile converts bytes read at one fixed rate. It is a normalization, not a benchmark: walking a binary document or scanning a Map costs
+more per byte than decoding a typed column, so the real gap is wider than the byte ratio.
+
+## Where it bites in production
+
+- **A query slows down with no change to the query.** A deploy adds keys that reach new blocks ahead of the field you filter on, and that field drops into the
+  fallback. Bytes read for one predicate jump. Check `JSONSharedDataPaths` or the per-file Parquet schema before the query plan.
+- **One `null` de-columnarizes a Snowflake element.** A producer that starts sending `"coupon": null` instead of omitting the key turns a column scan into a
+  document walk in every partition that receives it.
+- **Type drift disables skipping.** One string in a numeric Parquet field leaves `value` non-null, so typed statistics can no longer skip that file.
+- **Compaction changes performance in both directions.** A ClickHouse merge promotes the most common paths. A Spark rewrite picks one schema from the first
+  rows of the new file, which may not represent the rest.
+- **Wide keyspaces cost metadata before data**: large footers, many sub-column streams, slow merges. Reshape the data rather than raising the limit.
+
+:::note[What to take forward]
+Shredding stores the paths an engine chose as typed sub-columns and everything else in a fallback, and makes that choice per part, partition or file.
+ClickHouse takes the first `max_dynamic_paths` paths and tolerates type drift; Snowflake extracts up to 200 elements but refuses any with nulls or mixed
+types; Spark's Parquet writer decides from each file's first 4,096 rows. A path in a sub-column costs what a column costs; a path in the fallback costs a scan
+of the blob in every block. Promote the paths your queries depend on, and keep unbounded keys out of the object structure.
+:::

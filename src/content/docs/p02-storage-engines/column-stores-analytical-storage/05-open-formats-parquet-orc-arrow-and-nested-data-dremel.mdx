@@ -1,0 +1,221 @@
+---
+title: 'Open formats: Parquet, ORC, Arrow and nested data (Dremel)'
+description: Dremel repetition and definition levels and the assembly state machine, Parquet and ORC file anatomy for footer-first reads, and Arrow's validity bitmaps and offsets for zero-copy IPC.
+depth: intermediate
+sidebar:
+  order: 5
+---
+
+import DremelRecordShredderLab from '../../../../components/viz/DremelRecordShredderLab';
+import ArrowNestedBuffersLab from '../../../../components/viz/ArrowNestedBuffersLab';
+
+An open format has to be readable by Spark, Trino, DuckDB and others, usually from object storage where every
+read is a separate ranged request, and its data is often nested: JSON-shaped events, protobuf messages, lists of structs. So the
+bytes must say where each column is, what a reader can skip, and how a flat column remembers the shape of its record.
+
+Parquet and ORC answer on disk; Arrow answers in memory. The encodings inside a page were covered in
+[lightweight encodings](../02-lightweight-encodings-rle-dictionary-delta-bit-packing-for-a/) and
+[block compression](../04-block-compression-lz4-zstd-trained-dictionaries-and-hole-pun/); this page is the structure around them.
+The lab builds a real Parquet file from nested records you can edit.
+
+<DremelRecordShredderLab client:visible />
+
+## Shredding: repetition and definition levels
+
+Parquet's nested encoding comes from Google's Dremel paper (Melnik et al., VLDB 2010), and the format's README says so. A
+schema is a tree whose fields are `required`, `optional` or `repeated`, and every leaf becomes one column. The paper's
+`Document` schema, loaded in the lab, has six leaves, from `DocId` to `Name.Url`.
+
+Values alone lose the structure: two `Code` values could belong to one name, two names, or two records. Dremel stores two small
+integers with every value.
+
+**The definition level** counts how many `optional` or `repeated` fields on the leaf's path are actually present.
+`Name.Language.Country` has three such fields, so its maximum definition level is 3. A value at `d = 3` is a real country. A
+`NULL` at `d = 2` means the `Language` exists but has no country, `d = 1` means the `Name` exists but has no language, and
+`d = 0` means the record has no `Name` at all. Nulls are never stored as values: the level *is* the null.
+
+**The repetition level** says at which repeated field in the path the value repeated, and `0` starts a new record. In the
+first record, `Code` holds `'en-us'` at r = 0 (first in the record), `'en'` at r = 2 (`Language` repeated), and, after a `NULL`
+for the second `Name`, `'en-gb'` at r = 1 (`Name` repeated).
+
+That `NULL` is the other half of the idea: every present group instance adds at least one entry to every leaf column beneath it,
+even when the leaf is missing, which keeps the columns aligned. The lab's stripes for the paper's records are exactly its Figure 3.
+
+Try two edits:
+
+- In the JSON, delete `, "Country": "us"`. The first `Country` entry becomes `NULL` at `d = 2`, and no other column changes.
+- Pick **Three-level LIST&lt;string&gt;**. Parquet's logical-type spec tells new writers to wrap lists in three levels (a `LIST`
+  group, a `repeated group list`, an `element`), as pyarrow does. The `element` column's definition levels separate four cases: `d = 0` a null list (`id` 3), `d = 1` an empty list (`id` 2),
+  `d = 2` a null element, `d = 3` a value. A bare `repeated` field, as in the paper's schema, cannot tell an empty list from a
+  missing one.
+
+Levels are cheap: the maximum level fixes the bit width (2 bits for `Country`), pages store them with the RLE/bit-packing hybrid,
+and a top-level `required` column such as `DocId` has no level streams at all.
+
+## Assembly: a state machine over column readers
+
+A query that reads two leaves needs records made of only those leaves, without touching the other columns. Dremel builds a
+finite-state machine with one state per selected column, in schema order. After a reader returns a value, it looks at the
+**next** repetition level in its column, and that level picks the next state:
+
+- If the level is no deeper than the repeated ancestor this field shares with the next selected field (the paper calls that
+  field the *barrier*), move on to the next field. The current nested record still needs that field's values.
+- Otherwise the ancestor that repeats at that level is starting a new instance, so jump back to the first selected field
+  inside that ancestor.
+
+Switch back to the paper's records: with every column ticked, the lab draws its Figure 4. `Links.Forward` loops back to itself on level 1. `Country`
+jumps back to `Code` on level 2, a new `Language`. `Url` jumps back to `Code` on level 1, a new `Name`. Level 0 always flows
+forward, to the end of the record.
+
+The assembler keeps the chain of nested records currently open. A value's definition level says how deep that chain must reach,
+so a `NULL` still opens a `Name` when its level says one exists; a jump back closes the ancestor that repeats, so the next value
+opens a fresh instance.
+
+Untick everything except `DocId` and `Name.Language.Country`. The machine shrinks to Figure 5: two states, with `Country`
+looping on levels 1 and 2. Press **Assemble step by step**, then **Next read**:
+
+- Read 2 is `'us'`. It opens `Name[0]` and `Language[0]`. The next level is 2, so `Language[0]` closes.
+- Read 3 is a `NULL` at `d = 2`. It opens `Language[1]` and appends nothing. The next level is 1, so `Name[0]` closes.
+
+The finished records keep an empty `Language` and two empty `Name` groups. The `Country` column alone carried enough levels to
+rebuild groups whose other fields were never read. Seven reads rebuild both records; all six columns take 23.
+
+That is row-at-a-time assembly. Vectorized readers skip building records: Arrow C++'s Parquet reader
+turns levels straight into validity bitmaps and list offsets, column by column, in `DefLevelsToBitmap` and `DefRepLevelsToList`.
+
+## Parquet file anatomy
+
+A Parquet file is the magic `PAR1`, the column data, a footer, the footer's length as 4 little-endian bytes, and `PAR1` again.
+
+- A **row group** is a horizontal slice of rows. It holds exactly one **column chunk** per leaf column, and each chunk is
+  contiguous in the file.
+- A chunk is a run of **pages**, the unit of encoding and compression. An optional dictionary page comes first (at most one
+  per chunk), followed by data pages. A version 1 data page holds the repetition levels, the definition levels and the values,
+  back to back, after a Thrift `PageHeader` whose `num_values` counts nulls too. With dictionary encoding the values are
+  `RLE_DICTIONARY` indices.
+- The **footer** is a `FileMetaData` struct in Thrift's compact protocol. It holds the schema, flattened depth-first, and for
+  every row group and column a `ColumnChunk` whose `ColumnMetaData` records `path_in_schema`, `codec`, `num_values`,
+  `total_compressed_size`, `dictionary_page_offset`, `data_page_offset` and `statistics` (`min_value`, `max_value`,
+  `null_count`).
+
+The metadata comes last so a writer can stream rows out in one pass. Readers therefore start at the end. The numbered brackets
+under the lab's byte map are the reads a footer-first reader issues: the last 8 bytes for the length, the footer, then one range
+per column chunk it needs. Arrow C++ saves a round trip by reading the last 64 KB in one request (`footer_read_size`), and reads
+again only if the footer is larger.
+
+The lab's file is real (pyarrow reads it back as the same records) and tiny, which makes one cost easy to see. Tick only `DocId` and the reader fetches 681 of the 1,139 bytes, 600 of them footer. Then drag **Rows per
+row group** to 1: the footer grows to 959 bytes, because it holds a `ColumnChunk` entry for every column in every row group.
+
+Real files reverse the ratio: row groups of 128 MB to 1 GB or a million rows (the defaults are tabled on the
+[columnar layouts page](../01-columnar-layouts-nsm-dsm-pax-and-row-groups/#row-groups-pax-at-the-scale-of-a-file)) and pages of about 1 MB. The footer dominates again only for very wide schemas,
+where [the formats after Parquet](../06-after-parquet-lance-vortex-and-nimble/) begin.
+
+Footer statistics skip whole row groups: if a query wants `DocId = 42` and a row group's `max_value` is 20, none of its chunks are
+fetched. Two caveats:
+
+- **Bounds may be loose.** A writer may store `"B"` and `"C"` for a long string, so bounds can only rule row groups out.
+- **The old fields are unsafe for non-ASCII strings.** The deprecated `min` and `max` used signed byte comparison; new writers fill
+  `min_value` and `max_value` using the footer's `column_orders`.
+
+### Page index and Bloom filters
+
+Row-group statistics are coarse. The **page index** adds two structures per column chunk. They live after the row groups, near
+the footer, so a reader that is not filtering never fetches them.
+
+- `ColumnIndex`: per data page, `min_values`, `max_values`, `null_pages`, `null_counts`, plus a `boundary_order` saying whether
+  the pages are sorted, which allows binary search.
+- `OffsetIndex`: per data page, its `offset`, its `compressed_page_size` (header included) and its `first_row_index`.
+
+A selective reader uses the filtered column's `ColumnIndex` to find matching pages and turns them into row ranges. It then uses
+every other column's `OffsetIndex` to fetch only the pages holding those rows. That only works if pages line up with rows, so
+when an `OffsetIndex` is present every page must start at a row boundary (`repetition_level = 0`).
+
+Back at 2 rows per row group, tick **Write page index**. All the `ColumnIndex` blocks, then all the `OffsetIndex` blocks, appear before the footer (pyarrow's
+order), the file grows from 1,139 to 1,299 bytes, the chunk's footer entry gains `column_index_offset` and `offset_index_offset`,
+and page statistics leave the page headers. pyarrow writes no page index unless you pass `write_page_index=True`.
+
+For equality predicates on high-cardinality columns, where min/max prunes nothing, a chunk can carry a **Bloom filter**: a
+split-block filter of 256-bit blocks over XXH64 hashes, found through `bloom_filter_offset` and `bloom_filter_length`. The spec's sizing table puts a 1% false-positive rate
+at about 10.5 bits per distinct value. The lab writes none. Whether any of these
+statistics prune depends on sort order, the subject of [sort keys and data
+skipping](../08-sort-keys-clustering-and-multi-dimensional-data-skipping/).
+
+## ORC: stripes, streams and a row index
+
+ORC came out of Hive 0.11 and makes different choices for the same goals.
+
+- **The tail.** The last byte is the length of the PostScript (under 256 bytes, never compressed), which gives the compression
+  kind and the lengths of the footer (stripes, type tree, file statistics) and of the per-stripe statistics. The spec's reader
+  takes the last 16 KB in one read, hoping to get all of it.
+- **Stripes** hold whole rows; `orc.stripe.size` defaults to 64 MB in the Java writer. A stripe has its index streams first,
+  then its data streams, then a stripe footer that is the directory of streams and column encodings.
+- **Streams instead of pages.** A column is several streams: `PRESENT`, one bit per value and omitted when a stripe has no
+  nulls; `DATA`; `LENGTH` for strings and lists; `DICTIONARY_DATA`.
+- **The row index.** A `ROW_INDEX` stream per column has one entry every 10,000 rows (`orc.row.index.stride`), holding min/max
+  statistics and the stream positions to seek to. Bloom filters for columns listed in `orc.bloom.filter.columns` add one filter
+  per 10,000 rows, consulted only for groups that pass min/max.
+- **Nesting without levels.** A struct column has only a `PRESENT` stream and its child columns. A list column is `PRESENT`, a
+  `LENGTH` stream of list sizes and one child column. That is closer to Arrow's offsets than to Dremel's levels.
+
+| | Parquet | ORC | Arrow IPC |
+|---|---|---|---|
+| Horizontal unit | row group | stripe | record batch |
+| Inside a column | pages | streams | buffers |
+| Metadata | Thrift compact, in the footer | Protobuf, in the file tail | Flatbuffers message headers; file footer |
+| Nesting | repetition and definition levels | `PRESENT` and `LENGTH` streams | validity bitmaps and offsets |
+| Finer index | optional page index | row index every 10,000 rows | none needed: slots are addressable |
+
+## Arrow: the same data in memory
+
+Arrow specifies columnar data in memory and how to move it between processes without converting it. Every array except a union has a **validity bitmap**, one bit per slot, `1` for valid, least-significant bit first, which may be left unallocated when there are no nulls. Strings and lists add an **offsets buffer** of `length + 1` signed 32-bit integers (64-bit for the `Large` variants):
+slot *j* spans `offsets[j]` to `offsets[j+1]`, in the string bytes or in the child array. A struct is a validity bitmap plus one
+child array per field, and a dictionary array is integer indices plus a separate dictionary array. Unlike a Postgres
+[tuple's null bitmap](../../../p02-storage-engines/pages-tuples-heap-files/02-tuple-layout-headers-null-bitmaps-alignment-and-varlena/),
+the bitmap belongs to a column, not a row.
+
+<ArrowNestedBuffersLab client:visible />
+
+The lab holds the shredder's preset records in this layout. Where Parquet stores levels, Arrow stores positions. The default fetch is
+`Name.Url` for record 1: `Name`'s `offsets[1] = 3` and `offsets[2] = 4` select one child slot, and `Url`'s offsets at slot 3 give
+the bytes of `'http://C'`. That is two offset reads, and it would still be two for record ten million. The **Parquet levels decoded
+first** tile shows the other side: a data page has no per-row index, so a reader starting at the top of the page decodes the levels
+of the three earlier `Url` entries to find where record 1 begins. The `OffsetIndex` narrows the search to a page, not to a row.
+
+Switch to the **three-level LIST** records. `tags` has validity `1 1 0 1` and offsets `0, 2, 2, 2, 4`. The null list (`id` 3) is a
+cleared validity bit; the empty list (`id` 2) is two equal offsets. That is the distinction Parquet made with `d = 0` and `d = 1`.
+
+### Alignment, IPC and Flight
+
+The spec recommends 8- or 64-byte alignment and padding and prefers 64, an AVX-512 register's width, so SIMD loops need no tail
+check; IPC enforces it. Back on the paper's records, toggle **Pad each buffer to**: they need 214 bytes of buffers, 256 with 8-byte padding (exactly the body of the IPC `RecordBatch` message
+pyarrow writes for them) and 960 with 64-byte padding.
+
+That body is the point of Arrow IPC. A stream is a `Schema` message followed by `DictionaryBatch` and `RecordBatch` messages. Each
+message is a Flatbuffers header, which records every buffer's offset and length, followed by the body. A reader wraps those regions as
+arrays without copying or parsing any values, so an IPC file (magic `ARROW1`, the stream, and a footer of record batch offsets) can be
+memory-mapped and used in place. A dictionary is sent before it is used, and later batches can extend it with a delta (`isDelta`) or, in a stream, replace it.
+
+**Arrow Flight** carries the same messages over gRPC. `GetFlightInfo` returns endpoints, each with locations and an opaque ticket;
+`DoGet(ticket)` streams record batches back, several endpoints can be fetched in parallel, `DoPut` uploads and `DoExchange` does both. Flight implementations avoid most of the copies plain Protobuf would add.
+
+## Where it bites in production
+
+- **Many small files.** Each costs a tail read and a [footer parse](../06-after-parquet-lance-vortex-and-nimble/#many-small-files-multiply-both) before any data. Compact into fewer, larger files.
+- **Row groups sized wrong.** Tiny row groups inflate the footer (one entry per column per row group) and repeat a dictionary page in
+  every chunk. Huge ones make the writer buffer more before it can flush.
+- **Pushdown you assume is there.** pyarrow writes no page index by default, parquet-java writes no Bloom filters by default, and string
+  bounds may be truncated. Dump a file's footer before relying on page skipping.
+- **Null versus empty lists.** A pipeline that reads a three-level `LIST` and writes a bare `repeated` field loses the difference between a
+  null list and an empty one.
+- **One huge row, one huge page.** With a page index, pages cannot split a row, so a record holding a million-element list becomes one page,
+  and a reader must decode that whole page to reach any part of it.
+- **32-bit offsets.** One Arrow string or list array addresses at most 2³¹−1 bytes or children; beyond that use `Large` types or smaller batches.
+
+:::note[What to take forward]
+Dremel shredding flattens any nested record by storing two small integers per value: the definition level says how much of the path
+exists, the repetition level says where it repeated, and a state machine driven by the next repetition level rebuilds records from any
+subset of columns. Parquet wraps those columns in row groups, chunks and pages and puts every offset and statistic in a footer that readers
+fetch first; the page index and Bloom filters add finer skipping for readers that ask. ORC reaches the same goals with stripes, streams and a
+10,000-row index. Arrow keeps the data in memory as validity bitmaps and offsets, so any slot is a few offset reads away and buffers cross
+process boundaries without copying.
+:::

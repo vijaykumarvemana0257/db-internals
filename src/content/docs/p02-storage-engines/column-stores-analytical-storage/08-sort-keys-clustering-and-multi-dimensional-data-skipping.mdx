@@ -1,0 +1,234 @@
+---
+title: Sort keys, clustering and multi-dimensional data skipping
+description: Why min/max zone maps prune only when physical order follows the predicate, the leftmost-prefix rule inside ClickHouse's generic exclusion search and Redshift compound keys, Z-order and Hilbert layouts in Delta, Iceberg and ClickHouse, Snowflake clustering depth, how inserts erode clustering, and ClickHouse skip indexes.
+depth: deep
+sidebar:
+  order: 8
+---
+
+import ClusteringCurveSkipLab from '../../../../components/viz/ClusteringCurveSkipLab';
+
+A min and max per block costs almost nothing to store or to check. Whether it skips anything is decided
+elsewhere: by the order in which rows were written. The
+[BRIN and zone map page](../../../p02-storage-engines/indexes-beyond-the-b-tree/04-brin-zone-maps-and-min-max-data-skipping/)
+covered the summary itself and how a few misplaced rows stretch it. This page covers the other half, which analytical
+engines control directly: choosing the physical order, spreading it across more than one column, measuring how well it
+holds, and restoring it as inserts pile up.
+
+<ClusteringCurveSkipLab client:visible />
+
+The lab stores 4,096 rows with two integer columns, A and B, each between 0 and 63. The table is stored as parts, and each
+part is cut into blocks. Every block keeps a min and max for A and for B, so its summary is a box on the (A, B)
+plane. A range predicate is a rectangle, and a block is read exactly when its box touches the rectangle. That is the
+test [Parquet row-group statistics](../05-open-formats-parquet-orc-arrow-and-nested-data-dremel/#parquet-file-anatomy), Delta Lake's per-file statistics, Redshift's per-block metadata, Snowflake's
+micro-partition metadata and a ClickHouse `minmax` skip index all perform.
+
+## A zone map only prunes what the order grouped together
+
+A block can be skipped only if **every** value in it lies outside the predicate. Random order makes that almost
+impossible: each block holds values from across the domain, so every box covers the plane. Choose **Arrival order**:
+all 32 blocks are read for every preset predicate.
+
+Choose **ORDER BY A** with the predicate *A in [16, 23]*. Now 5 of 32 blocks are read. The predicate matches 488 rows,
+so even a perfect layout at 128 rows per block needs 4. Switch the predicate to *B in [40, 47]*: all 32 blocks again.
+Sorting by A made each block a thin vertical strip, and every strip crosses every value of B.
+
+A single sort key makes predicates on its column cheap and does nothing for
+the others. Redshift's documentation gives the sizes for the good case: it stores column data in 1 MB blocks with a min
+and max per block, so a one-month query against five years of data sorted by date can skip up to 98 percent of them.
+
+## Compound keys and the leftmost prefix
+
+A compound key sorts by the first column, then by the second within equal values of the first. ClickHouse's
+`ORDER BY (a, b)` sorts every data part this way, and so does Redshift's default `COMPOUND` sort key. Snowflake's
+multi-column clustering keys, reported as `LINEAR(c1, c2)`, are sensitive to column order in the same way.
+
+ClickHouse's primary index shows exactly where the second column stops helping. The index is sparse: one **mark** per
+granule of up to `index_granularity` rows (8,192 by default), holding the key of the granule's first row. When the
+condition on the key is one continuous key range, `markRangesFromPKRange` binary-searches the marks. Otherwise it runs
+the **generic exclusion search**: test a range of marks against the keys at its two boundary marks, drop it if no
+row can match, accept it if every row matches or it is down to one mark, and otherwise split it into at most
+`merge_tree_coarse_index_granularity` pieces and test those.
+
+The boundary test lives in `KeyCondition`. The tuples between a left mark `(x1, y1)` and a right mark `(x2, y2)` with
+`x1 ≠ x2` are decomposed into three rectangles:
+
+```
+[x1]        × [y1, +∞)
+(x1, x2)    × (−∞, +∞)
+[x2]        × (−∞, y2]
+```
+
+The middle rectangle leaves `y` unbounded. So a condition on `y` can exclude a range only when both boundary marks
+share the same `x` — when the whole range sits inside a run of one `x` value. The MergeTree documentation's example has
+key `(CounterID, Date)` and eleven marks: `Date = 3` reads marks 1 to 10. Only granule 0, which starts at
+`(a, 1)` and ends before `(a, 2)`, sits inside one `CounterID` with dates that rule out 3.
+
+In the lab, choose **ORDER BY (A, B)** and *B in [40, 47]*, at 128 rows per block:
+
+| Distinct A values | Rows per A value | Blocks read |
+|---|---|---|
+| 64 | about 64 | 32 of 32 |
+| 16 | about 256 | 29 of 32 |
+| 4 | about 1,024 | 10 of 32 |
+
+Pruning on B starts once a run of one A value spans more than a block, and improves as the runs get longer. At 64 distinct values, dropping to 16 rows per
+block gets the same effect partly: 146 of 256 blocks, in 67 separate read ranges.
+
+That is the rule behind every vendor's advice. ClickHouse's documentation says adding column `c` to a key `(a, b)` helps
+only when runs of identical `(a, b)` several times longer than `index_granularity` are common. Snowflake recommends
+ordering clustering key columns from lowest to highest cardinality, and at most three or four of them. Redshift notes
+that compound sorting helps less and less when queries filter only on secondary sort columns. On the
+[entropy page](../03-entropy-and-the-limits-of-compression-what-ratio-should-you-/) the same ordering also wins on
+compression. ClickHouse's guide shows the cost on real data: with the key `(UserID, URL)`, both high-cardinality, a filter on
+`URL` alone selects 1,076 of 1,083 marks.
+
+## Space-filling curves: pruning in two dimensions at once
+
+To make both A and B prunable, the order has to alternate between them. A **Z-order** (Morton) key does it by bit
+interleaving: take the top bit of A, then the top bit of B, then the next bit of each. Sorting by the result visits the
+plane quadrant by quadrant, recursively. A **Hilbert** key visits the same quadrants but rotates and reflects them so
+that the path never jumps. The lab's Hilbert order steps to a neighbouring cell on all 4,095 steps; its Morton order
+jumps on 2,047 of them.
+
+Jumps matter because a block that straddles one has a box spanning both ends. Moon, Jagadish, Faloutsos and Saltz
+(IEEE TKDE, 2001) counted **clusters**, the separate stretches of a curve inside a query region. On a 2D grid, a query
+rectangle averages about a quarter of its perimeter in clusters on the Hilbert curve, against about a third of the
+perimeter plus two-thirds of its side in the unfavoured direction on the Z curve.
+
+At 128 rows per block with 64 distinct A values:
+
+| Physical order | *A in [16, 23]* | *B in [40, 47]* | *A in [16, 31] and B in [40, 55]* | Average depth |
+|---|---|---|---|---|
+| ORDER BY (A, B) | 5 | 32 | 8 | 2.00 |
+| Z-order on A, B | 7 | 11 | 4 | 3.44 |
+| Hilbert curve on A, B | 8 | 9 | 4 | 2.56 |
+
+Blocks read, of 32. The curves give up some pruning on A to gain much more on B, and halve the box query. Neither
+wins every query: Z-order reads fewer blocks for the A strip. The curve clusters, shown in the lab's table under
+**Show the numbers**, explain the asymmetry: the Z curve passes through the A strip in 4 separate stretches and through the B strip in 8;
+the Hilbert curve in 5 and 4. Z-order puts A's bit first at every level, so it favours A. Hilbert's boxes overlap less on average. Set 64 rows per
+block and the box predicate shows why: Z-order reads 8 of 64 blocks, and 2 of them are tall boxes that straddle a jump
+without holding a single matching row. Hilbert reads 6, none empty.
+
+Every added dimension takes leading bits away from the others, which is why Delta's documentation warns that the
+effectiveness of locality drops with each extra `ZORDER BY` column.
+
+### What the engines implement
+
+- **Delta Lake `OPTIMIZE … ZORDER BY`.** Each column is first mapped to a range id with `range_partition_id`, from a
+  sample, with up to 1,000 ids (`spark.databricks.io.skipping.mdc.rangeId.max`). The ids are interleaved with
+  `interleave_bits`, and the table is repartitioned by range on the result, with a random byte appended by default
+  (`mdc.addNoise`) to break up skew. It processes every file in each selected partition, so the documentation calls
+  Z-ordering not idempotent.
+- **Delta liquid clustering (`CLUSTER BY`).** The same range ids go through a `hilbert_index` instead. `OPTIMIZE` is
+  incremental: clustered files are tagged with a ZCube id, and it picks files not yet clustered plus files in ZCubes
+  still below a size threshold (100 GiB by default). `OPTIMIZE FULL` reclusters everything. It accepts up to 4 clustering columns, and
+  they need statistics, which by default Delta collects on the first 32 columns.
+- **Apache Iceberg.** `rewrite_data_files` with `strategy => 'sort'` and `sort_order => 'zorder(c1, c2)'`. Iceberg
+  interleaves each value's order-preserving bytes, not range ids; string columns contribute 8 bytes by default
+  (`var-length-contribution`). A `hilbert()` sort order exists on the main branch but is not in the 1.11.0 release.
+- **ClickHouse.** A table can use `ORDER BY mortonEncode(x, y)` or `hilbertEncode(x, y)`. `KeyCondition` recognises the
+  curve, turns each granule's key range back into rectangles over `x` and `y`, and intersects them with conditions like
+  `x BETWEEN 10 AND 20 AND y BETWEEN 20 AND 30`. The source supports only the two-argument case.
+- **Redshift `INTERLEAVED`.** The documentation promises equal weight to up to 8 columns and does not name the curve.
+  It warns against interleaved keys on identity columns, dates or timestamps, and `VACUUM REINDEX` has to re-analyze
+  the key distribution as it skews.
+
+## Measuring clustering: overlap and depth
+
+Snowflake exposes clustering as overlap between micro-partitions' value ranges. `SYSTEM$CLUSTERING_INFORMATION('t',
+'(c1, c3)')` works for any columns, clustering key or not, and returns JSON with:
+
+- `total_partition_count` and `total_constant_partition_count`, the micro-partitions whose values can no longer be
+  improved by reclustering;
+- `average_overlaps`, the average number of micro-partitions overlapping each one;
+- `average_depth`, the average overlap depth of each micro-partition (1 or more; 0 for an empty table);
+- `partition_depth_histogram`, with buckets 0 to 16 in steps of one, then 32, 64, 128 and so on.
+
+The documentation's badly clustered example has 1,156 micro-partitions, an average depth of 64.07 and 698 of them in the
+128 bucket. Snowflake cautions that depth is not a precise measure; query performance is the real one.
+
+The lab computes its own version over the (A, B) boxes. A block's depth is the largest number of boxes covering any cell
+inside it, and the histogram uses Snowflake's buckets. A single-cell predicate reads exactly as many blocks as
+cover that cell, so a block's depth is what the worst point lookup inside its box would pay.
+
+## How inserts erode clustering
+
+**ClickHouse** sorts each inserted part by the key, but parts overlap each other. Every part has its own primary index,
+and a query searches each one. Background merges combine parts into larger sorted ones, though the documentation notes
+that merging does not guarantee rows with the same key end up in the same part.
+**Snowflake** micro-partitions keep the order data arrived in, and its documentation warns that `INSERT`, `UPDATE`,
+`DELETE`, `MERGE` and `COPY` gradually degrade clustering. Automatic Clustering
+reclusters only when it judges the table will benefit. Reclustering deletes and re-inserts rows, and the replaced
+micro-partitions stay in Time Travel and Fail-safe storage for their full retention. **Delta and Iceberg** add files that overlap the
+existing ones until the next `OPTIMIZE` or `rewrite_data_files`; an Iceberg table with `WRITE ORDERED BY` sorts each
+write, which makes its files behave like ClickHouse parts. **Redshift** appends to an unsorted region that `VACUUM`
+re-sorts.
+
+Set the lab to **Hilbert curve on A, B**, 128 rows per block, *A in [16, 31] and B in [40, 55]*, and inserted parts
+written **in arrival order**, then press **Insert 512 rows**:
+
+| State | Parts | Blocks read | Average depth |
+|---|---|---|---|
+| Freshly clustered | 1 | 4 of 32 | 2.56 |
+| After one insert | 2 | 8 of 36 | 6.61 |
+| After four inserts | 5 | 20 of 48 | 18.71 |
+| After twelve inserts | 13 | 52 of 80 | 50.83 |
+| **Merge inserted parts** | 2 | 9 of 80 | 4.28 |
+| **Recluster table** | 1 | 6 of 80 | 2.38 |
+
+Each unsorted part adds four blocks whose boxes cover almost the whole plane, so nearly every predicate reads them all. Choose *A in [32, 35] and B in [12, 15]* after twelve inserts: 49 of 80 blocks, 33 with no
+matching row. Written **sorted by the key**, like a ClickHouse part, twelve inserts leave depth at 22.10 and the box
+query at 23 of 80. That is better, but every sorted part still lays
+another set of boxes over the whole plane. Merging the new parts into one
+sorted part is most of the fix, and only a full recluster returns to the original shape.
+
+Since September 1, 2026, newly clustered Snowflake tables use **Optima Clustering**, billed per GB ingested times an
+overlap factor between 0 and 1. Existing tables stay on **Clustering Classic**, which uses only the first 5 bytes of each
+clustering key column; Optima uses up to 1 KB across the key. For Optima tables, `SYSTEM$CLUSTERING_INFORMATION` omits
+`total_constant_partition_count` and `partition_depth_histogram`.
+
+## Skip indexes for columns outside the key
+
+ClickHouse can add summaries for columns the key does not order:
+`INDEX name expr TYPE type GRANULARITY n` summarizes blocks of `n` granules (`GRANULARITY` defaults to 1).
+
+| Type | Stores per block | Serves |
+|---|---|---|
+| `minmax` | min and max of the expression | comparisons, ranges, `IN`, `LIKE`, `startsWith` |
+| `set(max_rows)` | the distinct values, or nothing once there are more than `max_rows` | any condition, evaluated on the stored values |
+| `bloom_filter([false_positive_rate])` | a Bloom filter; default rate 0.025 | `=`, `IN`, `has`; not `!=` or ranges |
+| `ngrambf_v1`, `tokenbf_v1` | Bloom filters over n-grams or tokens | `LIKE`, `match`; `hasToken` needs `tokenbf_v1`; deprecated since the `text` index went GA in 26.2 |
+
+A `set` index goes empty, and stops pruning, in any block
+with more distinct values than `max_rows`. All of them obey the lab's rule: if one matching value lands in a block, the
+whole block is read. ClickHouse's own
+guidance is that a useful skip index usually needs a strong correlation with the primary key, and its trace log reports
+the result per query, as in ``Index `vix` has dropped 6102/6104 granules``. Setting `use_skip_indexes = 0` skips the check
+for queries where it costs more than it saves.
+
+## Where it bites in production
+
+- **A high-cardinality column first in the key.** Filters on later columns fall back to generic exclusion search and read
+  nearly everything, as with 1,076 of 1,083 marks. Put low-cardinality columns first, or add a skip index or projection
+  for the other access path.
+- **Z-ordering too many columns.** Each extra column dilutes the others, and Delta rejects `ZORDER BY` on columns without
+  statistics.
+- **Rewrite cost nobody budgeted.** `ZORDER BY` rewrites every file in each partition it processes. Snowflake reclustering
+  rewrites micro-partitions and keeps the replaced ones for Time Travel and Fail-safe, from 8 up to 97 days.
+- **String keys that all look alike.** Clustering Classic sees only the first 5 bytes per key column, so URLs that start
+  with `https://www.` do not cluster. Snowflake suggests clustering on a substring past the shared prefix.
+- **Interleaved keys on time columns.** Redshift warns against it: new dates skew the key distribution, and restoring it
+  takes `VACUUM REINDEX`, slower than a plain `VACUUM`.
+- **Streaming inserts that never merge.** Watch `average_depth` in Snowflake (and the histogram on Classic tables), active part
+  counts in ClickHouse's `system.parts`, and file counts in Delta and Iceberg, next to bytes scanned per query.
+
+:::note[What to take forward]
+A zone map skips a block only when the physical order has put the predicate's values together, so the layout decides
+which queries are cheap. A compound key prunes its later columns only inside runs of equal leading values: that is the
+leftmost-prefix rule, visible in ClickHouse's exclusion search, and the reason every vendor puts low-cardinality columns
+first. Z-order and Hilbert layouts trade some pruning on each column for pruning on all of them, and Hilbert's
+jump-free path overlaps less. Every insert adds overlap, which Snowflake's clustering depth measures and merges,
+`OPTIMIZE` and reclustering pay to remove.
+:::

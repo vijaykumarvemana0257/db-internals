@@ -1,0 +1,238 @@
+---
+title: 'Lightweight encodings: RLE, dictionary, delta, bit-packing, FOR and friends'
+description: Dictionary, RLE, bit-packing, FOR, PFOR, delta, Gorilla, ALP and FSST as Parquet, ORC, DuckDB and Prometheus write them, how they cascade, and which let predicates skip decoding.
+depth: intermediate
+sidebar:
+  order: 2
+---
+
+import ColumnEncodingChainLab from '../../../../components/viz/ColumnEncodingChainLab';
+
+A column of 4,096 order statuses stored PLAIN takes about 50 KB: every row repeats its string and a 4-byte length.
+As a twelve-entry dictionary plus a 4-bit code per row, it takes about 2 KB. Column stores choose an encoding per column
+chunk from what the chunk looks like — few distinct values, runs, sorted neighbours, a narrow range, decimal structure —
+and the same encodings often let a scan test a predicate on the codes without building the values.
+
+These encodings are *lightweight*: fixed rules, no entropy coder, tight decode loops. General-purpose compressors
+such as LZ4 and ZSTD usually run on top of them, per block (see the
+[block compression page](../04-block-compression-lz4-zstd-trained-dictionaries-and-hole-pun/)). The
+[entropy page](../03-entropy-and-the-limits-of-compression-what-ratio-should-you-/) covers how small any encoding
+can make a column.
+
+<ColumnEncodingChainLab client:visible />
+
+The Parquet, Prometheus, Gorilla, ALP, PFOR and FSST steps follow their sources; the generic
+dictionary, RLE, delta, FOR and bit-pack steps use the lab's own simple layouts. Hover any bit to see its field.
+
+## Dictionary encoding
+
+A dictionary replaces each value with its position in a list of distinct values, so a code needs ⌈log₂ *d*⌉ bits
+for *d* distinct values. The default column has 12, so codes are 4 bits: 4.32 bits per value against 99 for PLAIN,
+22.9× smaller, with the dictionary itself taking 1,224 bits.
+
+Parquet's `RLE_DICTIONARY` writes one dictionary page at the start of each column chunk, with the entries PLAIN-encoded.
+Each data page starts with a byte holding the code width, followed by the codes in the RLE/bit-packing hybrid described
+below. If the dictionary grows too large, the writer falls back to PLAIN for the rest of the chunk. Arrow C++'s writer
+triggers that fallback when the dictionary page reaches 1 MB, its default limit.
+
+A dictionary only helps when values repeat. Switch **Column** to *URLs*: every value is distinct, and Parquet
+RLE_DICTIONARY comes out 1.02× *larger* than PLAIN. On *Sorted ids* it is 1.19× larger.
+
+### Sorted or first-seen
+
+The order of the dictionary decides what a predicate can do with the codes. Arrow's Parquet writer assigns codes in
+the order values first appear. ORC's specification sorts string dictionaries by their UTF-8 bytes.
+
+With a sorted dictionary, codes compare the same way the values do. `status < 'pending'` needs one binary search, which
+finds `'pending'` at code 7, and the predicate becomes `code < 7`. Choose the preset **Sorted dictionary → bit-pack**, set
+**Predicate** to `x < c` and move **Constant c** to `'pending'`. The numbers table shows 4 dictionary probes, then 4,096
+integer comparisons. No string is touched.
+
+With first-seen order, the engine tests the predicate once against each dictionary entry and gets a set of matching
+codes. On **Parquet RLE_DICTIONARY** the same predicate tests all 12 entries and leaves 7 codes. DuckDB's dictionary
+scan does exactly this: its filter runs over every entry once, then each row is one boolean lookup by code. Either way
+the per-row work is an integer operation, not a string comparison. The catch with sorting is on the write side: a code
+cannot be assigned until every smaller value has been seen, so sorted dictionaries suit writers that buffer a whole
+chunk.
+
+## Runs: RLE and Parquet's hybrid
+
+Run-length encoding stores each value once with the length of its run, so it depends entirely on physical order.
+The default column is unsorted: **RLE → dictionary → bit-pack** finds 3,387 runs averaging 1.2 rows and costs 6.94 bits
+per value, worse than the dictionary alone. Tick **Sorted (clustered)**: there are now 12 runs, and the same chain costs
+0.35 bits per value. Clustering data is a bigger lever than choosing an encoding, as the
+[entropy page](../03-entropy-and-the-limits-of-compression-what-ratio-should-you-/#order-moves-the-floor) explains;
+[sort keys](../08-sort-keys-clustering-and-multi-dimensional-data-skipping/) come later.
+
+Parquet has no general RLE encoding for arbitrary values. Its `RLE` encoding is a hybrid, used only for dictionary codes,
+repetition and definition levels, and booleans, and it mixes two kinds of run:
+
+- A **repeated run**: a header `ULEB128(count << 1)`, then the value once, padded to whole bytes.
+- A **bit-packed run**: a header `ULEB128(groups << 1 | 1)`, then values in groups of 8, packed starting from the least
+  significant bit of each byte.
+
+Arrow's encoder buffers values 8 at a time. A group of 8 identical values starts a repeated run, which continues while
+the value repeats; any other group joins the current bit-packed run, whose header is a single reserved byte, so it
+holds at most 63 groups. With **Show bits from** on *First data*, the unsorted column shows the width byte, a header of
+127 (63 groups), then 4-bit codes. The sorted column is 12 repeated runs and nothing else: 0.37 bits per value.
+
+A predicate on runs is tested once per run. On the sorted column, `x = 'delivered'` tests 12 runs, and `COUNT(*)` adds up
+run lengths without producing a single row. DuckDB's RLE scan does the same: it evaluates the filter over the run values
+once and emits rows only from the runs that matched.
+
+## Bit-packing and frame of reference
+
+Bit-packing stores each value in just enough bits for the largest value in its block. Frame of reference (FOR) first
+subtracts the block's minimum, so the width depends on the block's range rather than on the size of its values. Choose
+**Sorted ids**, which start at 1,000,000. **Bit-pack** alone needs 20 bits per value. **FOR → bit-pack** needs 9.28,
+because the ids inside one 256-row block span at most 448.
+
+Block size trades tighter widths against more headers: at **Block size** 2048, FOR → bit-pack costs 12.04 bits per
+value; at 128, 8.56. DuckDB bit-packs groups of 2,048 values and picks a mode per group: CONSTANT, CONSTANT_DELTA,
+DELTA_FOR when the differences need fewer bits than the values, or FOR.
+
+The block header doubles as a free zone map: a block with reference *r* and width *w* holds only values from *r* to
+*r* + 2*ʷ* − 1. Back at block size 256, with FOR → bit-pack and the default predicate `x < 1001804`, the headers alone rule out 11 of 16 blocks
+and accept 4 whole; one block, 256 codes, is unpacked. The work strip shows where. Exact min/max zone maps are covered on
+the data skipping page.
+
+## Outliers: patched frame of reference
+
+A FOR block's width is set by its range, so one outlier inflates it for every value in the block. Choose **Random ints
+with outliers**: values stay below 1,000 except for 2% that range up to two billion. FOR → bit-pack needs 31.16 bits per value.
+Set **Outliers** to 0% and it needs 10.28.
+
+Patched FOR (PFOR) comes from Zukowski, Héman, Nes and Boncz's 2006 paper on compression in MonetDB/X100. It keeps a small
+width *b* for the common values and stores outliers uncompressed, as **exceptions**. Choose **PFOR** with outliers back at
+2%: *b* = 10, 83 exceptions, 11.70 bits per value.
+
+An exception's code slot holds the distance to the next exception, so exceptions form
+a linked list through the code array. Decoding is two branch-free loops: decode every code as if it were ordinary, then
+walk the list and overwrite the wrong results. The paper shows the naive `if` per value collapsing as the exception rate
+nears 50%, when the branch becomes unpredictable. A *b*-bit code can only point 2*ᵇ* positions ahead, so longer gaps
+force **compulsory exceptions** — values that fit but are stored as exceptions to keep the list connected. **Show bits
+from → First exception** shows a slot holding its gap.
+
+ORC's RLEv2 has a variant, `PATCHED_BASE`, that takes the 95th-percentile bit width and patches the remaining values'
+high bits from a list. Unpacking itself vectorizes well: Lemire and Boytsov's SIMD-BP128 decodes nearly twice as fast
+as the previous fastest schemes.
+
+## Delta and delta-of-delta
+
+Sorted and time-ordered columns have small differences between neighbours. **Delta → FOR → bit-pack** on the sorted ids
+stores deltas between 1 and 9 and costs 4.30 bits per value. Parquet's `DELTA_BINARY_PACKED` stores a ULEB128 header,
+then per block the minimum delta, one width byte per miniblock and each miniblock bit-packed at its own width; Arrow's
+writer uses 256-value INT64 blocks of 4 miniblocks. The preset follows that layout: 3.86 bits per value.
+
+Regular timestamps have second differences that are mostly zero. Facebook's Gorilla paper (VLDB 2015) stores
+delta-of-delta as `0` for zero, else prefixes `10`, `110`, `1110`, `1111` with 7, 9, 12 or 32 bits, for second-resolution
+timestamps; about 96% took one bit. Prometheus uses 14, 17, 20 and 64-bit buckets, because its timestamps are milliseconds.
+
+Choose **Monotonic timestamps**: the Prometheus preset stores 99% of them in one bit, 1.20 bits per value, and each missed
+scrape costs two codes in the 17-bit bucket. Set **Scrape jitter** to ±3 ms and nearly every timestamp lands in the 14-bit bucket, 16
+bits with its prefix: 14.87 bits per value, where `DELTA_BINARY_PACKED` costs 6.43. A TODO in Prometheus's encoder
+notes that tiny deviations needlessly jump to large buckets.
+
+Delta encodings cost more at query time: a value exists only after a running sum over everything before it, so a
+predicate cannot skip. On sorted ids with `x < 1001804`, **Delta → FOR → bit-pack** decodes all 4,096 values where FOR →
+bit-pack tested 256. DuckDB's DELTA_FOR groups decode even the rows a scan skips, to keep the running value.
+
+## Floating point: Gorilla XOR and ALP
+
+For doubles, Gorilla XORs each value with the one before it. An identical value becomes a single `0` bit. Otherwise it
+writes `10` followed by the meaningful bits if they fit within the previous value's window of leading and trailing zeros,
+or `11`, a 5-bit leading-zero count, a 6-bit length and then the meaningful bits. In Facebook's data 51% of values took
+one bit, and with two-hour blocks a timestamp and value together averaged 1.37 bytes, down from 16.
+
+Decimal readings are harder: the XOR of 21.47 and 21.51 has 48 meaningful bits. Choose **Sensor floats** with **Gorilla
+XOR**: 51% of values take one bit, yet the column still costs 25.50 bits per value.
+
+ALP (Afroozeh, Kuffó and Boncz, SIGMOD 2024) relies on most real doubles being decimals. For each vector it picks an
+exponent *e* and a factor *f* so that `round(v × 10^e × 10^−f)` is an integer that decodes back exactly as
+`n × 10^f × 10^−e`. The integers go through FOR and bit-packing. A value that does not round-trip becomes an exception: a
+16-bit position plus the raw 8-byte double. Choose **ALP → FOR → bit-pack**: 6.54 bits per value, with no exceptions.
+The pair the lab picks is e = 14, f = 12, not e = 2, f = 0. With e = 2, three distinct readings in the first 256 rows
+become exceptions. One of them is 21.49: 2149 × 0.01 evaluates to 21.490000000000002, not 21.49.
+
+DuckDB ships ALP, plus ALP_RD for high-precision doubles, which dictionary-encodes the leading bits and leaves the rest
+raw; it has phased out its earlier XOR-based Chimp and Patas. Parquet added ALP as encoding 10, marked Preview as of
+August 2026 — use it only with readers known to support it.
+
+## Strings: FSST
+
+High-cardinality strings defeat dictionaries but usually share substrings. FSST (Boncz, Neumann and Leis, VLDB 2020)
+replaces substrings of 1 to 8 bytes with 1-byte codes from a static table of up to 255 symbols; code 255 escapes a
+literal byte. The table is built over five generations: compress a sample, count symbols and adjacent pairs, keep the
+255 candidates with the highest count × length.
+
+Choose **URLs** with **FSST**. The table fills all 255 symbols, among them `https://`, `shop.exa` and `mple.com`, and the
+column is 4.4× smaller than PLAIN, where the dictionary made it larger.
+
+Because the table is static, any string decompresses on its own, and equality needs no decompression: compress the
+constant with the same table and compare bytes. With `x = c`, the lab compares 4,096 compressed
+strings and decodes none. Switch to `x < c` and all 4,096 are decompressed, because codes do not preserve order. From
+storage version 1.3, DuckDB merges the two string encodings into DICT_FSST, a dictionary whose entries can be FSST-compressed.
+
+## Cascades and choosing
+
+The lab lets each step feed the next, as BtrBlocks (Kuschewski, Sauerwein, Alhomssi and Leis, SIGMOD 2023) does with
+RLE, one-value, dictionary, frequency, SIMD-FastPFOR, SIMD-FastBP128, FSST and a new Pseudodecimal scheme for doubles.
+For a 64,000-value chunk it samples 10 runs of 64 values, rules schemes out with simple statistics (no RLE if the
+average run is shorter than 2), compresses the sample with the rest and applies the best. Outputs such as RLE's values
+and lengths go through the same selection again, to a default depth of 3. On the Public BI benchmark the authors report
+scans 2.2× faster and 1.8× cheaper than with Parquet.
+
+**Auto-pick from a sample** runs a simplified version of that procedure. On sorted ids it picks Delta → RLE → PFOR, 27.6× smaller than PLAIN
+(`DELTA_BINARY_PACKED` reaches 16.6×), because runs of identical deltas collapse; on regular timestamps, Delta → RLE →
+bit-pack at 0.28 bits per value.
+
+DuckDB has no shared sample. At checkpoint every applicable compression method analyzes the column's data (ALP's analysis
+samples vectors internally), and the method with the smallest estimated size wins.
+
+## Queries on encoded data
+
+The lab's work strip follows one rule: a predicate is cheap when the encoding preserves what the predicate needs.
+
+| Encoding | How `x = c` or `x < c` runs | Decodes first? |
+| --- | --- | --- |
+| Sorted dictionary | Binary search, then an integer comparison on codes | No |
+| First-seen dictionary | Test each entry once, then a set lookup per code | No |
+| RLE, hybrid repeated runs | One test per run | No |
+| FOR + bit-pack | Headers settle whole blocks; the rest are unpacked | No |
+| PFOR | Unpack, patch exceptions, compare; exceptions defeat header bounds | No |
+| FSST | Equality on compressed bytes; ranges decompress | Ranges only |
+| Delta, delta-of-delta, Gorilla XOR | Running sum or XOR chain | Yes |
+| ALP | Unpack, add reference, multiply | Yes |
+
+DuckDB builds this into its compression API: a method may supply a `filter` callback, applied while scanning compressed
+data, and a `select` callback that reads only the rows in a selection vector. RLE and DICT_FSST implement both;
+bit-packing and ALP implement neither, so those segments are decoded, then filtered.
+
+With **Query** on *Return matching values*, 1,211 rows of the default column match
+`x = 'delivered'`, and only those codes are looked up; the other 2,885 rows are never materialized. The
+[columnar layouts page](../01-columnar-layouts-nsm-dsm-pax-and-row-groups/) applies the same late-materialization idea
+across columns.
+
+## Where it bites in production
+
+- **Dictionary fallback.** When a Parquet chunk's dictionary passes the writer's limit, the rest of the chunk is written
+  PLAIN, and anything relying on the dictionary covering every value in the chunk stops working.
+- **Sentinels and outliers.** One `-1` or `9999999` default in a narrow integer column widens every FOR block it lands in.
+  PFOR absorbs a few; storing the sentinel as NULL removes the problem.
+- **Order.** RLE, delta encodings and FOR block skipping all depend on physical order. In the lab, sorting the status
+  column takes Parquet's encoding from 4.32 to 0.37 bits per value.
+- **Sequential encodings under selective queries.** Delta and XOR encodings decode from the start of their block or page,
+  so a point lookup pays for every value before its target. Keep those units small.
+- **Millisecond jitter.** Under Prometheus's buckets, ±1 ms of jitter takes the lab's timestamps from 1.20 to 12.88 bits
+  per value. A Go timer regression once did this to real scrapes and grew TSDBs; Prometheus now snaps
+  timestamps within 2 ms of schedule back onto it (hidden flag `--scrape.timestamp-tolerance`).
+- **Decimals stored as doubles.** They resist XOR compression. A decimal or scaled-integer column gets FOR and
+  bit-packing directly; ALP recovers most of that where format and reader support it.
+
+:::note[What to take forward]
+Lightweight encodings turn a column chunk into small integers or byte codes and pack them, choosing per chunk from
+cardinality, order, range and type. Judge an encoding by how queries
+read it, not only by its size: dictionaries, runs, FOR headers and FSST equality let predicates run on stored data, while
+delta and XOR encodings buy size by forcing every value to be rebuilt. Sorting the data usually matters more than which
+encoding you choose.
+:::

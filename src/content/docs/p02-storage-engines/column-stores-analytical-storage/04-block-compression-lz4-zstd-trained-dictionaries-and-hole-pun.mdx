@@ -1,0 +1,223 @@
+---
+title: 'Block compression: LZ4, ZSTD, trained dictionaries and hole punching'
+description: What LZ4 and ZSTD write inside a block, why block size trades ratio for point-read cost, when trained dictionaries help, how RocksDB and ClickHouse pick codecs, and InnoDB's compressed pages versus hole punching.
+depth: intermediate
+sidebar:
+  order: 4
+---
+
+import BlockCompressionBench from '../../../../components/viz/BlockCompressionBench';
+import InnoDbPageCompressionLab from '../../../../components/viz/InnoDbPageCompressionLab';
+
+[Lightweight encodings](../02-lightweight-encodings-rle-dictionary-delta-bit-packing-for-a/) use what the engine knows
+about a column: its type, its cardinality, its order. A general-purpose compressor knows none of that. It finds repeated
+bytes and removes the redundancy an encoding left behind. Engines run it over fixed-size **blocks**, not whole files, so a
+reader can seek to one block and decompress only that. The flip side: to read one row, you decompress its entire block.
+Choosing a codec and a block size is choosing a price for storage, for CPU on every write, and for latency on every cold read.
+
+<BlockCompressionBench client:visible />
+
+## What LZ4 actually writes
+
+LZ4, Snappy, zlib and ZSTD all belong to the LZ77 family. They replace a byte string that already appeared earlier in the
+block with a back-reference: go back *offset* bytes and copy *length* bytes. What differs is how hard they search for
+matches and how they encode the result.
+
+LZ4 is the simplest. Its block is a list of **sequences**, each with four parts:
+
+- a one-byte **token**: the high 4 bits are the literal length, the low 4 bits are the match length minus 4;
+- the **literals**, copied verbatim. A length nibble of 15 means "read more": extra bytes follow, each added to the total,
+  and a 255 means another byte follows;
+- a **2-byte little-endian offset**, from 1 to 65,535. LZ4 can never reference data more than 64 KB back;
+- extra match-length bytes, in the same 15-then-255s scheme. The minimum match is 4 bytes.
+
+The last sequence has literals only, the last 5 bytes are always literals, and the last match must start at least 12
+bytes before the end. There is no entropy coder. Every match costs at least 3 bytes (token plus offset), and
+incompressible input grows by about 0.4%.
+
+The compressor is just as plain. It hashes the next 4 bytes, looks up an earlier position with the same hash (a 16 KB table
+by default, 8,192 16-bit positions for inputs under 64 KB), and checks that the bytes really match. If they do, it extends the
+match in both directions and emits a sequence. After 64 misses in a row it probes every 2nd byte, after 64 more every 3rd,
+which is how it races through data that won't compress.
+
+The lab runs exactly this algorithm. It is a port of `LZ4_compress_generic` from lz4 1.10.0, and its output matches the
+`lz4` command-line tool byte for byte on these blocks. On the default JSON block it finds 904 sequences, matches cover
+91.4% of the bytes, and the output is 4,467 bytes, a 3.67× ratio. In the stats, tokens, lengths and offsets take 3,058
+of those bytes. Most of LZ4's output is bookkeeping, not literals. Slide **Inspect sequence** to decode tokens by hand:
+`0x98` means 9 literals, then a match of 4 + 8 = 12 bytes.
+
+Now switch the sample to **INT64 timestamp column chunk**. Each 8-byte millisecond timestamp shares its high bytes with its
+neighbours, but its low bytes change every time. LZ4 alternates short literals with short matches and only reaches 1.59×.
+Tick **Delta(8) first**. The block now holds small deltas with six zero bytes each, and 99.5% of it is matches. The output
+drops to 5,122 bytes, but 5,041 of those are tokens, length bytes and offsets for 1,657 sequences.
+
+Choose **Random bytes**, or drag **Overwrite bytes with random data** to 100%. LZ4 finds nothing and emits one 16,384-byte
+literal run, which makes the output 66 bytes *larger* than the input.
+
+Snappy, RocksDB's default before LZ4, is the same design: byte-oriented literal and copy tags, no entropy stage.
+
+## ZSTD: the same matches, plus an entropy stage
+
+Zstandard (RFC 8878) finds matches the same way, then compresses what LZ4 leaves raw. A ZSTD frame holds blocks of at most
+128 KB. Each compressed block has two sections:
+
+- a **literals section**, usually Huffman-coded, in one or four streams;
+- a **sequences section** that codes each sequence's literal length, match length and offset with **FSE** (Finite State
+  Entropy, an ANS-based coder), interleaved in one bitstream. ZSTD also keeps the three most recent offsets, so a repeated
+  offset costs a small code instead of a full distance.
+
+A match now costs a few bits instead of at least 3 bytes, and the literals shrink toward their entropy. The fixture bars
+show the effect. On the same JSON block, ZSTD at level 1 writes 2,437 bytes to LZ4's 4,467. On the delta-encoded timestamps
+it writes 1,330 bytes to LZ4's 5,122. The raw timestamps, which LZ4 barely touched, come down to 4,289. The
+[entropy page](../03-entropy-and-the-limits-of-compression-what-ratio-should-you-/) explains how much further any codec could go.
+
+Levels run from 1 to 19 (default 3), plus "ultra" 20 to 22 and negative fast levels. Higher levels search harder while
+decompression speed barely moves: in the lab's measurements ZSTD -19 compressed at 5.8 MB/s against 790 MB/s at level 3, and
+decompressed at 2,040 against 1,630 MB/s. A level is a heuristic, not a guarantee: on the delta timestamps, level 9 (1,503
+bytes) loses to level 1 (1,330).
+
+zlib, which InnoDB uses, is DEFLATE: LZ77 plus Huffman codes. At level 6 it matches ZSTD -3's ratio here (2,376 bytes against
+2,392) but compressed about 4× slower.
+
+For a published reference, the zstd 1.5.7 README's lzbench table (Silesia corpus, Core i7-9700K) gives ratio, compress and
+decompress MB/s as: LZ4 2.101, 700, 4,000; Snappy 2.073, 530, 1,660; ZSTD -1 2.887, 510, 1,580; zlib -1 2.743, 95, 400.
+
+## Block size is a read-latency decision
+
+Every engine compresses independently decodable units:
+
+- **RocksDB** compresses each data block and index block of an SST on its own, and leaves filter blocks uncompressed.
+  `block_size` defaults to 4 KB.
+- **ClickHouse** compresses a column's data file in blocks of at least `min_compress_block_size` (65,536) and at most
+  `max_compress_block_size` (1,048,576) uncompressed bytes, closing blocks at mark boundaries. Each block carries a
+  16-byte CityHash128 checksum, a method byte, and 4-byte compressed and uncompressed sizes.
+- **Parquet and ORC** compress pages and stream chunks; see the [open formats page](../05-open-formats-parquet-orc-arrow-and-nested-data-dremel/).
+
+Larger blocks give the compressor more history. Open **Block size and read cost** and look at the table: on the JSON sample,
+ZSTD -19 goes from 3.49× at 1 KB to 8.58× at 16 KB and 9.85× at 256 KB. LZ4 saturates early, at 3.67× at 16 KB and 3.99× at 256 KB.
+
+But a point read decompresses the whole block. The lab's cost model adds a random-read latency, the compressed bytes at a
+read throughput, and the full block at the codec's decompression throughput. At 16 KB with a 100 µs read, the I/O dominates.
+Every codec lands between 104 and 115 µs; LZ4HC is fastest, with fewer bytes than LZ4 and cheaper decoding than ZSTD. Now choose
+**256 KB**: ZSTD -3 takes 288 µs, 161 µs of it decompressing 262,144 bytes to return one row. Tick **Compressed block already in the OS page cache**
+and the I/O vanishes: LZ4 costs 36 µs per point read, ZSTD -3 161 µs, zlib 209 µs. The OS page cache holds compressed file
+pages; RocksDB's own block cache holds *uncompressed* blocks and skips this cost, as the [read-path page](../../../p02-storage-engines/lsm-trees/06-read-path-bloom-filters-and-the-block-cache/) describes.
+
+Small blocks suit point lookups, large blocks suit scans.
+
+Engines also refuse compression that does not pay. RocksDB stores a block raw unless it shrinks by at least 12.5%
+(`CompressionOptions::max_compressed_bytes_per_kb`, default 896). The lab applies that rule, so the random sample is stored
+raw under every codec and costs no decompression.
+
+## Trained dictionaries for small blocks
+
+A 1 KB block has no past to match against, and the first bytes of any block compress badly. A ZSTD **dictionary** fixes that.
+It holds entropy tables plus content that acts as history in front of the first byte, so the first row of a block can
+reference strings the dictionary has seen. `zstd --train` builds one from samples. The frame header records the dictionary
+ID, and the decompressor needs the same dictionary. The zstd README says the gains are "mostly effective in the first few KB".
+
+The fixture shows the curve. It uses a 16 KB dictionary trained on 400 held-out 4 KB JSON samples. At 1 KB blocks, ZSTD -3
+drops from 297 to 192 bytes (−35%). At 4 KB, 720 becomes 647 (−10%). At 16 KB, the dictionary makes the block 1.5% *larger*,
+because the block is already its own dictionary. A dictionary trained on random bytes saves nothing.
+
+RocksDB builds one dictionary per SST file:
+
+- `CompressionOptions::max_dict_bytes` sets its size; the default 0 disables the feature.
+- With `zstd_max_train_bytes` > 0, sampled blocks go through the ZSTD trainer; with 0, the samples themselves become the
+  dictionary.
+- To sample, the table builder **buffers the file's uncompressed data blocks**, up to the target file size or
+  `max_dict_buffer_bytes`, before it can compress and write any of them. The buffer is charged to the block cache.
+- The dictionary lives in a meta-block of the SST, and readers keep a larger digested copy in memory.
+- Since 6.15, dictionary settings in `compression_opts` apply to every level; put them in `bottommost_compression_opts`
+  (with `enabled = true`) to keep them to the bottom.
+
+## Cheap codecs on top, dense codecs at the bottom
+
+RocksDB's wiki suggests a lightweight codec (LZ4 over Snappy) for `compression` and ZSTD for `bottommost_compression`. The
+bottommost level usually holds most of the data, while upper-level data will be rewritten by compaction anyway, so heavy CPU
+there buys little. The default `compression` was Snappy until RocksDB 11.5 (June 2026) switched it to LZ4. One catch: when
+levels use different codecs, a "trivial move" of a file down a level becomes a rewrite.
+
+ClickHouse puts the choice in the schema, per column, as a codec chain such as `CODEC(Delta, ZSTD)` or `CODEC(T64, ZSTD)`:
+specialized transforms first, at most one general-purpose codec last. Unless `allow_suspicious_codecs` is set, it rejects a
+chain with anything but encryption after the general codec, or a pure transform like `Delta` with nothing that compresses
+behind it. `Delta(n)` stores differences between neighbouring n-byte values; `DoubleDelta` codes delta-of-deltas for
+constant-stride timestamps; `T64` transposes 64 values' bits and drops high bits that never vary. The lab's Delta(8) check is
+the first half of `CODEC(Delta, ZSTD)`. A bare `CODEC(ZSTD)` means level 1. ClickHouse has long defaulted to LZ4 for table data; a change merged in September 2026 makes the default
+size-aware, LZ4 for parts under 100 MB and ZSTD(3) for the larger parts merges produce. That is RocksDB's split again.
+
+PostgreSQL's TOAST compresses individual oversized *values*, never pages, so it cannot exploit redundancy between rows. pglz is
+the default through PostgreSQL 18, `lz4` has been an option since 14, and PostgreSQL 19, now in beta, makes `lz4` the default when
+built with it. The [TOAST page](../../../p02-storage-engines/pages-tuples-heap-files/05-large-values-toast-and-overflow-pages/) has the details.
+
+<InnoDbPageCompressionLab client:visible />
+
+## InnoDB, design one: ROW_FORMAT=COMPRESSED
+
+B-tree pages are addressed by number, updated in place and split, so a variable-length compressed page is awkward. InnoDB
+has two answers. `ROW_FORMAT=COMPRESSED` stores every 16 KB page as a fixed-size compressed page of `KEY_BLOCK_SIZE`: 1, 2, 4, 8 or 16 KB,
+defaulting to half of `innodb_page_size`. It compresses with zlib at `innodb_compression_level` (default 6), and indexes
+are compressed too. `page0zip.ic` documents the layout: an uncompressed header, the compressed stream, the **modification log**
+(`m_start` to `m_end`), free space, and a trailer growing back from the end that holds each record's uncompressed `trx_id` and
+`roll_ptr` (6 + 7 bytes on a clustered-index leaf) and a 2-byte **dense page directory** slot.
+
+An update does not recompress. `btr_cur_update_alloc_zip` asks `page_zip_available()` whether the new record fits between
+`m_end` and the trailer. If it does, the new record's bytes are appended to the modification log, uncompressed. If not, InnoDB
+reorganizes the page: it rebuilds it from the uncompressed frame in the buffer pool, recompresses it with an empty log, and
+checks again. If the record still does not fit, the pessimistic path (`page_cur_insert_rec_zip`) inserts it into the
+uncompressed page and compresses the whole page with it. Only if that fails is it a **compression failure**, and the page splits.
+
+In the lab, keep **KEY_BLOCK_SIZE 8 KB** and press **Update a row** repeatedly. Sixteen same-size updates land in the log.
+The 17th finds it full and forces a recompression, and the cycle repeats. Now choose **4 KB** and **adds a 32-char random session
+token**. Each update logs a longer record, leaves the old record's trailer slot behind, and makes the page less compressible.
+The first recompression comes at the 5th update; after that the log holds two updates, two, then one at a time, and from the
+17th on every update recompresses. From the 22nd, even an empty log cannot take the record, so it is compressed into the stream; the 26th does not
+fit even that way, and the page splits.
+
+Real InnoDB fights that thrash with padding. Once a table's failure rate passes `innodb_compression_failure_threshold_pct`
+(default 5), InnoDB leaves free space in new compressed pages, up to `innodb_compression_pad_pct_max` (default 50) percent.
+Recompressions also cost redo: with `innodb_log_compressed_pages` on (the default), each recompressed image is logged. The
+buffer pool may hold a page in both forms, evicting just the uncompressed copy when I/O-bound. `INFORMATION_SCHEMA.INNODB_CMP`
+counts `COMPRESS_OPS` against `COMPRESS_OPS_OK`; the gap is your failure rate.
+
+## InnoDB, design two: transparent page compression
+
+`CREATE TABLE … COMPRESSION='zlib'` (or `'lz4'`) leaves pages at 16 KB in memory and compresses only on the way to disk.
+`os_file_compress_page()` leaves the 38-byte FIL header uncompressed and compresses the other 16,346 bytes. It keeps the result
+only if it fits in one filesystem block less than the page, so on a 4 KB filesystem a page must compress to 12 KB or less. It
+rounds the result up to whole blocks, writes it, and calls `fallocate(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE)` over the rest
+of the page's slot. The file keeps its logical size but becomes sparse. `ls -l` shows the full size and `du` the allocated
+blocks, the same pair `INFORMATION_SCHEMA.INNODB_TABLESPACES` reports as `FILE_SIZE` and `ALLOCATED_SIZE`.
+
+Switch the lab to **Hole punching, COMPRESSION='lz4'**. The sweep replays the initial writes: each page is written, rounded to 4 KB blocks,
+and its tail punched out. The file ends up at 68 KB allocated of 144 KB. Choose a **1 KB** filesystem block and the same pages
+occupy 28.5%, because the hole is quantized to the filesystem block, and a page that compresses to 4,786 bytes costs 8 KB on a
+4 KB filesystem. On Windows the hole unit is the NTFS compression unit, 64 KB with
+default 4 KB clusters, so the feature saves nothing out of the box.
+
+There is no modification log in this design. Every flush recompresses the whole page, and when the compressed size crosses a block
+boundary the page's allocation changes. With 1 KB blocks and session-token updates, the 9th update grows page 0 from 5 blocks to 6.
+The new block lands wherever the filesystem has free space. Only file-per-table
+tablespaces qualify, and `ALTER TABLE … COMPRESSION` affects future writes only; `OPTIMIZE TABLE` rewrites existing pages.
+
+## Where it bites in production
+
+- **Point-read tail latency grows with block size.** Every cache miss decompresses a whole block. If p99 lookups regress after
+  raising RocksDB's `block_size` or ClickHouse's `max_compress_block_size`, or after switching to ZSTD, this is the likely cause.
+- **Heavy levels on fresh data burn compaction CPU.** ZSTD -19 compressed at 5.8 MB/s here, about 170 CPU-seconds per GB, for data
+  an upper LSM level will rewrite soon. Keep dense codecs for the bottom level or merged parts.
+- **Dictionary compression holds memory.** The builder buffers an SST's uncompressed blocks before writing; cap it with
+  `max_dict_buffer_bytes`.
+- **Random or already-compressed data costs CPU for nothing.** UUIDs, ciphertext and JPEGs come out no smaller. Compress first,
+  then encrypt.
+- **ROW_FORMAT=COMPRESSED fails quietly.** Compression failures show up as CPU, splits and redo volume, not errors; watch `INNODB_CMP`.
+- **Hole-punched files misbehave outside the database.** Copy tools that don't preserve sparseness inflate them, `ls -l` overstates
+  usage, and a full filesystem can reject a later write into a hole with `ENOSPC`, as the
+  [sparse-files note](../../../p01-foundations/hardware-os-durability/03-storage-abstractions-files-block-devices-and-object-stores/) warns.
+
+:::note[What to take forward]
+LZ4 and Snappy emit raw LZ77 sequences at a cost of at least 3 bytes per match; ZSTD and zlib entropy-code them. Because engines
+compress per block, block size sets point-read cost, and trained dictionaries help only small blocks. Spend cheap codecs on fresh
+data and dense ones where it settles. InnoDB offers fixed-size compressed pages with a modification log, or whole-page compression
+with holes punched at filesystem-block granularity.
+:::
