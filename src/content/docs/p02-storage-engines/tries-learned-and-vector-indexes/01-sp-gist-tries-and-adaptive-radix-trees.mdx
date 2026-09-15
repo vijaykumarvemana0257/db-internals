@@ -1,0 +1,211 @@
+---
+title: SP-GiST, tries and adaptive radix trees
+description: How tries and space-partitioning trees navigate by a key's own bytes or coordinates instead of comparisons — ART's Node4/16/48/256 layouts, lazy expansion, path compression, binary-comparable keys and optimistic lock coupling in HyPer and DuckDB, Masstree's trie of B+trees, and PostgreSQL's SP-GiST callbacks behind its quadtree, k-d tree and radix-tree operator classes.
+depth: deep
+sidebar:
+  order: 1
+---
+
+import AdaptiveRadixSpGistLab from '../../../../components/viz/AdaptiveRadixSpGistLab';
+
+A B-tree finds a key by comparing it with other keys, level after level. A long key costs a long comparison at
+every step, and each comparison is a branch the CPU predicts badly. A **trie** uses the key's own bytes as
+directions instead: the first byte picks a child, the next byte picks the next child. **Space-partitioning trees**
+do the same with geometry, letting a point's coordinates pick a quadrant. Both give up balance, so their shape
+follows the data — which is where the speed and the surprises both come from.
+
+<AdaptiveRadixSpGistLab client:visible />
+
+## The key is the path
+
+A radix tree's inner node maps a chunk of the key, *s* bits wide, to a child pointer. The Adaptive Radix Tree
+paper (Leis, Kemper and Neumann, ICDE 2013) calls *s* the **span**. A tree over *k*-bit keys has at most
+⌈*k*/*s*⌉ levels of inner nodes, however many keys it holds: 32-bit integers with an 8-bit span need four. Three
+properties follow:
+
+- **Lookup is O(*k*)**, independent of *n*. A comparison tree is O(*k* log *n*) once comparing two long keys is
+  counted as O(*k*).
+- **No rebalancing.** Every insertion order produces the same tree, because the bytes fix each key's position.
+- **Order is free.** Children are visited in byte order, so an in-order walk is a sorted scan.
+
+The cost is space. With an 8-bit span, the obvious node is an array of 256 pointers, about 2 KB, and for sparse
+keys most of it is null. A smaller span saves memory but makes the tree taller.
+
+## Four node sizes for one span
+
+ART keeps the 8-bit span and changes each node's *representation* according to how many children it has. The
+sizes are the paper's, with a 16-byte header and 8-byte pointers:
+
+| Type | Children | Layout | Finding the child for byte *b* | Bytes |
+|---|---|---|---|---|
+| Node4 | 2–4 | 4 sorted key bytes + 4 pointers | loop over the keys | 16 + 4 + 4·8 = 52 |
+| Node16 | 5–16 | 16 sorted key bytes + 16 pointers | one SIMD compare, or binary search | 16 + 16 + 16·8 = 160 |
+| Node48 | 17–48 | 256-entry `child_index` + 48 pointers | `child_index[b]`, then that pointer | 16 + 256 + 48·8 = 656 |
+| Node256 | 49–256 | 256 pointers | `child[b]` | 16 + 256·8 = 2064 |
+
+The paper's Node16 search replicates the byte, compares it with all 16 keys using `_mm_cmpeq_epi8`, masks off
+unused slots, and counts trailing zeros of the `_mm_movemask_epi8` result. Node48 saves space by storing
+one-byte slot numbers in its 256-entry index instead of 8-byte pointers. DuckDB uses the same four layouts, and
+searches Node4 and Node16 with a plain loop over the sorted bytes.
+
+A full node is replaced by the next type when another child arrives. Choose **Many siblings** in the lab and drag
+**Keys inserted**: at 4 keys the root is a Node4, the 5th key makes it a Node16, the 17th a Node48 and the 49th a
+Node256. The memory bar jumps at each step, then the new slots fill.
+
+Shrinking is left to implementations; the paper only says an underfull node is replaced. DuckDB adds hysteresis:
+a Node256 becomes a Node48 at 36 children or fewer, a Node48 becomes a Node16 below 12, and a Node16 becomes a
+Node4 below 4. With all 60 keys inserted, drag **Then delete newest** to 20. The root still holds its 40 children
+in a Node256, although inserting 40 keys directly builds a Node48. At 24 deletions it drops to a Node48. Without
+that gap, a node hovering near 48 children would be copied on every insert and delete.
+
+Adaptive nodes bound memory. The paper proves inner nodes cost at most **52 bytes per key**, however long the
+keys, when values live in tagged child pointers rather than separate leaf objects. Dense integers are the best
+case. Choose **Dense integers 0 … 255** and set **Leaves** to *Tuple id in the pointer*: all 256 keys share the
+prefix `00 00 00` and hang from one Node256, which works out to 8.1 bytes per key. That is the figure the paper
+measured for HyPer's dense-integer TPC-C indexes. The B+tree model (insert-built 16-key nodes, 8-byte pointers) needs 37.3.
+
+## Lazy expansion and path compression
+
+Adaptive nodes fix wide nodes. Long keys create the opposite problem: chains of nodes with a single child.
+
+**Lazy expansion** creates an inner node only when it is needed to tell two leaves apart, so a key's unshared tail
+is not spelled out as nodes. The leaf must then hold the full key, or the index must load it from the table, so a
+lookup can confirm the leaf matches.
+
+**Path compression** removes every inner node with one child and records its byte as a **prefix** on the next node
+down. The prefix can be checked two ways:
+
+- **Pessimistic:** store the prefix bytes and compare them on the way down. A mismatch is caught at the node.
+- **Optimistic:** store only the prefix length and skip that many bytes. The leaf verifies them.
+
+The paper uses a hybrid: each header has room for 8 prefix bytes, which are compared, and anything longer is skipped
+optimistically.
+
+Choose **URLs with a long common prefix**. With **Collapsing** set to *None*, every key byte is a node: 77 Node4s, 71
+of them with one child, and 32 levels to the deepest leaf. *Lazy expansion* cuts that to 46 nodes. *+ Path compression*
+leaves 6, and the root carries the 17-byte prefix `shop.example.com/`.
+
+Now set **Look up** to *Missing: differs inside a compressed prefix*. The probe `shop.example.com0cart` changes the last
+byte of that prefix. *Pessimistic* checking rejects it at the root after 17 bytes. *Optimistic* checking skips those bytes,
+follows `c`, `a` and `r` down to the leaf `shop.example.com/cart`, and only the whole-key comparison there finds the
+difference. *Hybrid* compares 8 bytes, skips 9, and also ends at the leaf. Optimism saves work in every node, but a wrong
+turn is discovered only at the bottom.
+
+HyPer and DuckDB store keys differently. HyPer puts tuple identifiers directly into child pointers, marked by a tag bit, so
+verifying a key means reading it from the tuple. DuckDB never needs the table for that: when it inserts a key it creates a
+chain of `PREFIX` nodes holding all of the key's remaining bytes, ending in an inlined row id. Its path compression is
+pessimistic and every key byte stays in the index. When a non-unique key has several rows, a "gate" leads to a nested ART
+keyed by 8-byte row ids.
+
+## Keys must be binary-comparable
+
+A trie orders keys by their bytes, so the bytes must sort the way the values do. The paper calls these
+**binary-comparable keys**. The encoding rules — big-endian integers with the sign bit flipped, re-ranked floats, collation
+sort keys for text — are covered in
+[collation and byte-comparable key encoding](../../../p02-storage-engines/b-trees-and-variants/07-collation-unicode-and-byte-comparable-key-encoding/).
+A radix tree adds one rule: **no key may be a prefix of another**, or a key would have to end at an inner node. The paper
+terminates strings with a byte that appears nowhere else, such as `0x00`. DuckDB escapes each `0x00` or `0x01` byte in a
+string with a `0x01`, then appends `0x00`. The `∅` edges in the lab's words tree are those terminators: `rom` hangs off one, beside
+the `a` edge toward `romane`.
+
+Choose **Signed integers −8 … 8** and untick **Flip the sign bit**. The in-order scan becomes `0 … 8, −8 … −1`, because
+two's-complement negatives begin with `0xff`. Point lookups still work; every range scan is wrong.
+
+## Faster lookups, not always smaller
+
+**Key bytes examined** counts the search-key bytes a lookup reads. For *A stored key* on the URL set with *Pessimistic* checking, the ART reads 28. The
+B+tree model reads 74 in 3 comparisons, because each step of its binary search re-reads the 17-byte shared prefix. B-trees
+fight this with
+[prefix compression and suffix truncation](../../../p02-storage-engines/b-trees-and-variants/06-key-layout-prefix-compression-and-suffix-truncation/);
+a trie avoids it by construction.
+
+Memory is less one-sided. For the ten short words, with *Leaf stores the key*, the ART needs 51.3 bytes per key and the B+tree 28.3: one 272-byte leaf holds
+all ten keys, while the ART spends 52 bytes on each of seven Node4s. On the URLs the ART wins only with *Tuple id in the pointer*
+leaves, 32.2 bytes per key against 54.4; dense keys are its best case. Its lookups compare little, but every level is a pointer dereference, often a cache miss.
+
+## Concurrency: optimistic lock coupling
+
+A B-tree split can cascade to the root. An ART change touches at most two nodes: the node, and the parent pointer swung to a
+replacement when it grows or shrinks. "The ART of Practical Synchronization" (Leis, Scheibner, Kemper and Neumann, DaMoN 2016)
+builds on that.
+
+Plain **lock coupling** scales badly even for reads, because taking a read lock writes to the node, and cores keep invalidating
+each other's cached copy of the root. **Optimistic lock coupling (OLC)** gives each node a 64-bit version word instead, whose lowest
+bit marks the node obsolete and whose next bit marks it locked. A reader waits for the lock bit to clear, records the version, reads
+the node, and checks the version again — before it dereferences any child pointer it read, since that pointer may be garbage. If the
+version changed, the lookup restarts from the root. A writer locks by compare-and-swap and adds 2 on unlock, clearing the lock bit and
+bumping the counter. Removed nodes are marked obsolete and freed through epoch-based reclamation, because a reader may still be inside.
+
+The paper's second scheme, **ROWEX**, never restarts readers. Writers still lock, but must leave every intermediate state readable:
+Node4 and Node16 keys are appended unsorted, replacement nodes are installed with one atomic store, and each node records its level so
+a reader can detect a prefix that changed under it. The same validate-after-read idea for buffer frames appears in
+[latching the buffer pool](../../../p02-storage-engines/buffer-pool-memory-mmap-and-contention/04-latching-the-buffer-pool-and-hot-page-contention/).
+
+## Masstree: a trie of B+trees
+
+Masstree (Mao, Kohler and Morris, EuroSys 2012) is a trie with fanout 2⁶⁴ whose nodes are B+trees, each indexed by one **8-byte
+slice** of the key: layer 0 by bytes 0–7, layer 1 by bytes 8–15. A new layer appears only when keys share a whole slice, such as
+`01234567AB` and `01234567XY`. Each B+tree node has fanout 15, fitting four cache lines, and stores slices as byte-swapped 64-bit
+integers so a native integer comparison gives byte order. Readers validate version counters much as OLC does, and a border node's
+64-bit permutation field lets an insert publish a key and the new sort order in one write.
+
+## SP-GiST: space partitioning on disk pages
+
+PostgreSQL 9.2 added **SP-GiST**, which its documentation describes as supporting "non-balanced data structures, such as quad-trees,
+k-d trees, and radix trees". Those structures were designed as pointer-linked nodes in memory; SP-GiST maps them onto 8 kB pages so a
+search reads few pages while visiting many nodes. The source README is blunt: there is "no control or code to support balancing".
+
+An **inner tuple** holds an optional prefix and a set of **nodes**, each a label plus a downlink. The operator class decides what the
+prefix means: the common string in a radix tree, the centroid in a quadtree, the split coordinate in a k-d tree. A downlink leads to
+another inner tuple or to a chain of **leaf tuples** that must sit on one page. The class supplies five functions:
+
+| Callback | Called when | Returns |
+|---|---|---|
+| `config` | once | prefix, label and leaf types; `canReturnData`; `longValuesOK` |
+| `choose` | an insert reaches an inner tuple | `spgMatchNode` (descend), `spgAddNode` (add a node), `spgSplitTuple` (split the prefix) |
+| `picksplit` | a leaf chain no longer fits its page (short chains move instead) | a prefix, node labels, and a node for each leaf tuple |
+| `inner_consistent` | a search reaches an inner tuple | the nodes to follow, with distances for ordered search |
+| `leaf_consistent` | a search reaches a leaf tuple | match or not, and whether to recheck the heap |
+
+`compress` and `options` are optional.
+
+The built-in classes differ only in these callbacks. `quad_point_ops`, the default for `point`, sets the centroid to the **mean** of the
+tuples being split and makes four unlabeled nodes. `kd_point_ops` sorts by y at even levels and x at odd levels, then splits at the median
+into two. `text_ops` is a radix tree whose labels are `int2` byte values, with −1 for "the string ends here", and whose prefixes may reach
+3,964 bytes on 8 kB pages; it supports comparisons and the starts-with operator `^@`. `inet_ops` splits by address family, then by the next
+address bit and by netmask length. `range_ops`, `box_ops` and `poly_ops` complete the set. SP-GiST has served nearest-neighbour `ORDER BY <->` searches since
+PostgreSQL 12, and the point and polygon classes provide them.
+
+The README shows `spgSplitTuple` on a radix tree: inserting `www.gogo.com` under the inner tuple `(www.google.com/)[a, i]` splits it into
+`(www.go)[o]` above `(gle.com/)[a, i]`, `choose` then adds node `g`, and the new leaf stores only `o.com`.
+
+Switch the lab to **SP-GiST quadtree / k-d tree** and drag **Points inserted** to 6: everything is one leaf list. At 7 the list overflows the
+**Leaf capacity** of 6, the lab's stand-in for a full page, and `picksplit` creates the first inner tuple. Back at 120 clustered points,
+the box query visits 6 of 14 inner tuples and tests 26 of 120 points. `inner_consistent` follows all four quadrants when the centroid is inside
+the box, and otherwise only the quadrants containing the box's corners. Switch to `kd_point_ops`: the same points need 28 inner tuples, and the
+query visits 12. Then choose **Along a diagonal** with 200 points in the quadtree. Leaf depth now ranges from 1 to 7: a centroid on the line sends
+its points into just two quadrants, so each split halves them instead of quartering, while the off-line quadrants stay shallow.
+
+## Where it bites in production
+
+- **An ART lives in memory.** DuckDB builds one for every `PRIMARY KEY` and `UNIQUE` constraint and documents that the index must fit in memory
+  while it is created. Its `UPDATE` of an indexed column runs as a delete plus an insert per chunk of rows, so `SET i = i + 1` on a primary key can
+  raise a duplicate-key error the final state would not contain.
+- **Sparse keys cost memory.** Where few keys share a byte, the tree fills with Node4s holding two or three children — the case behind the 52-byte
+  bound. Bytes per key depends on the key distribution far more than on the key count.
+- **Optimism moves work, it does not remove it.** Optimistic prefixes and lazy expansion move key verification to the leaf, which in HyPer's layout
+  means reading the tuple. OLC readers restart under write contention, and removed nodes wait for epoch reclamation before their memory is freed.
+- **SP-GiST never repairs a partition.** A quadtree centroid is fixed by the points present when `picksplit` ran. If the data drifts, new points pile
+  into old cells and those branches deepen, and only a rebuild repartitions, as with [IVF centroids](../05-how-churn-degrades-a-vector-index-tombstones-merges-and-cent/#ivf-centroids-are-a-fit-to-old-data). The README also notes that VACUUM does not try to remove unused inner tuples.
+- **SP-GiST inserts can restart.** Insertion locks parent and child pages conditionally and starts over when a lock is unavailable; its "triple parity"
+  page placement makes that rarer, not impossible.
+- **Space partitioning fails in high dimensions.** A box that prunes well in two dimensions touches nearly every cell at embedding dimensionality, as
+  [why high dimensions break indexes](../03-why-high-dimensions-break-indexes-distance-concentration-and/) shows.
+
+:::note[What to take forward]
+Tries and space-partitioning trees navigate by a key's bytes or coordinates, so lookups cost O(key length) and nothing is ever rebalanced — but depth
+and memory follow the data. ART makes an 8-bit trie practical with Node4/16/48/256 layouts, lazy expansion and path compression, bounding inner nodes
+at 52 bytes per key and reaching about 8 for dense integers; it needs binary-comparable, prefix-free keys and scales with optimistic lock coupling.
+SP-GiST exposes the same unbalanced partitioning in PostgreSQL through `config`, `choose`, `picksplit`, `inner_consistent` and `leaf_consistent`, and
+the partitions it chooses stay until the index is rebuilt.
+:::

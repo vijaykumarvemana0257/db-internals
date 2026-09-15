@@ -1,0 +1,190 @@
+---
+title: 'Succinct and learned indexes: rank/select, Elias-Fano and RMI'
+description: How rank/select, Elias-Fano, wavelet trees and Roaring keep compressed data searchable, how learned indexes (RMI, PGM, ALEX, LIPP) replace tree descent with a prediction plus a bounded search, and why inserts, drift and concurrency keep the B-tree the default.
+depth: deep
+sidebar:
+  order: 2
+---
+
+import RmiEliasFanoLab from '../../../../components/viz/RmiEliasFanoLab';
+
+A B+tree over *n* sorted 64-bit keys pays twice. It stores 8 bytes for every key plus a tree of separators and
+pointers, and every lookup runs a binary search inside each node from root to leaf. Two lines of work attack
+those costs from opposite ends. **Succinct** structures shrink the keys to near the information-theoretic minimum
+and answer queries directly on the compressed bits. **Learned** indexes keep the keys but replace the tree with a
+model that predicts where a key sits. Both work best on data that does not change, and the cost of each one shows
+up once it does.
+
+<RmiEliasFanoLab client:visible />
+
+The lab builds all three over one key set. Cost is counted in **probes**: distinct 64-byte cache lines a cold lookup
+reads. It assumes 8-byte keys, completely full bulk-loaded B+tree nodes, and 24 bytes
+per learned leaf model.
+
+## Rank and select: the primitive under everything succinct
+
+For a bit vector *B*, **rank₁(i)** counts the 1s before position *i*, and **select₁(j)** returns the position of the
+*j*-th 1 (select₀ does the same for 0s). Almost every compressed index reduces its queries to these two operations.
+
+Rank is made constant-time with **two levels of counters** (Jacobson's construction): an absolute count at the start of
+each large block, a small relative count at the start of each sub-block inside it, and a popcount for the bits left over.
+Sebastiano Vigna's **Rank9**, from the sux library, is a concrete version. Every 512 bits it stores a 64-bit absolute count,
+and next to it a second 64-bit word packing seven 9-bit relative counts, one for each of the block's other seven 64-bit words. So
+`rank(k) = counts[block] + relative[word] + popcount(word & mask)`. That takes three memory reads, two of them next to each
+other, for 25% extra space.
+
+Select is harder. Practical implementations **sample** positions, keeping a pointer to every *q*-th 1 or 0, then scan forward
+with popcount. Set the lab's **Probe detail** to **Elias-Fano** and step through a lookup: step 2 jumps to a zero sample (one per
+256 zeros) and scans forward, and step 3 checks the result with Rank9 arithmetic: block count + word count + popcount in the word.
+
+## Elias-Fano: a sorted sequence in 2 + log(u/n) bits per key
+
+Take *n* sorted integers no larger than *u*. Elias-Fano splits each one at **ℓ = ⌊log₂(u/n)⌋** bits:
+
+- the **low ℓ bits** of every value are stored verbatim, packed side by side;
+- the **high parts** are stored in unary: the value with index *i* and high part *h* sets bit *h + i* of an upper bit array.
+
+The upper array holds *n* ones and at most `u >> ℓ` zeros. folly's `EliasFanoCoding.h` sizes it at exactly
+`(upperBound >> numLowerBits) + size` bits. Vigna's quasi-succinct indices paper shows the total is at most **2 + ⌈log₂(u/n)⌉
+bits per element**, within half a bit of the information-theoretic minimum. The size depends only on *n* and *u*, not on how the gaps are
+distributed.
+
+Queries work directly on those bits:
+
+- **access(i)** = `(select₁(i) − i) << ℓ | low[i]`. The number of zeros before the *i*-th one is its high part.
+- **lower_bound(x)**: `select₀(x >> ℓ)` finds where bucket `x >> ℓ` starts. The bit position minus the bucket number counts the keys
+  with a smaller high part, and a scan of the bucket's low parts finishes the search. folly's `skipTo` does exactly this: it skips to the
+  bucket, then reads values one by one.
+
+In the lab, **Uniform random** keys give ℓ = 20 and 22.1 bits per key, 2.77 bytes against the B+tree's 8.26. **Sequential ids** give
+ℓ = 0 and 2.7 bits per key, because *u* is barely larger than *n*. **Clustered timestamps** land near 16 bits: hour-long idle gaps make
+*u* large, and nothing in Elias-Fano can exploit the dense bursts in between.
+
+That is the weakness. One ℓ for the whole sequence means a dense run lands in one bucket, and the bucket is scanned linearly. Go back to
+**Uniform random**, keep **Burst into one hot key range** selected and press **Append keys** five times: the largest bucket grows to 4,001 keys, and Elias-Fano's
+average climbs from 3 probes to 36.6. **Partitioned Elias-Fano** (Ottaviano and Venturini) fixes this by cutting the sequence into chunks,
+each encoded with its own parameters. A dense chunk is stored as a plain bitvector, and a chunk that contains every value in its range
+takes zero bits. The structure is also static: folly's encoder takes the upper bound when it is built, so an insert into the middle means
+re-encoding. The lab re-encodes after every append.
+
+### Wavelet trees and the FM-index
+
+The same rank primitive supports substring search over compressed text. The **FM-index** stores the Burrows-Wheeler transform (BWT) of
+the text, a table *C* of how many characters sort before each symbol, and rank over the BWT. **Backward search** processes the pattern
+right to left, keeping an interval [*l*, *r*] of suffix-array rows. For each character *c*, sdsl-lite's implementation computes
+`l' = C[c] + rank_c(BWT, l)` and `r' = C[c] + rank_c(BWT, r+1) − 1`. After |*P*| steps the interval's width is the number of occurrences:
+two rank queries per character, and no suffix array scan.
+
+Rank for a multi-symbol alphabet comes from a **wavelet tree**: a binary tree of bit vectors, where each level records whether a symbol
+falls in the lower or upper half of the remaining alphabet. rank_c is then log₂σ bit-vector ranks, one per level.
+
+### The succinct cousins that ship
+
+- **[Roaring bitmaps](../../../p02-storage-engines/indexes-beyond-the-b-tree/03-bitmap-indexes-and-bitmap-heap-scans/)** split 32-bit integers by their high 16 bits into containers. A sparse container is a sorted array of 16-bit values (up to
+  4,096), a dense one an 8 KB bitmap, and runs use run-length containers. Lucene, Druid, Spark and Pinot are among the listed users. Lucene's
+  `RoaringDocIdSet` keeps a `short[]` when fewer than 2¹² of a 2¹⁶ block's bits are set, the complement when more than 2¹⁶ − 2¹² are set, and
+  a `FixedBitSet` otherwise; since Lucene 10.5 a contiguous run is stored as just its bounds. `LRUQueryCache` uses it for cached sets under 1% density.
+- **[Lucene's term index](../../../p02-storage-engines/indexes-beyond-the-b-tree/07-full-text-indexes-term-dictionaries-postings-and-skip-lists/)** (`.tip`) maps a term prefix to the on-disk block in `.tim` that holds the terms starting with it, 25–48 entries per block by
+  default. Through Lucene 10.2 that index was a per-field **FST**. Lucene 10.3.0 replaced it with a specialized trie (GITHUB#14333), so older
+  descriptions of "Lucene's FST terms dictionary" no longer match current code.
+- **RocksDB's ribbon filter** builds the filter by solving a linear system, saving about 30% of a Bloom filter's space for 3–4× its construction CPU. The
+  [filters beyond Bloom page](../../../p02-storage-engines/lsm-trees/08-beyond-bloom-cuckoo-quotient-xor-and-ribbon-filters/) covers it.
+
+## Learned indexes: the index is a CDF
+
+An index over a sorted array is a function from key to position, which is *N* × CDF(key). Kraska et al.'s "The Case for Learned Index
+Structures" (SIGMOD 2018) observes that a B-tree is already a model of that function. It is a regression tree whose min-error is 0 and whose
+max-error is the page size. Any model with a known error bound can take its place.
+
+The **Recursive Model Index (RMI)** stacks models in stages. The root predicts a position and picks a second-stage model with
+⌊*M* · f₀(x) / *N*⌋, with no search between stages. Each last-stage model stores its **worst over- and under-prediction** on the training keys:
+how far below and above the prediction a true position can sit. A lookup evaluates two models and then binary-searches only [pred − below, pred + above]. The paper's default, "model-biased search", puts the
+first probe at the prediction. Its grid search favored a root anywhere from a linear model to a net with two 8- or 16-wide hidden layers, over 10,000 to 200,000 linear leaf models. A hybrid variant
+replaces any leaf whose max error exceeds a threshold with a B-tree.
+
+Press **Reset** and look up the key at rank 2,000 in the default uniform set. The root sends it to leaf 25, the leaf predicts 1,999, and the stored errors (true rank at most 4 below
+and 4 above) give a 9-slot window closed in 4 comparisons: **4 probes against the B+tree's 11**. Averaged over every key, the RMI costs 3.8.
+That gap is the whole case: a model small enough to stay in cache replaces the descent, leaving one short search in the key array,
+as long as the keys stay sorted, read-mostly and smooth.
+Now change **RMI leaf models**:
+
+- **4 leaves**: the average window grows to 37 slots.
+- **1,024 leaves**: it shrinks to 2.3 slots, but the models take 4.9 bytes per key at 5,000 keys. The error shrinks, and the index grows.
+
+Switch to **Zipf-like gaps** and the window at 64 leaves jumps to 253 slots (8.4 probes): linear pieces fit a staircase badly.
+
+Two cautions. First, the byte meters: the RMI is 8.31 bytes per key against the B+tree's 8.26, because the **keys are still stored**; the model only
+replaces the tree's small overhead. Wongkham et al.'s 2022 evaluation, which counted the leaf layer of key-position pairs that updatable indexes need,
+found learned indexes at most 3.2× smaller than traditional ones, and sometimes larger. Second, the stored errors cover **stored keys**. The RMI paper
+notes the bound holds for absent keys only if the model is monotonic.
+
+### PGM-index: bounds you can prove
+
+Ferragina and Vinciguerra's **PGM-index** makes the bound a definition. A segment (key, slope, intercept) is **ε-approximate** if |f(x) − rank(x)| ≤ ε for
+*every* x in its range, absent keys included. The minimum number of such segments is computed in O(n) by a streaming convex-hull algorithm borrowed from
+time-series compression. Every segment covers at least 2ε keys, so there are at most n/2ε of them. The first keys of the segments are then indexed the same
+way, recursively, until one segment remains, and each level costs a binary search over 2ε + 1 positions. Space is Θ(m), where *m* is the number of segments:
+it grows with how hard the data is to fit, not with n.
+
+The library's `DynamicPGMIndex` handles updates with sorted levels of geometrically growing size that are merged as they fill, the larger levels each
+indexed by their own PGM. That is the LSM shape again.
+
+## What inserts do to a learned index
+
+Kraska et al. split inserts into two cases. **Appends** that follow the learned pattern are O(1) if the model generalizes. **Inserts in the middle** shift
+every later position. The paper's fallback is a delta buffer merged with a retrain.
+
+Switch back to **Uniform random** (5,000 keys, 64 leaves, fanout 64) and press **Append keys** (a burst of 1,000 keys). Every key after the burst moves 1,000 ranks, but the models still predict the old
+ranks, so the windows of every later leaf widen. The lab recomputes the window each stale leaf now needs. Average probes go from 3.8 to 8.0 after one burst, and
+then 9.0, 10.0 and 10.2. The fifth burst reaches 11.2, above the B+tree's 11, and the auto-retrain rescans all 10,000 keys. The average falls only to 8.5,
+because a single linear leaf cannot fit a vertical step. Retraining does not cure a distribution the model family cannot express.
+
+Appends past the max are gentler, but not free. Reset, choose **Past the max, same pattern**, append three times, and move the lookup to the last rank. That key's
+leaf now over-predicts by up to 188 ranks, so its window must reach 188 slots below the prediction: a slope fitted to the top 78 keys of the build runs ahead of the true ranks
+across 3,000 more. Repeat with **Past the max, 10× sparser** and the same leaf needs 2,717 below.
+
+Two updatable designs attack this directly:
+
+- **ALEX** stores data nodes as **gapped arrays**, with a bitmap marking which slots are filled. An insert goes to its sorted position, found from the model's prediction by
+  exponential search, and shifts elements one slot toward the nearest gap if that slot is taken. Lookups use exponential search from the prediction, so no error bounds are stored. A node counts as full at 80% density by default
+  (0.6 and 0.8 are its density limits). Cost models then choose between **expanding** it (a new gapped array of n/0.6 slots, rescaled or retrained), **splitting sideways**
+  like a B+tree, or **splitting down** into an inner node with two children.
+- **LIPP** removes the last-mile search entirely by requiring **precise** positions. When two keys map to the same slot, that slot becomes a pointer to a child node.
+  Every entry is NULL, DATA or NODE, and an adjustment step rebuilds subtrees so that height stays O(log N).
+
+## Learned pieces inside other structures
+
+A **learned Bloom filter** puts a classifier in front of a filter. Keys scoring above a threshold τ are reported present, and a backup Bloom filter holds the stored keys
+the model rejects, so there are still no false negatives. The overall rate is FPR_τ + (1 − FPR_τ) · FPR_B. Mitzenmacher's analysis points out the catch: a Bloom filter's
+false-positive rate holds for any query set, but a learned filter's test-set rate predicts production only if queries come from the same distribution.
+
+**Bourbon** (OSDI 2020) put learned models inside an LSM. It is built on WiscKey, whose
+[key-value separation](../../../p02-storage-engines/lsm-compaction-and-maintenance/03-key-value-separation-and-blob-storage/) leaves only a key and a value pointer in each SSTable record.
+Bourbon also requires fixed-size keys, so a predicted position times the record size is a file offset. It learns **per SSTable** with Greedy-PLR, a linear-time piecewise linear regression with an error bound (8 in its
+experiments). Its guidelines follow file lifetimes: favor long-lived lower-level files, wait before learning a new file (50 ms, just above the
+longest time it took to learn one), skip level-wide models for write-heavy workloads, and let a cost-benefit analyzer decide per file. The paper reports 1.23×–1.78× faster lookups than WiscKey.
+An SSTable never changes, so its model never goes stale; compaction replaces the file and the model together.
+
+## Where it bites in production
+
+- **Silent drift.** A stale model does not fail; it gets slower. Unless someone tracks window size or search steps, a learned index degrades without an error, and the fix is an O(n)
+  rebuild. Wongkham et al. found traditional indexes more robust than most learned ones when the distribution changed.
+- **No worst case by default.** An RMI's bound covers only the keys it was trained on, and a hard distribution produces huge windows. Hybrid B-tree leaves, PGM's ε and LIPP's height bound
+  exist to put back a guarantee a B-tree has for free.
+- **Keys must look like numbers.** Bourbon requires fixed-size keys, and the RMI paper turned each string into a fixed-length vector of character codes before a model could
+  read it. Variable-length strings, the usual database key, remain the hard case; a [trie](../01-sp-gist-tries-and-adaptive-radix-trees/) indexes their bytes directly.
+- **Concurrency and memory reclamation.** Of the in-memory learned indexes surveyed in 2022, only XIndex and FINEdex were concurrent by design. XIndex waits with RCU for readers to leave
+  before merging a node's delta buffer. The evaluators' concurrent LIPP stopped scaling under writes because every insert updates statistics in every node on its path, the root included.
+- **Elias-Fano and friends are static.** Their queries are fast because nothing moves, so they belong in data written once: MG4J's quasi-succinct posting lists, a filter built once per
+  SSTable.
+
+That is what ships: mainstream engines still index with B-trees and per-file index blocks. The succinct structures appear inside immutable units —
+Roaring containers in a query cache, a trie per field in each Lucene segment, a ribbon filter per SSTable — and the learned work that transfers best, like Bourbon, attaches a model to an immutable file whose
+rebuild compaction already pays for.
+
+:::note[What to take forward]
+Succinct structures answer queries on compressed bits using rank and select: counters make rank a few memory reads, and Elias-Fano stores a sorted set in 2 + log₂(u/n) bits per key but
+scans long buckets on clustered data. A learned index predicts a position and searches the window its error bound allows. It wins on smooth, static numeric keys, and loses its edge
+under inserts, drift, string keys and concurrency, because every one of those invalidates the model. That is why engines ship learned and succinct *components* inside immutable files
+rather than learned replacements for the B-tree.
+:::

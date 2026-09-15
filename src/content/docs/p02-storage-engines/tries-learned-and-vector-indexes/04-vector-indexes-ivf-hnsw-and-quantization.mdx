@@ -1,0 +1,223 @@
+---
+title: 'Vector indexes: IVF, HNSW and quantization'
+description: How IVF cells, HNSW's layered graph, scalar, binary and product quantization and DiskANN trade recall for work and memory, and why filtered search and builds differ between pgvector and Lucene.
+depth: deep
+sidebar:
+  order: 4
+---
+
+import HnswIvfQuantizationLab from '../../../../components/viz/HnswIvfQuantizationLab';
+
+A query like `ORDER BY embedding <-> $1 LIMIT 10` asks for the ten stored vectors nearest to a query vector. Answered
+exactly, that is one distance computation per row, each costing O(d): ten million 768-dimensional vectors means about
+7.7 billion floating-point operations per query. No ordering exists to binary-search. The indexes on this page give up
+exactness to compute far fewer distances, and each is judged by **recall@k**: the fraction of the true k nearest neighbours it
+actually returns.
+
+The [previous page](../03-why-high-dimensions-break-indexes-distance-concentration-and/) showed why tree-shaped indexes
+stop pruning in high dimensions. This page covers what production engines use instead.
+
+<HnswIvfQuantizationLab client:visible />
+
+## Recall against work
+
+The lab's chart has one x-axis on every tab: **distance computations per query**, log scale, with an exact scan as the
+dashed line. The y-axis is recall@10, averaged over 60 queries that are not in the index (30 when filtering).
+Every knob on this page moves a point on that plane; measuring the same curve on your own data is how an index is tuned.
+
+The map shows 500 points in two dimensions so the structures are visible, but two dimensions are too easy: switch **Chart
+data** to *2-D map* and HNSW reaches almost perfect recall at every `efSearch`. By default the chart runs the same code over
+2,000 clustered 16-dimensional vectors, where the trade-offs appear.
+
+## IVF: cluster first, then scan a few lists
+
+An **inverted file (IVF)** index is k-means clustering turned into an access method. Training fits `nlist` centroids.
+Each vector is stored in the inverted list of its nearest centroid, so the lists partition the space into Voronoi cells.
+A query computes its distance to every centroid, picks the `nprobe` nearest, and scans only those lists exactly.
+
+Open **IVF cells**. With 16 cells, 2 probes and the query between two clusters, the index scans 62 of 500 vectors and
+returns 9 of the true 10. The tenth sits just across a cell boundary, in an unopened list, and nothing inside
+the probed lists can recover it. Drop `nprobe` to 1 and recall falls to 20%; raise it to 3 and all ten come back
+for 85 vectors scanned. The lists are uneven, from 12 to 85 vectors, which is why FAISS warns that
+`nprobe/nlist` underestimates the fraction scanned.
+
+On the 16-dimensional chart, `nlist` = 16 gives 59% recall at `nprobe` = 1 and 97% at `nprobe` = 8, for about 1,000 distance
+computations. On this data IVF's curve sits to the right of HNSW's, but IVF needs no graph: the index is centroids plus lists.
+
+Knobs by engine:
+
+- **pgvector** `ivfflat`: `lists` (default 100) at build time, `ivfflat.probes` (default 1) at query time. The README suggests
+  `rows / 1000` lists up to a million rows and `sqrt(rows)` beyond, and `sqrt(lists)` probes as a start. Setting probes to
+  `lists` makes the search exact, and the planner then stops using the index.
+- **FAISS** `IndexIVFFlat`: `nlist` and `nprobe` (default 1). Its guide suggests `nlist` on the order of `C × sqrt(n)`,
+  balancing centroid comparisons against list scanning.
+
+Centroids are fitted to the data present at build time. pgvector trains k-means on a sample of `lists × 50` rows, at least
+10,000, and if the table has fewer rows than lists it emits `ivfflat index created with little data` with the detail
+`This will cause low recall.` What happens when new data drifts away from old centroids is the
+[churn page's](../05-how-churn-degrades-a-vector-index-tombstones-merges-and-cent/) subject.
+
+## HNSW: a skip list of proximity graphs
+
+**Hierarchical Navigable Small World** graphs (Malkov and Yashunin) put every vector on layer 0 of a proximity graph and a
+random, geometrically shrinking subset on each layer above. A node's top layer is `floor(−ln U × mL)` for uniform U, with
+`mL = 1/ln M`. The paper points out this matches a [skip list](../../../p02-storage-engines/lsm-trees/03-skip-lists-probabilistic-balance-without-rebalancing/)
+with p = 1/M: each layer holds roughly 1/M of the nodes below it. The lab's M = 16 graph has 500, 32 and 2 nodes on layers 0,
+1 and 2. Each node keeps at most M links on upper layers and **2M on layer 0**, the paper's recommended `Mmax0`, which
+pgvector (`HnswGetLayerM`), Lucene and hnswlib all follow.
+
+### Searching
+
+Press **Search step by step**. The search starts at the entry point, the node with the highest layer, drawn as a diamond:
+
+1. **Upper layers, ef = 1.** On each layer it moves to the closest neighbour of the current node while that neighbour is
+   closer to the query, and stops at a local minimum. Where it stops becomes the entry point one layer down. Upper layers are sparse, so these hops cover long distances cheaply.
+2. **Layer 0, ef = `efSearch`.** The search keeps two heaps: a min-heap of candidates to expand and a max-heap **W** of the
+   best `ef` nodes found. It repeatedly pops the nearest candidate and computes distances to its unvisited neighbours. A
+   neighbour enters W, and the candidate heap, only if W has room or it beats W's farthest member. The search stops when the
+   nearest remaining candidate is farther than everything in W.
+3. The first k entries of W are the answer.
+
+The side table shows W filling, then its farthest member moving closer, as the steps advance. The default query costs 93 distance computations against an exact scan's
+500, with 100% recall.
+
+`efSearch` is the recall knob. On the 16-dimensional chart at M = 16, `efSearch` 10 gives 93% recall for about 200 distance
+computations and 40 gives 99.8% for about 430; beyond that you pay for nothing. W can never hold more than `ef` rows, so a
+single index scan can never return more: pgvector's FAQ names `hnsw.ef_search` as the reason an HNSW query can return fewer rows
+than its `LIMIT`.
+
+### Building
+
+Inserting a vector is a search: draw its level, descend greedily to that layer, then on that layer and every layer below run the
+layer-0 search with `ef = efConstruction` to collect candidate neighbours. A larger `efConstruction` finds better neighbours for more work.
+Drag it from 16 to 200 and the map graph's build cost goes from about 54,000 to 233,000 distance computations.
+
+Choosing which candidates become links matters as much as finding them. The paper's **neighbour-selection heuristic** walks the
+candidates nearest first and keeps one only if it is closer to the new node than to every neighbour already kept, so links point
+in different directions and some cross the gaps between clusters. Links go both ways; a neighbour whose list overflows re-runs
+the same rule over its old links plus the new one.
+
+The paper reports that plain nearest-M selection fails to reach high recall on clustered data because the search gets stuck at
+cluster boundaries. Switch **Chart data** to *2-D map*, set M to 2 and untick **Neighbour-selection heuristic**: recall drops to
+about 50% however far you raise `efSearch`, because layer 0 has split into five disconnected islands. Tick it again and recall
+returns to nearly 100%.
+
+**M** sets memory and the recall ceiling. The paper puts link memory at `(Mmax0 + mL × Mmax) × 4` bytes per node, about 60 to
+450 bytes for M between 6 and 48, before the vectors themselves. On the 16-dimensional chart, M = 4 at `efSearch` 40 reaches 93%
+recall where M = 16 reaches 99.8%.
+
+| Engine | Links | Build beam | Search beam |
+|---|---|---|---|
+| pgvector | `m` = 16 (2m on layer 0) | `ef_construction` = 64, must be ≥ 2 × `m` | `hnsw.ef_search` = 40 |
+| Lucene `Lucene99HnswVectorsFormat` | `maxConn` = 16 | `beamWidth` = 100 | set per query |
+| Elasticsearch `dense_vector` | `m` = 16 | `ef_construction` = 100 | set per query |
+| hnswlib | `M` = 16 | `ef_construction` = 200 | `ef` = 10 |
+| FAISS `IndexHNSW` | set at construction | `efConstruction` = 40 | `efSearch` = 16 |
+
+## Quantization: fewer bytes per vector
+
+A float32 vector costs 4 bytes per dimension: 3,072 bytes at d = 768, roughly 30 GB for ten million, before any graph. RAM, not
+CPU, usually limits an in-memory index, so engines compress the vectors it navigates with.
+
+- **Half precision**: pgvector's `halfvec` stores 2 bytes per dimension and can be indexed up to 4,000 dimensions.
+- **Scalar quantization** maps each dimension to a small integer: int8 is 4× smaller, int4 8×. FAISS calls it `SQ8`;
+  Elasticsearch's `int8_hnsw` and `int4_hnsw` index types apply it automatically.
+- **Binary quantization** keeps one bit per dimension, 32× smaller, compared with cheap bitwise operations. pgvector does it
+  with an expression index on `binary_quantize(embedding)::bit(n)`, and its README pairs Hamming-distance search with a subquery that
+  re-ranks the top 20 by the original vectors. Elasticsearch 9.1 defaults float vectors of 384 or more dimensions to `bbq_hnsw` and smaller ones to
+  `int8_hnsw`, keeping raw floats on disk for rescoring; from 9.4 the docs list
+  `bbq_disk` as the default where licensed.
+
+### Product quantization
+
+**Product quantization** (Jégou, Douze and Schmid) splits a d-dimensional vector into m subvectors and trains a separate k-means
+codebook of 2^bits centroids for each. A vector is stored as m centroid ids. With the paper's common choice of 256 centroids,
+that is m bytes: 96 subspaces encode a 768-dimensional vector in 96 bytes. The set of representable vectors is the Cartesian
+product of the codebooks, which is why the map shows a grid.
+
+Search uses **asymmetric distance computation (ADC)**. The query is not quantized. For each subspace, it computes squared
+distances from its subvector to all centroids once, filling an m × 256 table. The distance to any stored code is then m table
+lookups added up. The symmetric variant quantizes the query as well; the paper found it has more distortion at similar cost.
+**IVFADC**, FAISS's `IndexIVFPQ`, combines the two ideas: it quantizes the *residual* from the cell centroid, which has less
+energy than the vector itself.
+
+Tick **PQ codes** in the HNSW tab. The pink squares are what the index sees. On the chart, at 4 bits per subspace each
+16-dimensional vector is 4 bytes instead of 64, and recall sits near 60% whatever `efSearch` is. The cap is not ties, since all
+2,000 codes are distinct: code distances reorder near neighbours, and a wider beam only converges on the codes' own top 10. Tick **Re-rank with full vectors**: the candidate list is re-sorted
+by exact distance, and at `efSearch` 40 recall climbs back to about 96%. That split is the standard design: codes to navigate,
+full vectors to re-rank a shortlist.
+
+## DiskANN: the graph on SSD, the codes in RAM
+
+DiskANN (Subramanya et al., NeurIPS 2019) asks what to do when even compressed graphs do not fit in memory. Its graph, **Vamana**,
+is a single layer searched from the dataset's medoid. Its pruning rule, `RobustPrune`, is the HNSW heuristic with a parameter:
+a candidate c is dropped when a kept neighbour is within distance d(p, c)/α of it, for α ≥ 1. HNSW and NSG implicitly use α = 1.
+With α > 1 more long edges survive, and the paper measured two to three times fewer hops than HNSW or NSG.
+
+Hops matter because each one is an SSD read. DiskANN keeps a PQ code for every vector in RAM, 32 bytes in the paper's example,
+and stores each node on SSD as its full-precision vector followed by up to R neighbour ids, padded so offsets are computable. Beam
+search reads the neighbourhoods of the best 2 to 8 candidates per round trip, trading latency against throughput. Full
+vectors arrive in the same 4 KB read as the neighbour lists, so re-ranking costs no extra I/O.
+
+On the billion-point SIFT1B set, DiskANN served more than 5,000 queries per second at under 3 ms mean latency and 95%+ 1-recall@1,
+on a 16-core workstation with 64 GB of RAM. The unit of cost is no longer distance computations, which are cheap
+lookups in RAM, but SSD round trips.
+
+## Filtered search
+
+`WHERE category_id = 123 ORDER BY embedding <-> $1 LIMIT 10` needs the nearest *matching* rows. Open **Filtered search**, where 10%
+of rows match:
+
+- **Post-filter.** Run the normal index search, then apply the `WHERE` clause to its output. This is pgvector's default, and its
+  README gives the arithmetic: with 10% matching and `hnsw.ef_search` 40, about 4 rows come back. The lab returns 3. At 1%, it
+  returns none.
+- **Iterative scan.** Since 0.8.0, pgvector can keep going. `hnsw.iterative_scan` resumes the layer-0 search from the candidates
+  earlier rounds discarded, `ef_search` at a time, until enough rows pass or `hnsw.max_scan_tuples` (20,000 by default) or
+  `work_mem × hnsw.scan_mem_multiplier` is reached. `strict_order` keeps results sorted by distance; `relaxed_order` allows slight
+  disorder for better recall. IVFFlat has `ivfflat.iterative_scan` and `ivfflat.max_probes`. The lab's iterative scan returns all
+  10 rows in 3 rounds, for 210 distance computations.
+- **In-graph filter.** Pass the filter into the traversal: non-matching nodes are still followed as routing hops but never enter
+  W, as with hnswlib's `isIdAllowed` functor. It returns all 10 rows for 478 distance computations.
+- **Exact over matches (pre-filtering).** Find matching rows with a B-tree and score each one. That is 46 distance computations here, and exact.
+  pgvector's README suggests starting with an index on the filter column for exactly this reason.
+
+Drag **Rows matching the filter** to 1% and pick **In-graph**: it visits all 500 nodes, while the exact strategy scores 7 rows.
+Lucene encodes this crossover per segment: if no more than about k documents match, it scores them exactly. Otherwise it searches
+the graph with a visit limit equal to the number of matches, and falls back to exact scoring if the limit is hit. Lucene 10.2
+added an ACORN-1-inspired searcher that also explores neighbours of neighbours; released 10.x versions use it only when the
+query's `KnnSearchStrategy` asks, and the Lucene 11 main branch enables it when under 60% of vectors pass. pgvector recommends a partial index when a filter has only a few distinct values and partitioning when it has many, and
+it warns that tenants sharing one approximate index affect each other's recall.
+
+## Building: one graph or one per segment
+
+**pgvector** builds a single graph per index. `CREATE INDEX` builds it in memory until `maintenance_work_mem` is exhausted, then
+writes what it has to disk and inserts the remaining tuples one at a time, as ordinary inserts would, with the notice
+`hnsw graph no longer fits into maintenance_work_mem after N tuples` and `Building will take significantly more time.`
+`max_parallel_maintenance_workers` parallelizes the build. After the build, every `INSERT` runs the `ef_construction` search
+against the on-disk graph and rewrites neighbour pages through WAL. IVFFlat builds faster and smaller, but must be built after the
+data is loaded, because it has k-means to train.
+
+**Lucene**, and Elasticsearch on top of it, builds one HNSW graph *per segment*. Graph memory is bounded by segment size rather than
+by a build budget, and since Lucene 10.4 tiny segments skip the graph entirely. The costs move elsewhere: a kNN query searches every
+segment's graph and merges the results, and every merge must produce a graph for the new segment. That merge work is covered on the [churn page](../05-how-churn-degrades-a-vector-index-tombstones-merges-and-cent/).
+
+## Where it bites in production
+
+- **Fewer rows than `LIMIT`.** A selective `WHERE` over an HNSW or IVFFlat index silently returns fewer rows. Enable iterative
+  scans, add a B-tree for selective filters, or partition.
+- **The `maintenance_work_mem` cliff.** A build fast in staging crawls in production once the graph stops fitting; watch for the
+  notice.
+- **IVF trained on the wrong data.** An `ivfflat` index built on an empty or tiny table has meaningless centroids.
+- **The quantization ceiling.** With codes alone, raising `ef_search` stops helping. Re-rank an oversampled shortlist with full
+  vectors.
+- **Recall is unmeasured.** Latency dashboards cannot see recall. Keep real queries with exact answers and re-chart recall against
+  work whenever data, model or parameters change.
+
+:::note[What to take forward]
+Vector indexes trade recall for distance computations. IVF scans the `nprobe` nearest k-means cells and misses neighbours across
+cell boundaries. HNSW descends greedily through sparse layers, then searches layer 0 with a candidate list bounded by `efSearch`;
+M and the neighbour heuristic decide whether the graph can be navigated. Quantization shrinks vectors 4× to 32× but caps recall
+until a shortlist is re-ranked with full vectors, and DiskANN extends that split to SSD. Filters and builds are where engines differ
+most: pgvector post-filters one graph whose build speed hangs on `maintenance_work_mem`, while Lucene filters inside per-segment graphs and falls
+back to exact scoring.
+:::

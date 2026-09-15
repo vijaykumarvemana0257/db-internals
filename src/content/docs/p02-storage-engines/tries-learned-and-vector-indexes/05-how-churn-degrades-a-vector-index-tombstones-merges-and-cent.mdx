@@ -1,0 +1,213 @@
+---
+title: 'How churn degrades a vector index: tombstones, merges and centroid drift'
+description: Why an HNSW delete can only be a tombstone, how dead nodes inflate search work or crowd out results, what pgvector's VACUUM, DiskANN's consolidate_deletes and Lucene's segment merges each pay to repair the graph, and why IVF centroids fitted to old data need reclustering.
+depth: deep
+sidebar:
+  order: 5
+---
+
+import VectorChurnTombstoneLab from '../../../../components/viz/VectorChurnTombstoneLab';
+
+A vector index is fitted to the data it was built from. An HNSW graph's edges record which vectors were near each other
+when each one was inserted. An IVF index's centroids sit where the data was when k-means ran. Deletes, updates and new
+data invalidate that fit, and neither structure has a cheap local fix the way a B-tree has page splits and merges.
+
+So engines defer the problem: tombstones, background repair, rebuilds during merges, reclustering. Each costs something different —
+search work, missing results, CPU or index size. HNSW and IVF basics are on the [previous page](../04-vector-indexes-ivf-hnsw-and-quantization/).
+
+<VectorChurnTombstoneLab client:visible />
+
+The lab runs these algorithms on 300 points in two dimensions: an HNSW graph with M = 6 and `efConstruction` = 40, and 40 fixed
+queries scored as recall@10 against exact search. Work is counted in distance computations. A 2-D graph gives each node fewer
+neighbours than an embedding graph has, so damage shows up sooner: read the numbers for direction and relative size.
+
+## Why an HNSW delete is a tombstone
+
+Every node's neighbour list was chosen from the nodes around it at insert time, then trimmed as later nodes linked in, and other
+nodes route searches through it. Edges are stored
+only as out-lists. A node does not know who points at it, so deleting it would first mean scanning the graph to find its
+in-neighbours, and then choosing new neighbours for each of them.
+
+hnswlib does not try. `markDelete` sets a bit in the element's level-0 header, and the source says in so many words that it
+"does NOT really change the current graph". The dead node keeps its vector, its edges and its place as a route. If it was the
+entry point, it stays the entry point.
+
+The search then treats dead nodes as hops, not as answers. In `searchBaseLayerST`, a dead neighbour still goes into the
+candidate heap, so the search expands it and reads its neighbour list, but it never enters the result heap *W*. The stop rule
+changes too. Once the index holds any deleted element, the search may only stop when *W* holds `ef` *live* elements.
+Lucene works the same way until a merge: a deleted document is a cleared bit in the segment's live-docs, and
+`HnswGraphSearcher` scores every neighbour it reaches but only collects the ones the accept-bits allow.
+
+The lab opens on this case: **hnswlib markDelete** with **Delete one region of the space**, the pattern you get when a whole
+category is removed and the dead vectors share a neighbourhood. At 40% deleted, 120 tombstones remain in the graph. Queries compute 111 distances on average instead of 60 before
+any delete, and expand 40.5 dead nodes on the way. Recall@10 stays at 1.00. Drag **Deleted so far** to 60% and the count
+reaches 147. Tombstones cost this engine latency, not recall, and nothing alerts on that.
+
+Why not just remove dead nodes? Tick **Mark nodes stranded if tombstones were dropped** and switch to **Random deletes**: at 60%
+deleted, dropping the tombstones without repair would leave 30 live nodes with no path from the entry point.
+
+hnswlib's insert search also skips dead nodes when it picks neighbours, so tombstones stop gaining edges but keep the ones they have.
+
+## When dead entries crowd out results
+
+pgvector sees deletes differently. A deleted or updated row becomes dead in the heap, but the HNSW index cannot know that until
+VACUUM runs. Until then a dead row's element is an ordinary member of the graph. A scan's candidate list, `hnsw.ef_search`
+(40 by default), fills with live and dead elements alike. Postgres then checks each heap tuple and drops the dead ones. The README
+warns that results can be fewer than requested "due to dead tuples or filtering conditions". New inserts can also pick
+dead elements as neighbours.
+
+DiskANN's in-memory index behaves the same way between consolidations. `lazy_delete` adds the location to `_delete_set` and erases its tag, leaving the graph alone, and
+`search_with_tags` returns only the entries of its size-L list that still have tags, so dead nodes use up slots in L.
+
+Choose **pgvector HNSW + VACUUM** in the lab and watch the chart's dashed "never" line. It shows the same deletes with VACUUM
+never running. With **Delete one region of the space** and `efSearch` 20, recall@10 falls to 0.89 at 10% deleted, 0.72 at 20% and 0.57 at 40%.
+Distance computations stay flat at 60. This engine pays for tombstones in missing results, not in CPU. Queries that land inside the
+deleted region suffer most: their true neighbours sit at the edge of the hole, and the list fills with dead elements before the
+search gets there. Raising `efSearch` helps less than you might hope: at 40% deleted, `efSearch` 40 only reaches 0.71.
+
+pgvector 0.8.0's [iterative index scans](../04-vector-indexes-ivf-hnsw-and-quantization/#filtered-search) (`hnsw.iterative_scan`) address this by reading further into the index, up to
+`hnsw.max_scan_tuples`, when too few rows survive.
+
+## An update leaves the old neighbourhood behind
+
+In most engines an update is a delete plus an insert. The old element stays in the graph with its old edges, and the new element
+is linked near its new position.
+
+- **pgvector.** An `UPDATE` that changes the embedding writes a new heap tuple and a new index element; the old element stays until
+  VACUUM. (An update that changes no indexed column can be a [HOT update](../../../p02-storage-engines/pages-tuples-heap-files/04-hot-updates-redirect-line-pointers-and-opportunistic-page-pr/) with no index entry.)
+- **Lucene.** `updateDocument` is documented as "first deleting the document(s) containing term and then adding the new document". The
+  new version lands in a new segment with its own graph; the old one stays behind a cleared live-docs bit.
+- **DiskANN.** `lazy_delete` of the old tag, then an ordinary insert.
+- **hnswlib** is the exception. `addPoint` with a label that already exists updates the element in place and re-links its
+  neighbourhood. With `allow_replace_deleted` set, a new insert can also reuse a tombstone's slot.
+
+Choose **Updates: delete + insert nearby**. The lab models every engine's update as delete plus insert, which for hnswlib means
+`markDelete` and an insert under a new label. With hnswlib, the graph grows to 480 stored nodes by 60%, and 180 of them are dead.
+With either Lucene engine, the updated vectors appear as orange squares: a second segment with its own small graph. Every query now
+searches both graphs, and distance computations climb from 60 to 104 by 15% updated.
+
+## Repairing the graph in place
+
+Two engines repair the graph in place, with very different amounts of searching.
+
+**pgvector's VACUUM** (`hnswbulkdelete`) runs in passes. Pass 1 removes dead heap TIDs from the index; an element left with none is
+"being deleted". Pass 2, `RepairGraph`, finds every live element whose neighbour list points at a being-deleted one and re-runs the full
+neighbour search for it (`HnswFindElementNeighbors`, with `ef_construction`), then rewrites its neighbour tuple and updates its neighbours'
+lists, as an insert would. Elements being deleted still serve as routes during that search, but do not count toward ef and are removed
+before neighbours are selected. Passes 3 and 4 wait for in-flight inserts and scans, confirm nothing still points at a being-deleted
+element, then mark those elements deleted and zero their vectors.
+
+Later inserts reuse the freed space (`AddElementOnDisk` tries "space from a deleted element"), but the index file never shrinks; only
+`REINDEX` gives space back. The README warns "Vacuuming can take a while for HNSW indexes" and suggests `REINDEX INDEX
+CONCURRENTLY` first, then `VACUUM`.
+
+In the lab, with **Random deletes** and the default 20% threshold, the first VACUUM re-searches 171 elements and costs 29,983 distance
+computations. That is 0.71× the cost of building the original graph, spent to remove 60 vectors. Random deletes touch many
+neighbourhoods. With **Delete one region of the space**, only the 20 elements at the edge of the hole need repair, and the pass costs 4,318.
+
+**DiskANN's `consolidate_deletes`** does no searching. For each live node with a deleted out-neighbour, `process_delete` builds a
+candidate set: the node's live out-neighbours, plus the live out-neighbours of each deleted one. If that set fits within the degree
+bound, it becomes the new neighbour list directly. If not, it is pruned with [`RobustPrune`](../04-vector-indexes-ivf-hnsw-and-quantization/#diskann-the-graph-on-ssd-the-codes-in-ram), the α rule that built the graph. The
+freed locations go to `_empty_slots` for reuse. DiskANN's graph has one layer and every search begins at the start node (plus any frozen
+points), so consolidation throws if the start node itself was deleted.
+
+Choose **DiskANN consolidate_deletes**. With **Random deletes**, the first consolidation costs 2,444 distance computations, 0.06× the
+build. With **Delete one region of the space**, it costs none, because every candidate set fits within the degree bound. The FreshDiskANN paper
+reports keeping above 95% 5-recall@5 under thousands of concurrent inserts, deletes and searches per second, at 5–10× less cost than
+periodic rebuilds.
+
+Splicing is cheap because it only looks two hops out. It cannot find a better neighbour that the old edges never led to. VACUUM's
+re-search can, and that is what it pays for.
+
+## Rebuilding in merges: Lucene and Elasticsearch
+
+Lucene never edits a segment after writing it. Elasticsearch's tuning guide puts it this way: it "stores the vector values of each
+segment as a separate HNSW graph, so kNN search must check each segment." Deletes are bits; only a merge, which writes a new segment
+with a new graph, drops a deleted vector. Merge selection weighs deletes: `TieredMergePolicy`'s `deletesPctAllowed` defaults to 20%.
+
+What a merge does with the old graphs has changed over several releases:
+
+| Lucene | Merged graph starts from |
+|---|---|
+| before 9.6 | nothing: every vector is inserted again |
+| 9.6 (GITHUB#12050) | the largest segment graph with **no** deletions; the other vectors are inserted into it |
+| 10.2 (GITHUB#14331) | the same; other deletion-free graphs join with lighter searches seeded from a small "join set" of their nodes |
+| 10.4 (GITHUB#15003) | the largest graph with **up to 40%** deleted. Dead nodes are dropped, nodes that kept fewer than 85% of their neighbours are repaired by a search that starts from the neighbours they kept, and levels are rebalanced |
+| 10.5.1 (GITHUB#16400) | the same, now under the default codec too. Since 10.4.0 the check had tested the per-field reader wrapper, so "every merge rebuilt the graph from scratch" |
+
+Compare the two Lucene engines in the lab on **Random deletes**. At 20% deleted, the 10.3 merge cannot use the old graph, because it
+has deletions. It inserts all 240 surviving vectors again, for 32,156 distance computations (0.77× the build). The 10.5.1 merge copies the
+240 surviving nodes, repairs the 178 that lost too many neighbours, and spends 20,749. The lab leaves out the join-set shortcut and level
+rebalancing, so read these as rough proportions.
+
+Repair has blind spots. With the 10.5.1 engine, tick **Mark nodes stranded if tombstones were dropped**: at 15% deleted it rings 3 live
+nodes whose only links to the rest of the graph run through tombstones. The 20% merge drops those tombstones, and repair cannot reconnect
+the 3, because its search starts from the neighbours they kept, which are each other. Two are still unreachable at 55%. The 85% test also
+runs once per merge, so a node that loses a few neighbours each time is never repaired. Lucene's changelog lists a fix under 11.0.0,
+GITHUB#16552, for nodes "whose out-degree decays across successive merge-reuse generations".
+
+Updates make merges the dominant cost. Choose **Updates: delete + insert nearby** with **Lucene 10.3 segment merge**. Up to 60% updated,
+building the small graphs for the new segments costs 13,519 distance computations. The merges cost 112,927, more than eight times as
+much. The same guide's advice for re-embedding follows from this: reindex the new documents into a separate index rather than update them
+in place. That "prevents expensive merge operations due to frequent document updates".
+
+Qdrant's optimizer also rebuilds whole segments, keeping each readable behind a proxy while writes go to a copy-on-write segment. Its
+vacuum optimizer runs on segments that are 20% deleted (`deleted_threshold`) and hold at least 1,000 vectors.
+
+## IVF: centroids are a fit to old data
+
+An IVF index has no graph to damage, but it is still a fit. pgvector's IVFFlat build runs k-means on a sample, and every later insert
+goes to the list whose centroid is closest. Nothing ever moves a centroid, which is why the README's first key
+to good recall is to create the index "after the table has some data".
+
+Switch the lab to
+**IVF under drift**: sixteen centroids were fitted to 400 rows, and **A new cluster appears** adds 600 rows, most where no training data was.
+
+- **401 of the 600 inserted rows (67%)** sit farther from their centroid than any row that centroid was trained on. With **Same
+  distribution as the build**, that figure is 39 (7%).
+- The lists nearest the new cluster swell. The largest holds 290 rows against an average of 62.5.
+- At `nprobe` 1, queries on the new data scan 192 rows on average for recall 0.90. Reaching 95% recall takes 261 rows per query.
+
+Tick **Recluster**. k-means refits on all 1,000 rows, and 95% recall now takes 180 rows, while `nprobe` 1 scans 89 rows for recall 0.94.
+The refit costs 1,264,000 distance computations and moves rows between lists: a rebuild, not an update.
+
+With fewer new rows, drift raises `nprobe` too: drag **Rows inserted after build** to 100 and the table shows 95% recall needing `nprobe` 3
+with the fitted centroids, 2 after reclustering. Systems that ship IVF treat drift as a quality problem. Lance's index optimization, by default,
+adds new rows to the existing index as a delta index. Its `retrain` option is documented as "useful when the data distribution has changed
+significantly, and we want to retrain the index to improve the search quality".
+
+## Designs that never mutate a graph
+
+Some systems never edit an index structure at all. Milvus defines a sealed segment as data persisted to object storage, and "the data of
+sealed segment is immutable". Each sealed segment gets its own index; segments under `minSegmentSizeToEnableIndex` (1,024 rows) are
+searched by brute force. Deletes go to delta logs, and compaction "merges small-size segments into a large segment" and clears deleted entities,
+producing a new segment that needs a new index.
+
+This is the [LSM compaction](../../../p02-storage-engines/lsm-compaction-and-maintenance/01-why-compaction-exists-the-three-amplifications-and-the-rum-t/)
+trade with a far more expensive merge: rewriting a sorted run is linear, rebuilding an ANN graph runs a search per vector. And as with an
+[LSM tombstone](../../../p02-storage-engines/lsm-trees/07-deletes-tombstones-ttl-and-snapshots/), a deleted vector costs something until
+that merge removes it.
+
+## Where it bites in production
+
+- **pgvector returns fewer rows than `LIMIT` after churn.** Dead tuples fill `hnsw.ef_search` until VACUUM runs. Watch `n_dead_tup`,
+  raise `ef_search` or enable iterative scans, and expect HNSW VACUUM to be slow: it re-searches every affected neighbourhood.
+- **Latency creeps up with no recall alarm.** In hnswlib, and in Lucene before a merge, tombstones are extra hops. Plot per-query latency
+  against the deleted fraction.
+- **The index never shrinks.** pgvector reuses freed elements but keeps the file; hnswlib keeps every tombstone unless inserts reuse slots.
+  Only `REINDEX` or a rebuild returns the space.
+- **Merge storms after bulk updates.** Re-embedding in place in Elasticsearch deletes and re-adds every vector, and the resulting merges
+  rebuild graphs in the background while search competes for CPU. Write new vectors to a new index.
+- **Local repair can decay.** Neither splicing nor the kept-85% rule recreates the edges a fresh build would find. Keep periodic rebuilds
+  on the calendar.
+- **IVF lists fitted to old data.** Even a well-trained index drifts: a new kind of content arriving after the build lands in lists
+  fitted to what came before. Watch list sizes and rows scanned per query, and rebuild to recluster.
+
+Recall SLOs, shadow indexes and re-embedding runs belong to Part 5's vector and hybrid retrieval module.
+
+:::note[What to take forward]
+An HNSW node cannot simply be removed: other nodes route through it and nothing records the edges pointing at it. So deletes start as
+tombstones, costing extra hops where search skips dead nodes (hnswlib, Lucene) or missing results where dead entries fill the candidate
+list (pgvector, DiskANN). Reclaiming them means rewriting edges — re-searching neighbourhoods (pgvector VACUUM), splicing locally (DiskANN)
+or rebuilding during a merge (Lucene). IVF centroids are a fit to the data at training time, and only reclustering refits them.
+:::

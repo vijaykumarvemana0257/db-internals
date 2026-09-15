@@ -1,0 +1,203 @@
+---
+title: 'Why high dimensions break indexes: distance concentration and intrinsic dimension'
+description: Why nearest and farthest distances converge in high dimensions, why partitioning indexes become scans, why intrinsic dimension decides what stays searchable, and how LSH amplification and graph indexes cope.
+depth: deep
+sidebar:
+  order: 3
+---
+
+import DistanceConcentrationLab from '../../../../components/viz/DistanceConcentrationLab';
+
+A tree index answers "what is nearest to this point?" with a proof: it keeps the best answers so far and skips every
+region that cannot contain anything closer. In two or three dimensions that discards almost the whole tree. In a few dozen
+dimensions of unstructured data it discards nothing, because nearly every point is about the same distance from the query,
+and the index becomes a sequential scan with extra pointer chasing.
+
+Which of those two cases you are in does not depend on the length of your vectors. It depends on the dimension of the data itself.
+
+<DistanceConcentrationLab client:visible />
+
+## Distances concentrate
+
+Draw a query and a point uniformly from the unit cube in *D* dimensions. Their squared distance is a sum of *D*
+independent terms, each with mean 1/6 and variance 7/180. The sum's mean grows like *D* but its standard deviation
+only like √*D*, so the relative spread of the distance shrinks like 1/√*D* — roughly 0.59/√*D* for the cube. At 256
+dimensions the standard deviation of the distance is under 4% of its mean.
+
+Beyer, Goldstein, Ramakrishnan and Shaft turned this into a theorem in *When Is "Nearest Neighbor" Meaningful?* (ICDT
+1999). Fix the number of points. If the variance of the ratio of distance to expected distance goes to zero as dimension
+grows, then for every ε > 0 the probability that the farthest point is within (1 + ε) of the nearest goes to one. That
+condition is much broader than independent, identically distributed coordinates. Their experiments on real and synthetic
+data found the effect appearing at as few as 10–15 dimensions.
+
+The lab starts on the uniform cube at *D* = 4. The histogram pools every query-to-point distance over 40 queries, each
+divided by that query's mean distance. The dashed and solid lines mark the average positions of the 1st and 10th
+neighbours. Move **Ambient dimension D**:
+
+- At *D* = 2 the farthest point is on average about 107 times as far as the nearest. The histogram is wide and the
+  neighbours sit near zero.
+- At *D* = 8 the ratio is 5.30, at *D* = 64 it is 1.60, and at *D* = 256 it is 1.26. The histogram collapses into a spike
+  around 1, and the 10th neighbour sits at 0.91 of the mean distance.
+
+The **Relative contrast** tile is He, Kumar and Chang's difficulty measure (ICML 2012): mean distance divided by nearest
+distance. It falls from 39.27 at *D* = 2 to 1.13 at *D* = 256. Near 1, the "nearest" answer is barely closer than a random point.
+
+## Why partitioning indexes turn into scans
+
+Every space- or data-partitioning index prunes with the same test. A branch — a kd-tree cell, an R-tree bounding
+rectangle, an M-tree ball, a quadtree square — has a lower bound on the distance from the query to anything inside it. If
+that bound is at least the current *k*-th best distance, the branch is skipped. So pruning only works while the *k*-th
+best distance is small compared with the distance to most cells.
+
+Concentration removes exactly that. The lab's **kd-tree** splits the coordinate with the largest spread at its median and
+stops at 12 points per leaf. It searches best-bin-first using the exact distance from the query to each cell's box, so
+with no budget it is an exact 10-nearest-neighbour search, and the grid shows which of its 128 leaves the first query had
+to open. On the uniform cube, an exact search opens about 4 leaves on average at *D* = 2 (3.2% of the points), 11.5 at *D* = 4,
+and 62 at *D* = 8, about half the data. At *D* = 16 it averages 127.98, and from *D* = 32 up every query opens every leaf.
+
+Weber, Schek and Blott found a second, structural cause in their VLDB 1998 analysis. A tree over *N* points with *m* points
+per leaf has about log₂(*N*/*m*) levels, so each leaf cell is bounded on at most that many coordinates and spans the full range
+of all the others. The lab's tree has seven levels: at *D* = 64 each leaf is cut on at most 7 of the 64 coordinates. The ball
+around the query out to its 10th neighbour reaches into nearly every cell. For rectangular bounding regions (R\*-tree,
+X-tree, SR-tree) on uniform data, Weber and colleagues calculated that a search reads more than 20% of the blocks beyond roughly
+15, 18 and 20 dimensions for 10⁵, 10⁶ and 10⁷ points, and that partitioning methods in general tend towards O(*N*): a
+sequential scan beat them on average above about 10 dimensions. The crossover grows with log *N*, which is why the lab's 1,500
+points collapse so early.
+
+This is why scikit-learn's documentation calls its `KDTree` very fast below about 20 dimensions and inefficient as
+dimension grows, and why `algorithm='auto'` switches to brute force whenever *D* > 15. It also explains PostgreSQL's
+`cube` extension. Its GiST operator class uses Guttman's R-tree split and can serve `ORDER BY c <-> cube(...) LIMIT k`, but it caps
+cubes at 100 dimensions, and its [bounding boxes](../../../p02-storage-engines/indexes-beyond-the-b-tree/05-gist-and-r-trees-for-spatial-and-range-data/)
+hit the same wall well before that on unstructured data. The same geometry applies to the
+[quadtrees and k-d trees behind SP-GiST](../01-sp-gist-tries-and-adaptive-radix-trees/).
+
+## Intrinsic dimension is what counts
+
+The theorem has a condition, and real data often violates it. Beyer et al. describe two ways out: clustered data where
+the query falls inside a cluster, and data whose underlying dimensionality is much lower than its number of coordinates.
+Levina and Bickel (NIPS 2004) open by citing the consensus that methods work in very high dimensions only because the data are not truly high-dimensional.
+
+Switch **Data** to **Curved m-dim sheet**. Each point starts as *m* latent coordinates, bent into 2*m* coordinates, then rotated
+into *D* dimensions by a fixed random rotation. A rotation preserves distances, so moving *D* from 8 to 256 draws a fresh sample with the same
+geometry. At *m* = 4 the relative contrast stays between 6.08 and 6.72 and the intrinsic-dimension estimate stays at
+3.9–4.1. The histogram never collapses.
+
+Now select **Hyperplane tree**. It splits each node the way Spotify's Annoy does: seed two centres with two
+sampled points, move them with a weighted 2-means over sampled points, and cut on the hyperplane equidistant between them.
+Those cuts follow the data wherever it lies, and an exact search reads 16–18% of the points at every *D* from 8 to 256. Switch
+back to **kd-tree**: it reads 20% at *D* = 8, 46% at *D* = 32, 76% at *D* = 64, and opens 127 of its 128 leaves on average at *D* = 256.
+
+The sheet did not change. The kd-tree cuts one coordinate at a time, and after a rotation every coordinate mixes all the latent ones. Dasgupta and Freund (STOC 2008) showed that k-d trees do not adapt to intrinsic dimension — points on the coordinate axes,
+intrinsic dimension log₂ *D*, need *D* levels to halve a cell's diameter — and proved that splitting along random directions does adapt.
+A partitioning index can count on low intrinsic dimension only if its cuts are not tied to the coordinate axes.
+
+Low is relative, though. Raise **Intrinsic dimension m** to 8. The estimate reads 7.1–7.6 across *D* and relative contrast drops to
+2.7–2.9. At *D* = 16, exact search already reads 92% of the points in the kd-tree and 94% in the hyperplane tree. Real corpora are
+higher still. Aumüller and Ceccarello estimated local intrinsic dimension for standard benchmark sets (SISAP 2019): medians of 13.2
+for MNIST's 784 pixels, 19.2 for 128-dimensional SIFT, 17.8 for 100-dimensional GloVe and 23.4 for 300-dimensional GloVe-2M. That is
+far easier than random vectors of the same length, yet too high-dimensional for exact pruning — the regime approximate indexes exist for.
+
+### Estimating it
+
+The lab's estimate is Levina and Bickel's maximum-likelihood estimator, in the per-point form Aumüller and Ceccarello use. For a
+point whose nearest-neighbour distances are r₁ ≤ … ≤ r_k:
+
+```
+LID = −( (1/k) · Σᵢ ln(rᵢ / r_k) )⁻¹
+```
+
+The lab uses *k* = 20 and reports the median over queries. The answer depends on scale: Levina and Bickel note that a line with noise added can look one- or two-dimensional depending
+on the neighbourhood size. And every estimator they compared is biased low at higher dimensions. On the uniform cube the lab reads
+35.7 at *D* = 64 and 78.6 at *D* = 256, so treat a large estimate as a lower bound.
+
+## LSH: hashing instead of partitioning
+
+Locality-sensitive hashing gives up on exact pruning and bounds the cost with probability instead. A hash family is
+**(r, cr, p₁, p₂)-sensitive** if points within distance *r* collide with probability at least *p₁* and points beyond *cr* collide
+with probability at most *p₂* < *p₁*. The E2LSH family for Euclidean distance, from Datar, Immorlica, Indyk and Mirrokni, projects
+onto a random Gaussian direction and cuts the line into buckets of width *w*: h(v) = ⌊(a·v + b)/w⌋, with *b* uniform in [0, *w*].
+Its collision probability depends only on distance ÷ *w*, and the E2LSH implementation uses *w* = 4 with the radius *r* scaled to 1.
+
+A single hash separates near from far poorly, so it is amplified twice:
+
+- **AND.** Concatenate *k* hashes into one bucket key. A pair lands together with probability *p*ᵏ, which drives far points down
+  faster than near ones.
+- **OR.** Build *L* independent tables and take every point that shares the query's bucket in any of them. A pair becomes a
+  candidate with probability 1 − (1 − *p*ᵏ)ᴸ.
+
+That curve has an S shape. *Mining of Massive Datasets* describes the same construction for MinHash as *b* bands of *r* rows, with
+the threshold near (1/*b*)^(1/*r*). The framework from Indyk and Motwani (STOC 1998) turns it into a bound: with ρ = ln(1/*p₁*)/ln(1/*p₂*), about
+*n*^ρ tables answer a *c*-approximate query in roughly *n*^ρ time. For the p-stable family ρ < 1/*c*.
+
+The lab draws the S-curve over the histogram, with *w* set to 4 × the mean 10th-neighbour distance. Weighting the
+histogram by the curve gives the expected number of distinct candidates; the E2LSH manual's cost model, *L* × Σ *p*ᵏ(‖q − v‖),
+counts a point once for every table it collides in.
+
+- At *D* = 4 with *k* = 6 and *L* = 10, the curve is high over the neighbours and near zero over the bulk: 208 candidates out of
+  1,500 (the **LSH candidates** tile).
+- Set **LSH hashes per table k** to 16 and only 8 candidates remain — too strict to keep the neighbours. Raise **LSH tables L**
+  to 40 and 21 candidates recover most of them.
+- Return to *k* = 6 and *L* = 10 and move to *D* = 64. The spike now sits under the top of the curve, and 1,159 points are
+  candidates. Any *k* steep enough to cut the spike cuts the neighbours too: at *k* = 16 and *L* = 40 there are still 552.
+
+The **LSH exponent ρ** tile uses the 10th-neighbour distance for *r* and the mean distance for *cr*. It rises from 0.23 at *D* = 4 to
+0.80 at *D* = 64 and 0.90 at *D* = 256, so query cost approaches *n*. He, Kumar and Chang prove the general form: the number of
+candidates LSH must return grows as *n* raised to a function that shrinks as relative contrast grows.
+
+## Graphs versus hashes on the same queries
+
+The bottom chart gives every index the same budget — at most **Distance budget** percent of the 1,500 distances per query — and plots
+recall@10, the fraction of the true 10 nearest neighbours returned, at each ambient dimension. Only distances to data points are charged: LSH's *k* × *L* projections and the hyperplane tree's
+split tests come free, which flatters both. The dashed line is what a random sample of that many points finds: no index at all. The HNSW here is a small build (M = 8, `efConstruction` = 32); the
+[vector index page](../04-vector-indexes-ivf-hnsw-and-quantization/) explains how it works.
+
+On the uniform cube at 5%, all four methods score above 0.9 at *D* = 4, then fall together to between 0.09 and 0.12 at *D* = 256,
+against 0.05 for the random line. Raise the budget to 20%. At *D* = 16, HNSW now finds 0.97 of the true neighbours while both trees and
+LSH find about 0.74, and at *D* = 256 HNSW's 0.52 still leads. On the *m* = 8 sheet at *D* = 256 and 20%, HNSW reaches 1.00.
+
+Published benchmarks on real vectors show the same order. Malkov and Yashunin compared HNSW with FALCONN (an LSH library), Annoy,
+FLANN and a VP-tree on SIFT, GloVe, DEEP and CoPhIR, and HNSW won by a large margin. In ANN-Benchmarks, graph-based methods were the
+fastest on both GloVe and SIFT. Synthetic data misleads in both directions: ANN-Benchmarks also built a set where most points have no structure but
+each query's neighbours are well separated, and there no HNSW setting passed recall 0.86 while Annoy was fastest.
+
+LSH still wins where its model fits the problem:
+
+- **Near-duplicate detection.** Beyer et al. note that approximate-match queries stay meaningful when the query really lies within a
+  small distance of a data point. Duplicates sit near distance zero, far left of the bulk, where the S-curve separates cleanly. Manku, Jain and Das Sarma (WWW 2007) found 64-bit Charikar simhash fingerprints with at most 3 differing bits
+  suitable for an 8-billion-page crawl. Lee et al.'s 2021 deduplication of language-model training data used MinHash over 5-grams: a
+  9,000-hash signature in 450 bands of 20, with candidates then kept only if their edit similarity exceeded 0.8.
+- **Streams.** Inserting an item costs *k* × *L* hash computations and *L* bucket appends. Nothing is re-linked, so there is none of
+  the [maintenance a graph index needs under churn](../05-how-churn-degrades-a-vector-index-tombstones-merges-and-cent/).
+
+## Measure your corpus first
+
+Before choosing an index, run the lab's measurements on your own data; they need one brute-force pass over a sample.
+
+1. **Use queries that look like production.** Beyer et al. show the query distribution matters as much as the data: queries that
+   fall inside clusters get meaningful answers, while queries between clusters face the same concentration when picking a cluster.
+2. **Compute exact k-NN** for a few thousand of those queries against a sample of the corpus.
+3. **Plot distance ÷ mean distance** and mark the 10th neighbour. A wide histogram with the neighbours well to the left gives
+   partitioning, graphs and LSH something to work with. A spike near 1 means a partitioning index will scan, and every approximate
+   index will pay heavily for recall.
+4. **Record relative contrast and the LID distribution, including its tail.** Aumüller and Ceccarello found that query sets with
+   higher LID needed more time to reach the same recall, and that LID has a long tail. Those tail queries become your recall misses
+   and your slow queries.
+5. **Allow for sample size.** Relative contrast rises with the number of points, so a small sample overstates difficulty.
+
+## Where it bites in production
+
+- **Benchmarks on random vectors.** Uniform random vectors are far harder than embeddings of the same length. Benchmark on real
+  vectors and real queries.
+- **Tree indexes on embeddings.** A GiST, R-tree or kd-tree index over dense embeddings, which spread information across every
+  coordinate, builds and returns correct answers while doing the work of a full scan: query time grows with table size even though the plan says index scan.
+- **The hard-query tail.** Mean recall hides high-LID queries. Break recall down by query difficulty.
+- **Intrinsic dimension drift.** A new embedding model or content type can raise LID without changing the vector length, making
+  every index more expensive at once. Recompute the histogram and LID estimate on a schedule.
+
+:::note[What to take forward]
+When distances concentrate, the *k*-th neighbour is nearly as far away as everything else, so no lower bound can exclude a cell:
+partitioning indexes become scans and LSH's exponent ρ approaches 1. Intrinsic dimension controls concentration, not vector length,
+though a kd-tree's axis-aligned cuts cannot exploit a low one. Benchmark corpora measure in the teens and low twenties, far easier than
+random vectors but too hard for exact pruning, so graph indexes lead there while LSH keeps near-duplicate detection and streaming inserts.
+Measure the distance histogram and LID of your own queries before you choose.
+:::
