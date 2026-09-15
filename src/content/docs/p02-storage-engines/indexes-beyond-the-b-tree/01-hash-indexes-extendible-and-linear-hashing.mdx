@@ -1,0 +1,247 @@
+---
+title: 'Hash indexes: extendible and linear hashing'
+description: How an on-disk hash index grows without rehashing everything — static hashing's overflow chains, extendible hashing's doubling directory and local depths, linear hashing's round-robin split pointer — and how PostgreSQL's hash index and InnoDB's adaptive hash index use them.
+depth: basics
+sidebar:
+  order: 1
+---
+
+import ExtendibleLinearHashLab from '../../../../components/viz/ExtendibleLinearHashLab';
+
+A [B-tree](../../../p02-storage-engines/b-trees-and-variants/01-b-tree-structure-invariants-and-search/)
+finds a key by descending one page per level; a hash index computes which page the key lives on and reads
+it. The hard part is growth. The address function has the bucket count built into it, so a growing table
+must either let buckets overflow into ever-longer chains, or change the function without rehashing every
+entry at once. Extendible hashing
+and linear hashing are the two classic ways to do the second, and PostgreSQL's hash index is linear hashing.
+
+<ExtendibleLinearHashLab client:visible />
+
+## Static hashing and its overflow chains
+
+The simplest on-disk hash index fixes the number of buckets, *N*, when it is created. Each bucket is one
+page. A key goes to page `hash(key) mod N`, and when that page is full the engine allocates an **overflow
+page** and links it to the bucket, so a bucket becomes a chain of pages. A lookup reads the primary page and
+then every overflow page in its chain.
+
+Nothing keeps those chains short: their length grows with rows ÷ (N × page capacity). Switch the lab to **Linear hashing** and set **Split when** to *Never (static
+hashing)*. The default ten keys already need two overflow pages. Insert keys up to the lab's limit of 48 and the
+average chain reaches 8 pages, the longest 10. Setting **Initial buckets N** to 4 roughly halves the average, to
+4.25 pages — but in a real index, changing *N* means computing a new address for every entry and moving most of
+them. That is a rebuild.
+
+SQL Server's hash indexes on memory-optimized tables are static in exactly this sense. `BUCKET_COUNT` is
+fixed when the index is created and changes only with `ALTER TABLE ... ALTER INDEX ... REBUILD`. Microsoft's
+guidance is one to two times the number of distinct key values, and more buckets do nothing for rows
+sharing a key value: they share a chain regardless.
+
+The two dynamic schemes below grow one bucket at a time, moving only the split bucket's entries.
+
+## Extendible hashing: a directory that doubles
+
+Fagin, Nievergelt, Pippenger and Strong introduced extendible hashing in 1979. It adds one level of
+indirection: a **directory** of 2^G pointers, where *G* is the **global depth**. To find a key's bucket,
+take the first *G* bits of its hash, use them as an index into the directory, and follow the pointer.
+
+Buckets do not all need *G* bits. Each bucket records a **local depth** *d′*. It holds every key whose hash
+starts with one particular *d′*-bit prefix, so 2^(G−d′) adjacent directory entries point at it. The global
+depth is the largest local depth of any bucket.
+
+The lab's default state shows this. Ten keys in buckets of capacity 3 have produced *G* = 3, a directory of
+8 entries, and 5 buckets. Buckets `000…` and `001…` use all three bits; `01…`, `10…` and `11…` have
+local depth 2, and each is shared by two directory entries. Every lookup takes the same two steps, one
+directory slot and one bucket page, which is why the paper promises at most two page faults per lookup,
+and one when the directory fits in memory, as the paper expects it often will.
+
+### Two ways to handle a full bucket
+
+When an insert finds its bucket full, the bucket's local depth decides what happens:
+
+- **d′ < G: a local split.** The bucket splits into two buckets of local depth d′ + 1, divided by the next
+  hash bit. Its 2^(G−d′) directory entries are divided between the two. Nothing else changes.
+- **d′ = G: a directory doubling.** No existing entry can tell the two halves apart, so the directory
+  doubles first. Each entry becomes two adjacent entries pointing at the same bucket, and *G* grows by one.
+  Then the bucket splits as above.
+
+From the default state (press **Reset** if you have been experimenting), press **Insert next key** four
+times. The first three keys land in buckets with room. The fourth, key 8733,
+arrives at bucket `11…`, which is full and has local depth 2 while *G* is 3. It splits into `110…` and
+`111…`, and the directory stays at 8 entries.
+
+Now click bucket `000…`, which is full at local depth 3; clicking a bucket inserts a key that hashes into it.
+The directory doubles to 16 entries and exactly one bucket splits. The other bucket pages are not touched —
+twice as many entries now point at each of them. The paper makes the same point: doubling rewrites the
+directory, not the data pages.
+
+After a split the key is inserted again. If the split sent every key to the same side, the bucket is still
+full and splits again, possibly doubling the directory again — rare with well-mixed hashes, routine without them.
+
+### What the directory costs
+
+The directory has 2^G entries, so its size is set by the **deepest** bucket, not by the number of buckets.
+With well-mixed hashes that stays modest. Press **Reset**, then **Insert 10 keys** until the lab stops at 48
+keys: *G* = 6, 64 entries for 21 buckets, 76% full on average. Fagin's analysis puts long-run bucket
+utilization near ln 2, about 69%, rising and falling as the file grows.
+
+Change **Keys** to *Skewed: hashes share their first 4 bits*. The lab swaps in 48 keys whose hashes all begin
+`0000`, and they need *G* = 10: 1,024 directory entries for 28 buckets, six of them empty. Half the directory, 512 entries, points at the one
+empty bucket for hashes starting with 1.
+
+Now pick *One key value, over and over*: 48 copies of key 42 sit in one bucket with 15 overflow pages, behind
+a 1,024-entry directory. Press **Undo** until three copies remain, which fit in a single bucket, and insert one
+more. The fourth copy has exactly the same hash bits as the other three, so no split can ever separate them,
+and the algorithm as written would keep doubling until it ran out of hash bits. The lab doubles ten times in that single insert, stops at
+1,024 entries, and adds an overflow page. Extendible hashing can store duplicate hash values only on overflow
+pages, the very thing its directory exists to avoid.
+
+Like the paper, the lab indexes the directory with leading hash bits; the paper notes that trailing bits
+would make doubling a plain copy of the directory.
+
+## Linear hashing: split in a fixed order
+
+Litwin's linear hashing (1980) has no directory. The file has *M* buckets numbered from 0, plus two pieces of
+state: a **level** *i* and a **split pointer**, `next`. It uses a family of hash functions, each doubling
+the range of the last (reading one more low bit when N is a power of two):
+
+```
+h_i(k)  = hash(k) mod (N · 2^i)
+bucket  = h_i(k)
+if bucket < next:  bucket = h_{i+1}(k)     // already split this round
+```
+
+*M* is always N · 2^i + `next`, so the address can be computed from the bucket count alone.
+
+Litwin's key idea: **the bucket that splits is not necessarily the one that overflowed.** Splits happen in a fixed
+order. Each split takes bucket `next`, rehashes its keys with `h_{i+1}`, moves the keys that now belong at `next` + N·2^i into a new bucket at the end of the file, and advances the
+pointer. When the pointer reaches N·2^i, every bucket of the round has split, the level goes up by one and the
+pointer returns to 0. Meanwhile the bucket that actually overflowed keeps the key on an overflow page until
+the pointer reaches it.
+
+In the **Linear hashing** view, put the controls back to their defaults — page capacity 3, **Initial buckets
+N** 2, split when load exceeds 75% — and press **Reset**. Then press **Insert next key**. Key 1311 lands in
+bucket 2, which is full, so it goes onto an overflow page, and load is 73%, so nothing splits.
+Press it three more times. The first of those keys lands in empty bucket 0, but load passes 75%, so bucket 1
+splits, because that is where the pointer is. The third overflows bucket 3 and splits bucket 2: three keys move
+to the new bucket 6, and bucket 2's chain goes from two pages back to one, while bucket 3's new overflow page
+waits for the pointer. Two more inserts and the pointer finishes the round: level 2, eight buckets, no
+overflow pages.
+
+### When to split
+
+Litwin names two policies, and the **Split when** control has both:
+
+- **Uncontrolled splitting** splits whenever an insert lands in a full bucket.
+- **Controlled splitting** also consults the load factor, keys ÷ (buckets × page capacity). Litwin's load
+  control splits on a full bucket only if the load exceeds a threshold; PostgreSQL, like this lab, splits
+  whenever it does. The load stays near the threshold; Litwin reports loads held steady as high as 90%.
+
+Insert keys until the lab stops at 48 and move **Load threshold**: 75% ends with 22 buckets and 4 overflow
+pages, 50% with 32 buckets and 1, and 90% with 18 buckets and 5: space traded directly against chain length.
+
+Linear hashing does nothing about skew. Set the threshold back to 75% and pick *Skewed: hashes share their
+last 4 bits*: every key lands in bucket 0 or bucket 16, the other 20 buckets are empty, and those two chains are 9 and 8 pages long, while the
+load factor shows an unremarkable 73%. Pick the duplicate key and switch to uncontrolled splitting: the file splits 45 times, each of the four splits that reach the duplicates' bucket moves all of the chain or none of it, and that
+chain ends 16 pages long.
+
+| | Static | Extendible | Linear |
+|---|---|---|---|
+| Directory | none | 2^G pointers | none; address from *M* |
+| Growth step | rebuild | split the full bucket; double when d′ = G | split bucket `next` |
+| Overflow pages | the only mechanism | only for hashes that cannot be separated | normal; drained by later splits |
+| Lookup | primary page + chain | directory slot + one page | primary page + chain |
+| Skew and duplicates | long chains | the directory explodes | long chains |
+
+## PostgreSQL's hash index
+
+PostgreSQL's `hash` access method implements linear hashing on ordinary index pages. Its source README credits
+Seltzer and Yigit's 1991 hashing package for UNIX, and adding a bucket always means splitting exactly one
+existing bucket.
+
+The index has four kinds of pages: a **meta page** at block 0, **primary bucket pages**, **overflow pages**
+chained to a bucket in a doubly linked list, and **bitmap pages** recording which overflow pages are free for
+reuse. The meta page holds the linear-hashing state: `hashm_maxbucket`, `hashm_highmask`, `hashm_lowmask`, the
+tuple count `hashm_ntuples` and the target `hashm_ffactor`. The address computation, `_hash_hashkey2bucket`,
+is the pointerless form Litwin also gives, using only the bucket count:
+
+```c
+bucket = hashkey & highmask;
+if (bucket > maxbucket)
+    bucket = bucket & lowmask;
+```
+
+Splits are controlled. `_hash_doinsert` increments `hashm_ntuples`, and if it now exceeds
+`hashm_ffactor * (hashm_maxbucket + 1)` it calls `_hash_expandtable`, which creates bucket `maxbucket + 1` and
+splits `(maxbucket + 1) & lowmask` — the split pointer, recovered from the bucket count. The target comes
+from the index's `fillfactor` storage parameter, default 75, converted to entries per bucket: with 8 KB pages
+and 20-byte entries on a 64-bit build, 307. Bucket pages are allocated in power-of-two groups the code calls
+split points, handed out in four phases once the groups get large, and the `hashm_spares` array maps bucket
+numbers to block numbers around the overflow pages allocated in between.
+
+Most user-visible limits follow from one decision. Since PostgreSQL 8.4 an index entry stores only the **32-bit hash code** of the key, not the key, kept sorted within each page so a
+page can be binary-searched. So:
+
+- **Wide keys are cheap.** An index on long URLs or UUIDs can be much smaller than the B-tree, which stores the
+  values themselves.
+- **Every scan is lossy.** Different keys can share a hash code, so each match is rechecked against the heap
+  row, and index-only scans are impossible.
+- **Equality only.** Hash codes carry no order, so there are no range predicates and no `ORDER BY`.
+- **No `UNIQUE`, no second column, no `INCLUDE`.** Separately, the access method declares `amcanunique`, `amcanmulticol`
+  and `amcaninclude` false, so a hash index cannot back a primary key.
+
+Hash indexes can still take part in [bitmap index scans](../03-bitmap-indexes-and-bitmap-heap-scans/).
+
+Before PostgreSQL 10, hash index changes were not WAL-logged. After a crash an index could need `REINDEX`,
+replicas did not receive changes made after the base backup, and the documentation discouraged using them. PostgreSQL 10 added WAL logging,
+and hash indexes from earlier versions must be rebuilt after `pg_upgrade`.
+
+Two operational details come from the implementation. A split needs a cleanup lock on the bucket being split;
+if another backend holds a pin there, the inserter abandons the split and a later insert retries, so an index
+can stay slightly overfull. And buckets never merge: overflow pages emptied by `VACUUM` are recycled
+through the bitmap pages but never returned to the operating system, so only `REINDEX` shrinks a hash index.
+
+## InnoDB's adaptive hash index
+
+MySQL's `MEMORY` engine defaults to hash indexes, but InnoDB answers `USING HASH` with a warning and builds a B-tree. What it has instead is
+the **adaptive hash index** (AHI), an in-memory shortcut that lets repeated lookups skip the B-tree descent.
+
+InnoDB watches the searches on each index. After 17 searches (`BTR_SEARCH_HASH_ANALYSIS`) it starts checking
+whether a hash on some prefix of the key would have found the same record. Once 100 consecutive searches
+(`BTR_SEARCH_BUILD_LIMIT`) would have succeeded with the recommended prefix, and searches have landed on a
+particular page more often than a sixteenth of its record count (`BTR_SEARCH_PAGE_BUILD_LIMIT`), InnoDB
+hashes that page's records into a table from hash value to record pointer. The next lookup of a hot key goes
+straight to the record in the buffer pool.
+
+Because the AHI points into [buffer pool](../../../p02-storage-engines/buffer-pool/01-buffer-pool-structure-frames-page-table-and-pins/)
+pages, it is neither persistent nor logged. Evicting a page removes its entries, and dropping a table has to find
+and remove all of them. The table is split into
+`innodb_adaptive_hash_index_parts` partitions (default 8, maximum 512), each with its own latch. Under heavy
+concurrency those latches can become the bottleneck; MySQL's manual says to look in the `SEMAPHORES` section of
+`SHOW ENGINE INNODB STATUS` for threads waiting on latches created in `btr0sea.c`. The AHI is on by default in
+MySQL 8.0 and off by default in 8.4.
+
+## Where it bites in production
+
+- **Many rows per key.** Duplicates share a bucket whatever the scheme, chains grow, and PostgreSQL's
+  documentation warns that an unbalanced hash index can need more block reads than a B-tree. Use hash indexes
+  for unique or nearly unique keys.
+- **Split work lands on inserts.** PostgreSQL splits inside the insert that crosses the threshold; its
+  documentation cautions against hash indexes on rapidly growing tables.
+- **No shrinking.** After a mass delete, buckets remain and freed overflow pages are reused only inside the
+  index. `REINDEX` is the only way to return the space.
+- **PostgreSQL constraints still need a B-tree.** Even a workload of pure equality lookups needs B-trees for its primary
+  key and unique constraints; a hash index is an addition, not a replacement.
+- **AHI latch contention, and a changed default.** Upgrading from MySQL 8.0 to 8.4 turns the AHI off unless it
+  is set explicitly, which can move point-lookup latency either way; benchmark with it on and off.
+- **A poor or adversarial hash** drives every scheme to its worst case: long chains for static and linear
+  hashing, an exploding directory for extendible hashing. The
+  [next page](../02-hash-functions-inside-the-engine-universality-avalanche-and-/) is about the hash function
+  itself.
+
+:::note[What to take forward]
+A hash index turns a lookup into an address computation, and the design problem is growing it without
+rehashing everything. Extendible hashing adds a directory of 2^G pointers, splits only the overflowing bucket,
+and doubles the directory only when that bucket's local depth equals the global depth. Linear hashing has no
+directory: a split pointer splits buckets in a fixed order while overflow pages wait for it, which is exactly
+what PostgreSQL's hash index does with its masks and fill factor. Both need hashes that spread keys out, and
+neither can split apart duplicate keys.
+:::

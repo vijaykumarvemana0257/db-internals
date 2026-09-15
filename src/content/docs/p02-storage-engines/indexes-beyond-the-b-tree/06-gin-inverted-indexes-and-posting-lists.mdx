@@ -1,0 +1,244 @@
+---
+title: GIN inverted indexes and posting lists
+description: How PostgreSQL's GIN splits each row into many keys, keeps a compressed posting list of heap TIDs per key under an entry B-tree, batches writes in the fastupdate pending list, and answers @>, && and ? by walking posting lists — plus what jsonb_ops and jsonb_path_ops actually store.
+depth: intermediate
+sidebar:
+  order: 6
+---
+
+import GinPostingListLab from '../../../../components/viz/GinPostingListLab';
+import GinPostingWalkLab from '../../../../components/viz/GinPostingWalkLab';
+
+A B-tree stores one entry per row, keyed by the whole column value. That is useless for `WHERE tags @> '{gin}'`
+or `WHERE doc @> '{"status":"active"}'`: the predicate is about an element *inside* the value, and no order over
+whole arrays or whole documents groups the rows that contain `gin`.
+
+An inverted index turns the relationship around: one entry per **element**, each listing the rows that contain it.
+PostgreSQL's version is **GIN**, the Generalized Inverted Index. "Generalized" means the access method does not know
+what an element is or what `@>` means. An operator class says how to split a value into keys and how to decide a
+match; GIN supplies the storage, concurrency and WAL logging.
+
+<GinPostingListLab client:visible />
+
+## One row, many keys
+
+A GIN operator class supplies a few support functions. Two of them shape the index:
+
+- **`extractValue`** takes an indexed item — an array, a `jsonb` document, a `tsvector` — and returns its keys.
+  GIN sorts them and removes duplicates (`ginExtractEntries`), so a row contributes each distinct key once.
+- **`extractQuery`** does the same for the operator's right-hand side, and can set a search mode:
+  `tags @> '{}'` asks for `GIN_SEARCH_MODE_ALL`, a whole-index scan, because every row contains the empty set.
+
+The others are `consistent` or `triConsistent`, which decide matches, `compare` for ordering keys, and the optional
+`comparePartial` for prefix-style range matches. The built-in classes:
+
+| Operator class | Keys it extracts | Indexable operators |
+|---|---|---|
+| `array_ops` | each array element | `&&`, `@>`, `<@`, `=` |
+| `jsonb_ops` (default for `jsonb`) | every object key and every scalar value, separately | `@>`, `?`, `?\|`, `?&`, `@?`, `@@` |
+| `jsonb_path_ops` | one hash per scalar value, covering the keys on its path | `@>`, `@?`, `@@` |
+| `tsvector_ops` | each lexeme | `@@` |
+
+The lab starts with a `tags text[]` column indexed over 24 rows. The chips are the keys of the newest row. The table
+averages 2.6 keys per row, and the stat **TIDs in posting lists** (63) is the number that drives cost: GIN stores one
+entry per *(key, row)* pair, not per row.
+
+Switch **Column** to **doc jsonb**. Each document has a status, an owner team, a short tag array, a priority and
+sometimes a reviewer, and `jsonb_ops` pulls **9.5 keys per row** out of it. Five of those keys — `key:owner`,
+`key:priority`, `key:status`, `key:tags` and `key:team` — occur in every row, so their posting lists cover the whole
+table.
+
+Rows that are NULL or yield no keys still get placeholder entries, so full-index scans find them. A multi-column GIN
+index is a single B-tree over *(column number, key)* pairs.
+
+## The entry tree and its posting lists
+
+On disk a GIN index is a metapage, a **B-tree over keys** called the entry tree, and posting trees for large lists.
+The entry tree uses the same Lehman–Yao right links as the
+[regular B-tree](../../../p02-storage-engines/b-trees-and-variants/01-b-tree-structure-invariants-and-search/),
+but has no left links, because GIN never scans backwards.
+
+Each leaf entry holds a key and its **posting list**: the sorted heap TIDs of every row containing that key. Since
+PostgreSQL 9.4 the lists are compressed:
+
+1. Each TID becomes one integer, with the offset number in the low 11 bits and the block number above it — 43 bits
+   (`itemptr_to_uint64` in `ginpostinglist.c`).
+2. The first TID is stored whole; every later one as the **difference** from the previous one.
+3. Each difference is **varbyte** encoded: 7 data bits per byte, the high bit saying another byte follows. A 43-bit
+   value needs at most 7 bytes.
+
+Two rows on the same heap page differ by a small offset: one byte. A row on the next page differs by about 2,048: two
+bytes. Hover over a bar in the lab to compare a list's compressed size with the 6 bytes per TID of a raw `ItemPointer`.
+
+An entry tuple must fit in `GinMaxItemSize`, about a third of a page (2,712 bytes with 8 KB pages). A list that
+outgrows it moves into a **posting tree**, a separate B-tree keyed by TID, and the entry keeps only its root block
+number. Posting-tree leaves hold several independently compressed **segments** (256 bytes targeted, 384 at most), so
+an insert re-encodes only the segment it lands in, and a scan that skips ahead starts decoding at the segment holding
+its target. A posting tree never turns back into an inline list.
+
+The lab makes lists into posting trees above 48 bytes, so this happens in a few clicks. Switch **Column** back to
+**tags text[]**, untick **fastupdate** and press **INSERT 10 rows** three times. At 54 rows the `postgres` list
+reaches 50 bytes for 30 TIDs, and its bar turns into a posting tree.
+
+The entry tree only grows. VACUUM removes dead TIDs from posting lists and frees empty posting-tree pages, but never
+deletes keys or pages from the entry tree; the GIN README's reasoning is that the set of distinct words in a corpus
+changes very slowly.
+
+## Writes, and why the pending list exists
+
+A row with *k* keys is *k* index insertions. For each key GIN descends the entry tree, decodes the posting list,
+merges in the new TID, recompresses and writes the entry back, or inserts into the posting tree. A 10-key document
+costs ten insertions where a B-tree row costs one. An `UPDATE` that changes the indexed column cannot be a
+[HOT update](../../../p02-storage-engines/pages-tuples-heap-files/04-hot-updates-redirect-line-pointers-and-opportunistic-page-pr/),
+so the new row version pays for every key again.
+
+**fastupdate**, on by default, defers that work. `gininsert` appends the row's keys to the **pending list**, a chain of
+pages found through `head` and `tail` in the metapage, which also counts `nPendingPages` and `nPendingHeapTuples`.
+Each pending entry is one key plus one TID. A row's entries stay together and sorted; across rows the list is in
+arrival order.
+
+**Cleanup** (`ginInsertCleanup`) later moves the list into the entry tree. It reads pending pages into an in-memory
+accumulator grouped by key, so within each batch a key gets one merge however many new rows carry it — that grouping
+is the saving. It runs:
+
+- **Inside an INSERT.** After appending, the backend checks whether `nPendingPages × 8,160 bytes` exceeds
+  `gin_pending_list_limit` (default 4 MB, overridable per index). At 4 MB that means more than 514 pending pages. The
+  backend then does the cleanup itself, flushing a batch whenever the accumulator fills `work_mem`. If another backend
+  is already cleaning, it skips.
+- **In the background**, from VACUUM, autovacuum, auto-analyze, or `SELECT gin_clean_pending_list('idx')`. These wait
+  for a running cleanup and use `maintenance_work_mem` (or `autovacuum_work_mem`).
+
+In the lab, tick **fastupdate**, press **Start over**, and press **INSERT 10 rows** three times with the limit at
+2 lab pages. Most bars in **Work inside each INSERT** are empty: the row only went to the pending list. Two INSERTs hit
+a full list and carry the whole cleanup, with 8 and 9 entry-tree insertions. The stats read **17 entry-tree insertions
+for 70 keys inserted**. With fastupdate off, the same 30 rows cost 70, at 1 to 4 per INSERT.
+
+So fastupdate makes writes cheaper on average, the INSERT that crosses the limit much slower, and every read slower
+while the list is full, since scans must read all of it.
+
+`ALTER INDEX ... SET (fastupdate = off)` stops new entries going to the pending list but does not flush existing ones;
+run VACUUM or `gin_clean_pending_list` afterwards. Untick **fastupdate** with entries pending and insert a row: they
+stay put.
+
+Builds avoid all of this. `CREATE INDEX` accumulates *(key, TIDs)* in memory until `maintenance_work_mem` fills, then
+inserts each key's TIDs in one go, and PostgreSQL 18 can build GIN indexes in parallel. For large bulk loads the
+documentation advises dropping the GIN index and recreating it afterwards.
+
+## Answering a query by walking posting lists
+
+GIN has no `amgettuple`: it only fills a TID bitmap, which a
+[Bitmap Heap Scan](../03-bitmap-indexes-and-bitmap-heap-scans/) reads in heap order. `gingetbitmap` reads the
+**pending list first**, every page of it (binary-searching each row's sorted keys), then the entry tree. A concurrent
+cleanup can move entries into the tree mid-scan, so the reverse order could miss them. This order can find a row
+twice, harmless in a bitmap — and that possibility is a major reason GIN cannot return tuples one at a time.
+
+<GinPostingWalkLab client:visible />
+
+`extractQuery` turns the query into keys, and each key becomes a **scan entry** reading one posting list in TID order.
+An inline list is decoded in full at scan start; a posting tree loads one leaf page at a time.
+
+`startScanKey` first sorts the entries by estimated size. It marks the rarest absent and the rest unknown, and calls
+`triConsistent` after each one until the answer is "no match possible". Those entries are **required** — every match
+appears in at least one — and the rest are **additional**. For `@>`, which needs every key, the single rarest entry
+already rules matches out, so it is the only required entry. For `&&`, which needs any key, every entry is required.
+
+`keyGetItem` then repeats one step: take the smallest current TID among the required entries as the candidate, advance
+each additional entry to it without testing the TIDs skipped, and call the consistent function (in its
+`triConsistent` form) with which entries hold it. A posting-tree entry that runs off its loaded page steps right to
+the next leaf only if the scan wants the TID just after its own current one, as it does for the required entry that
+supplied the last candidate. An entry that was skipped past descends again from the posting tree's root to the leaf
+covering the target, and decodes from that segment on.
+
+The lab starts on `tags @> '{gin,postgres}'` over 400 rows. Press **Restart scan**, then **Next consistent() call**:
+
+- `gin` (37 TIDs) is **required**, `postgres` (237) **additional**. The dashed line jumps from `gin` TID to `gin` TID,
+  and `consistent()` runs **37 times** for 274 TIDs.
+- **Show result**: 189 of 274 TIDs decoded. `postgres` loaded 13 of 15 leaves, each by a fresh descent; `gin` rows are
+  spread over the whole heap, so few pages can be skipped.
+- Choose `tags @> '{rust,postgres}'`. Here `rust` first appears at row 262, so its TIDs cluster at the end of the heap
+  and the `postgres` walk jumps straight there: **6 of 15 leaves**, 135 of 279 TIDs decoded.
+- Choose `tags @> '{linux,postgres}'`. The rarer key still has 187 TIDs, and the walk decodes **all 424**. Intersection
+  saves work only when one side is small or clustered.
+- Choose `tags && '{gin,rust}'`. Both entries are required, and `consistent()` runs once per row of the **union**: 74 times.
+
+Raise **Newest rows still in the pending list** to 20. Those rows leave the posting lists, and **Pending entries
+read** shows the whole list read first: 53 entries for 20 rows.
+
+`triConsistent` works in three values — TRUE, FALSE, MAYBE — and answers MAYBE when the result depends on unknown keys.
+For an operator class with only boolean `consistent`, GIN substitutes a shim that tries every combination of up to four
+unknown keys and answers MAYBE beyond that.
+
+## Recheck: when the index cannot be sure
+
+`consistent` also sets a **recheck** flag; when set, the Bitmap Heap Scan re-evaluates the operator on the fetched row.
+
+- **Arrays.** `array_ops` is exact for `@>` and `&&`. `<@` and `=` recheck: the index cannot tell whether a row has
+  elements the query does not mention.
+- **`jsonb`.** Both classes always recheck. `jsonb_ops` knows a row has a string value `db`, not *where* it is; it also
+  flags string array elements like object keys, and hashes strings over 125 bytes. `jsonb_path_ops` hashes can collide.
+- **`tsvector`.** No positions or weights are stored, so weighted and phrase queries recheck — see the
+  [full-text page](../07-full-text-indexes-term-dictionaries-postings-and-skip-lists/).
+
+A bitmap that outgrows `work_mem` also goes lossy page by page, forcing rechecks regardless of the operator class.
+
+Set the pending slider back to 0 and choose `doc @> '{"status":"active","owner":{"team":"db"}}'` with `jsonb_ops`; a
+newly chosen query shows its finished scan. The query has 5 keys — `key:owner`, `key:status`, `key:team`, `str:active`, `str:db` — and only
+`str:db` is required. The bitmap gets **61 rows**; the recheck keeps **36** and discards **25**. The note quotes the first
+discard, `(0,3)`, which has `"owner": {"team": "web"}` and `"reviewer": {"team": "db"}`: every key the index looked
+for, but `db` belongs to the reviewer.
+
+Choose `doc ? 'team'`. `?` asks about top-level keys, but `key:team` is in every row because of the nested `owner.team`,
+so all 400 rows are candidates and the recheck discards all 400.
+
+## jsonb_ops versus jsonb_path_ops
+
+`jsonb_ops` indexes each key and each value on its own, prefixed with a flag byte (`JGINFLAG_KEY`, `_STR`, `_NUM`,
+`_BOOL`, `_NULL`). That supports the key-exists operators `?`, `?|`, `?&` and the jsonpath accessors `.*` and `.**`,
+at the price of many keys per row and huge lists for keys every row has.
+
+`jsonb_path_ops` emits one `uint32` per scalar value: walking down to it, each object key's hash is folded into a
+running value — rotate left one bit, XOR in the next hash — and then the value's hash. The documentation's example,
+`{"foo": {"bar": "baz"}}`, gives three items under `jsonb_ops` and one under `jsonb_path_ops`.
+
+In the first lab, select **doc jsonb**, then **jsonb_path_ops**. The index rebuilds over the same rows, keys are now
+ordered by hash, and **Keys per row** reads **9.5 vs 4.4**. In the second lab the same containment query needs 2 entries
+instead of 5, decodes **280 TIDs instead of 1,499**, and all 36 candidates survive the recheck.
+
+The costs, both documented: `jsonb_path_ops` has **no `?` operators** (select `doc ? 'team'` with it and the lab reports
+the index unusable), and it emits **no entries for structures without values**, so a search for `{"a": {}}` becomes a
+full-index scan.
+
+## No ordering, no uniqueness, no index-only scans
+
+GIN's handler sets `amcanorder`, `amcanunique` and `amcanbackward` to false and has no `amcanreturn`. A GIN index cannot
+supply `ORDER BY`, enforce `UNIQUE`, or answer from the index alone; ordering is a sort after the Bitmap Heap Scan. The
+`btree_gin` extension adds GIN operator classes for scalar types, so a single GIN index can combine them with an array or
+`jsonb` column.
+
+## Where it bites in production
+
+- **Periodic slow INSERTs and UPDATEs.** The writer that crosses `gin_pending_list_limit` does everyone's cleanup before
+  it commits: latency spikes under steady writes. Let autovacuum clean first (for insert-heavy tables, a lower
+  `autovacuum_vacuum_insert_threshold`), raise the limit on that index and accept larger, rarer spikes, or set
+  `fastupdate = off` and pay evenly on every write.
+- **Reads slow down between vacuums.** Every scan reads the whole unsorted pending list. `pgstatginindex()` in
+  `pgstattuple` reports `pending_pages` and `pending_tuples`.
+- **Write amplification hides in key counts.** A document with 40 keys and values is 40 index insertions per non-HOT
+  update, and index size and WAL grow with total keys, not rows. `jsonb_path_ops`, or an expression index on
+  `(doc -> 'tags')`, stores fewer.
+- **Common keys defeat intersection.** When even the rarest query key matches most rows, the scan decodes nearly every TID
+  of every list, then visits the heap for each match.
+- **Rechecks are heap reads.** A query the index narrows poorly, like `? 'team'`, fetches every candidate just to reject it;
+  `EXPLAIN ANALYZE` reports them as `Rows Removed by Index Recheck`.
+- **SERIALIZABLE sees more conflicts.** Every GIN scan predicate-locks the metapage and every pending-list insert checks
+  against it, since a pending entry could belong anywhere; the README notes that with fastupdate on this amounts to
+  locking the whole index.
+
+:::note[What to take forward]
+GIN splits each row into many keys and keeps, per key, a sorted, delta- and varbyte-compressed list of heap TIDs, moving it
+to a posting tree once it outgrows an entry tuple. Every key is a separate insertion, so fastupdate queues keys in a pending
+list and merges them in bulk: cheaper on average, expensive for the writer that crosses the limit, and slower to read until
+the merge. Queries walk posting lists in TID order — the rarest keys drive, the rest skip forward, `consistent` decides — and
+recheck the heap whenever the operator class cannot be exact. Prefer `jsonb_path_ops` when containment and path queries are
+all you need.
+:::

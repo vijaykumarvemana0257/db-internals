@@ -1,0 +1,224 @@
+---
+title: 'BRIN, zone maps and min/max data skipping'
+description: How a Block Range INdex keeps one min/max summary per run of heap pages, turns every summary that might match into a lossy page bitmap, why a pg_stats.correlation near 1 does not guarantee pruning, how summaries widen and new ranges go unsummarized, and the same idea in Parquet, ClickHouse and Snowflake.
+depth: intermediate
+sidebar:
+  order: 4
+---
+
+import BrinZoneMapPruningLab from '../../../../components/viz/BrinZoneMapPruningLab';
+
+A B-tree on the timestamp of a 10-million-row events table holds one entry per row: 214 MB next to a 498 MB heap, measured on
+PostgreSQL 17. If the rows arrived in time order, most of that is redundant, because the heap is already sorted by time. A BRIN
+index on the same column is 32 KB. It keeps one summary per run of pages, skips every run whose summary rules the predicate out,
+and reads the rest. It is exactly as good as the physical order of the data, and the gap between "mostly ordered" and "ordered
+enough" is what this page is about.
+
+<BrinZoneMapPruningLab client:visible />
+
+## What the index stores
+
+A BRIN index divides the heap into **block ranges** of `pages_per_range` consecutive pages: 128 by default, about 1 MB of heap at
+the standard 8 KB page size. Each range has at most one **summary tuple**. With the `minmax` operator class, that is the smallest
+and largest value in the range, plus flags recording whether the range holds any NULLs and whether it holds only NULLs.
+
+To find a summary without searching, the index keeps a **range map**, the *revmap*, in the pages after the metapage: an array of
+6-byte tuple identifiers, one per range. The entries have a fixed size, so the entry for any heap page is found by arithmetic. An
+entry that points nowhere means the range is **unsummarized**.
+
+The 10-million-row table has 63,695 heap pages, so 498 ranges. `pageinspect` shows the entire index in four pages: the metapage, one
+revmap page and two regular pages, the first holding 291 summaries such as `{2026-01-01 00:00:00+00 .. 2026-01-01 05:34:55+00}`.
+
+BRIN stores no heap TIDs, so it can only return a bitmap. Its access-method definition in `brin.c` lists the rest of what it cannot
+do: ordered scans, uniqueness, index-only scans, and serving as the index for `CLUSTER`. BRIN arrived in PostgreSQL 9.5;
+PostgreSQL 17 can build it with parallel workers.
+
+## How a scan uses the summaries
+
+`bringetbitmap` walks the revmap from the first range to the last. For each range:
+
+1. **No summary:** every page in the range goes into the bitmap. An index that knows nothing about a range cannot rule it out.
+2. **A summary:** the operator class's `consistent` function tests it against the scan keys. For `minmax` and a range predicate,
+   that is an interval-overlap test.
+3. **Might match:** `tbm_add_page` adds every page of the range.
+
+The result is a **lossy** bitmap of page numbers. The Bitmap Heap Scan reads those pages in physical order and re-evaluates the
+predicate on every row, the same recheck the [bitmap heap scan page](../03-bitmap-indexes-and-bitmap-heap-scans/) shows for bitmaps
+that outgrow `work_mem`. A BRIN bitmap is lossy from the start. A one-hour window on the measured table:
+
+```
+Bitmap Heap Scan on ev (actual rows=3600 loops=1)
+  Recheck Cond: ((ts >= '2026-02-01 00:00:00+00'::timestamp with time zone) AND (ts < '2026-02-01 01:00:00+00'::timestamp with time zone))
+  Rows Removed by Index Recheck: 16496
+  Heap Blocks: lossy=128
+  ->  Bitmap Index Scan on ev_brin (actual rows=1280 loops=1)
+```
+
+One range matched, so the scan read 128 pages and rechecked 20,096 rows to return 3,600. The `rows=1280` on the index node is not a
+row count: `bringetbitmap` cannot know how many tuples its pages hold, so it reports ten per page.
+
+The lab starts with a perfectly ordered table: 100 pages of 12 rows, `pages_per_range` 8, and the predicate `ts 600–659`. Each box is
+one range's `[min, max]` summary, and only one of the 13 overlaps the violet predicate band. The bitmap strip under the plot shows 8 of
+100 pages read; the stats show 96 rows rechecked to keep 60.
+
+## The pruning arithmetic
+
+For perfectly ordered data, a predicate selecting a fraction *s* of the rows overlaps about *s* × *ranges* summaries, plus at most one
+range at each edge. PostgreSQL's cost function, `brincostestimate`, starts from that minimum and adjusts it with one statistic:
+
+```
+ranges          = ceil(heap pages / pages_per_range)
+minimal ranges  = ceil(ranges × selectivity)
+expected ranges = min(minimal ranges / |correlation|, ranges)
+```
+
+`correlation` is `pg_stats.correlation`. ANALYZE sorts its sample by value and correlates each row's rank with its physical position,
+from −1 (reverse order) to +1 (physical order). At 1.0 the planner expects the minimum; at 0.5, twice as many ranges; near zero, all of
+them, and a sequential scan wins.
+
+The trap: correlation measures order *on average*, while a min/max summary is set by its *most extreme* row. In the lab, choose **A few
+rows anywhere** and move **Rows at random pages** to 1%, which relocates 13 of the 1,200 rows. Correlation still reads 0.9938 and the
+planner still expects about one range, but the scan reads 56 of 100 pages: each relocated row stretches the min or max of the range it
+landed in across much of the table. At 5%, correlation is 0.9438 and the scan reads 92 pages.
+
+Now choose **Every row nearby** and set the displacement to 384 rows. Every row is out of place and correlation is lower, 0.9534, yet
+the scan reads only 40 pages. A row that moved a few ranges widens its neighbours' summaries a little, not across the table.
+
+The same holds at full scale. Four versions of a 2-million-row table (12,800 heap pages), queried for one hour (3,600 rows) with the
+default 128 pages per range:
+
+| Physical order | `pg_stats.correlation` | Heap pages read (minmax) |
+|---|---|---|
+| Every row displaced by up to 2 hours | 0.99999 | 256 |
+| 0.05% of rows at random positions | 0.9995 | 12,544 |
+| 1% of rows at random positions | 0.9913 | all 12,800 |
+| Random order | 0.0026 | all; the planner picks a sequential scan |
+
+With 1% misplaced, the planner still chose BRIN, estimating about one range's worth of rows, then read every page and discarded
+1,996,400 rows in the recheck. A 128-page range here holds about 20,000 rows, so even at 0.05% the average range contains ten misplaced
+rows, and the chance that a range contains none is about e<sup>−10</sup>.
+
+The converse also holds. The same 2 million rows loaded as one-day batches, with the batches in shuffled order, have a correlation of 0.18, yet
+the same query read 12 of the 100 ranges: only a range that straddles two batches has a wide summary.
+
+## Operator classes beyond minmax
+
+| Opclass family | Summary per range | Serves | Since |
+|---|---|---|---|
+| `minmax` | one `[min, max]` | `<` `<=` `=` `>=` `>` | 9.5 |
+| `minmax_multi` | several intervals and points | the same operators | 14 |
+| `inclusion` | one value containing every value: a box, a network, a range | `&&`, `@>`, `<@` and others | 9.5 |
+| `bloom` | a Bloom filter over value hashes | `=` only | 14 |
+
+**`minmax_multi`** exists for the failure above. It keeps up to `values_per_range` values (default 32, allowed 8 to 256); a point uses
+one slot and an interval two. When a range has more distinct values than fit, it keeps the widest gaps between values and merges
+everything else, so an isolated outlier survives as a separate point and a predicate that falls in the gap still prunes the range. On the
+0.05% table it read 384 pages instead of 12,544. On the 1% table it still read 10,752 of 12,800: two hundred outliers per range do not fit
+in 32 values. It also doubled the index, from 24 KB to 48 KB.
+
+Back on **A few rows anywhere**, select **minmax_multi** in the lab, which keeps 8 values per range. At 1% relocated rows the scan drops from 56 pages to 16; at 10% it
+climbs back to 64.
+
+**`inclusion`** covers types without a linear order: `box_inclusion_ops`, `inet_inclusion_ops` and `range_inclusion_ops` store one value
+that contains everything in the range and answer overlap and containment against it. **`bloom`** gives up ordering entirely: it answers
+equality only, but needs each range to hold a limited set of values rather than values sorted by position. Its parameters are
+`n_distinct_per_range` (default −0.1, a fraction of the range's maximum possible rows) and `false_positive_rate` (default 0.01), and the
+filter must fit on one 8 KB index page.
+
+## pages_per_range: index size against precision
+
+Index size scales with heap pages divided by `pages_per_range`, and pruning can never be finer than one range. The one-hour query on the
+10-million-row table:
+
+| `pages_per_range` | Index size | Heap pages read | Rows discarded by recheck |
+|---|---|---|---|
+| 1 | 2.1 MB | 24 | 168 |
+| 16 | 144 KB | 32 | 1,424 |
+| 128 (default) | 32 KB | 128 | 16,496 |
+
+Even at one page per range, BRIN is about a hundred times smaller than the B-tree, though its 63,695 summaries now need 47 revmap pages.
+
+The bar charts under the lab compute this trade-off for the current table and predicate, building a fresh index at each setting. With
+**minmax** and the rows in order, one page per range keeps 100 summaries and reads 5 pages; 32 pages per range keeps 4 and reads 32. At 1%
+relocated rows the spread grows to 12 pages versus 96, because smaller ranges hold fewer outliers each. Moving the lab's `pages_per_range`
+slider rebuilds the index, as `REINDEX` would.
+
+## Keeping summaries current
+
+BRIN is maintained on insert, but only in one direction.
+
+**Inserts widen.** `brininsert` finds the range of the page the new row landed on. If the range is summarized and the value falls outside the
+summary, the summary is widened: in place if it still fits on its index page, otherwise as a new tuple with the revmap entry repointed. If the
+range is unsummarized, nothing happens.
+
+**New ranges start unsummarized.** `CREATE INDEX` summarizes every range, including the partial one at the end. Appended rows widen that
+range until it is full; the next range has no summary tuple, inserting into it does not create one, and every BRIN scan reads its pages.
+
+Set the lab back to 0% relocated rows, **minmax** and `pages_per_range` 8, then press **INSERT new rows**. The batch lands on pages 100–102 and range 12's summary widens from 1152–1199 to 1152–1235. Press it
+again: range 13 starts with no summary, drawn as a dashed yellow column, and the query now reads 10 pages instead of 8. On a real table whose
+last two ranges had gone unsummarized after a load, a query for the oldest data read 381 pages; after summarization, 128.
+
+Three things fill the gap:
+
+- **VACUUM** summarizes unsummarized ranges, but calls `brinsummarize` with `include_partial = false`, skipping the partial range at the end.
+  Press **VACUUM** now: range 13 stays unsummarized. On PostgreSQL 17, VACUUM summarized a complete range at page 512 and left the partial range
+  at page 640 alone.
+- **`brin_summarize_new_values(index)`** summarizes every unsummarized range, the partial one included, and returns the count;
+  `brin_summarize_range(index, block)` does one range. The source expects `brin_summarize_new_values` to be run once bulk loading is done. Press it: it returns 1 and the scan is
+  back to 8 pages.
+- **`autosummarize`**, an index storage parameter that is off by default. When a row becomes the first tuple on the first page of a new range,
+  `brininsert` asks autovacuum to summarize the previous range, and the next worker to finish in that database does it. The request queue holds
+  256 entries; when it is full the server logs `request for BRIN range summarization for index "…" page N was not recorded` and the range waits
+  for VACUUM. Press **Reset table**, tick **autosummarize** and insert five batches: range 13 is summarized when the first row lands on page 112, leaving
+  only range 14 without a summary.
+
+**Updates widen too.** Before PostgreSQL 16, updating a BRIN-indexed column ruled out a
+[HOT update](../../../p02-storage-engines/pages-tuples-heap-files/04-hot-updates-redirect-line-pointers-and-opportunistic-page-pr/). Since 16, an
+update that changes only columns covered by summarizing indexes can stay HOT: `heap_update` reports `TU_Summarizing`, and the executor inserts
+into the BRIN indexes alone, so the summary still widens. Updating one row on page 0 to a timestamp two months later was a HOT update, and range
+0's maximum jumped to that timestamp.
+
+**Deletes never narrow.** A deleted row may have set its range's min or max, but BRIN cannot subtract it; the BRIN README lists re-summarizing
+such ranges as "not currently implemented". After deleting that updated row and vacuuming, range 0 kept its stretched maximum until
+`brin_desummarize_range` and `brin_summarize_range` rebuilt it. In the lab, press **Reset table**, then **UPDATE old rows**: three summaries widen and the scan reads 24 pages. **DELETE out-of-place
+rows** removes those rows, and the scan still reads 24. **Re-summarize all ranges** brings it back to 8. Deletes can also widen summaries indirectly: once VACUUM records
+[free space](../../../p02-storage-engines/pages-tuples-heap-files/03-heap-file-organization-and-free-space-management/) in old pages, new rows can be placed there. The lab always appends at the end.
+
+## The same idea elsewhere
+
+A min and max per chunk, used to skip chunks, is usually called a **zone map**.
+
+- **Parquet.** Each column chunk in a row group can carry `Statistics` with `min_value` and `max_value`. The optional page index adds a `ColumnIndex`
+  with per-page `min_values`, `max_values` and a `boundary_order` so readers can binary-search sorted columns, and an `OffsetIndex` to jump to the
+  surviving pages. Writers may truncate bounds (the spec stores `"B"` and `"C"` for `"Blart Versenwald III"`), and `is_min_value_exact` and
+  `is_max_value_exact` record whether they did.
+- **ClickHouse.** `INDEX idx ts TYPE minmax GRANULARITY n` stores a min and max per block of *n* granules; a granule is at most `index_granularity`
+  rows (8,192 by default) and `GRANULARITY` defaults to 1. An index added to an existing table covers only new inserts until
+  `ALTER TABLE … MATERIALIZE INDEX`. At trace log level, each skip index reports its effect per query, as in ``Index `vix` has dropped 6102/6104 granules``.
+  ClickHouse's guidance matches this page: in most cases a skip index is useful only when the column is strongly correlated with the primary key.
+- **Snowflake.** Every micro-partition (50–500 MB uncompressed) records each column's range of values and distinct count, and queries skip
+  micro-partitions whose ranges cannot match. Overlap is measured as clustering depth (`SYSTEM$CLUSTERING_DEPTH`), and Automatic Clustering reclusters
+  tables with a clustering key in the background. Snowflake does not prune on a predicate containing a subquery, even one that returns a constant.
+
+The difference is who controls physical order. BRIN summarizes whatever order the heap has and never changes it. ClickHouse sorts each data part
+by the sorting key as it writes it, and Snowflake can recluster continuously. Choosing those sort keys belongs to the column-stores module.
+
+## Where it bites in production
+
+- **High correlation, full-table scan.** `EXPLAIN (ANALYZE)` shows `Heap Blocks: lossy=` near the table's page count and millions of
+  `Rows Removed by Index Recheck`. A small fraction of far-misplaced rows (backfills, late events, updated timestamps) has stretched the
+  summaries; `brin_page_items` from `pageinspect` shows them. Try `minmax_multi`, a smaller `pages_per_range`, or rewriting the table in order.
+- **The planner cannot see outliers.** `brincostestimate` knows only selectivity and `|correlation|`, so it keeps choosing a BRIN plan that reads
+  everything. The index is fine; the estimate is wrong.
+- **Slow queries on old data after a load.** Every BRIN scan reads unsummarized ranges, and routine VACUUM never summarizes the partial last range.
+  Call `brin_summarize_new_values` after bulk loads, or enable `autosummarize` and watch for requests that were not recorded.
+- **Summaries only grow.** Updates to the indexed column and late inserts widen summaries, and nothing narrows them automatically. After cleaning up,
+  re-summarize the affected ranges or `REINDEX`.
+
+:::note[What to take forward]
+BRIN keeps one summary per `pages_per_range` block and returns every page of every range whose summary might match, so the index is tiny and its
+value depends entirely on physical order. Correlation near ±1 is the planner's proxy for narrow ranges, not a guarantee: a fraction of a percent of far-misplaced rows can
+stretch every min/max while correlation reads 0.99. Summaries widen on insert and update, never narrow, and new ranges at the tail stay unsummarized
+until VACUUM (complete ranges only), `brin_summarize_new_values` or `autosummarize` catches up. Parquet statistics, ClickHouse minmax indexes and
+Snowflake micro-partition metadata apply the same mechanism to files and parts.
+:::

@@ -1,0 +1,192 @@
+---
+title: 'Building indexes online: CREATE INDEX CONCURRENTLY internals'
+description: How PostgreSQL builds an index without blocking writers — a catalog row, two table scans, three waits and the indisready/indisvalid flags — why each wait is required, what a failed build leaves behind, and how InnoDB's online ADD INDEX replaces the second scan with a row log and a metadata lock.
+depth: deep
+sidebar:
+  order: 9
+---
+
+import CreateIndexConcurrentlyLab from '../../../../components/viz/CreateIndexConcurrentlyLab';
+
+A plain `CREATE INDEX` in PostgreSQL takes a `ShareLock` on the table. Reads carry on, but every `INSERT`,
+`UPDATE` and `DELETE` queues behind the lock until the build finishes — minutes or hours on a large table. The lock
+is what makes the build simple: the table cannot change while it is being scanned, so one pass is enough.
+
+`CREATE INDEX CONCURRENTLY` gives up that lock. Building the index is the easy part — the sort and bottom-up load
+are the ones described on the [bulk loading page](../../../p02-storage-engines/b-trees-and-variants/05-bulk-loading-and-index-construction/).
+The hard part is proving that no row written *during* the build is missing from the finished index. PostgreSQL does it
+with two table scans and three waits, spread over four transactions. InnoDB solves the same problem with a log.
+
+<CreateIndexConcurrentlyLab client:visible />
+
+## The lock it takes instead
+
+`DefineIndex()` in `src/backend/commands/indexcmds.c` picks the lock in one line:
+`lockmode = concurrent ? ShareUpdateExclusiveLock : ShareLock`. `ShareUpdateExclusiveLock` does not conflict with the
+`RowExclusiveLock` that writers hold, so DML continues. It does conflict with itself, so only one concurrent build can run on
+a table at a time, and it also blocks `VACUUM`, `ANALYZE` and most `ALTER TABLE` forms for the whole build.
+
+The statement cannot run inside a transaction block, because it commits several times on its own, and it cannot target a
+partitioned table; build each partition's index concurrently instead.
+
+The scans differ too. A plain build scans with `SnapshotAny` and also indexes recently dead tuples, which older snapshots may
+still need. A concurrent build scans with an ordinary MVCC snapshot and indexes only what it sees. The rest of the procedure
+exists to make that safe.
+
+## Transaction 1: a catalog row nobody may use
+
+The first transaction inserts the index's `pg_index` row with `indisready = false` and `indisvalid = false`, takes a
+session-level `ShareUpdateExclusiveLock` so the table cannot be dropped between transactions, and commits.
+
+It commits this early for the sake of [HOT updates](../../../p02-storage-engines/pages-tuples-heap-files/04-hot-updates-redirect-line-pointers-and-opportunistic-page-pr/).
+An update can be HOT only when no index that [points at individual tuples](../04-brin-zone-maps-and-min-max-data-skipping/#keeping-summaries-current) covers a changed column. `RelationGetIndexAttrBitmap()` in `relcache.c`
+deliberately counts indexes that are neither ready nor valid, so once a backend has seen the new catalog row, an update to
+the new index's column is no longer HOT. The executor, meanwhile, skips any index whose `ii_ReadyForInserts` is false, so
+nobody inserts into the empty index yet. As the
+[catalog page](../../../p02-storage-engines/pages-tuples-heap-files/07-catalog-storage-the-bootstrap-problem-and-cache-invalidation/)
+put it: `indisready` means writers maintain the index, `indisvalid` means the planner may use it.
+
+## Wait 1, then the build from snapshot S1
+
+Backends already writing when the catalog row committed may not have seen it. `WaitForLockers(heaplocktag, ShareLock)`
+collects every transaction holding a lock that conflicts with `ShareLock` — every writer of the table — and waits for each
+to finish. It waits by acquiring a lock on each transaction's virtual xid, so a waiting build shows up in `pg_locks` as an
+ungranted `virtualxid` lock, and the deadlock detector can see it. Transactions that start writing after the commit are not on the
+list; they already see the new index.
+
+`README.HOT` gives the reason for this wait. Suppose the build makes an entry for a row with `X = 1`. Another backend, unaware that
+`X` is now indexed, HOT-updates the row to `X = 2` and commits. The index holds `X = 1` pointing at a chain whose live row has
+`X = 2`. Validation could add an entry for 2, but nothing can remove the wrong entry. So HOT safety must be in force for every
+live row before the scan begins.
+
+After the wait, the build takes snapshot **S1** and runs the normal index build over the tuples live in S1. For a heap-only
+tuple, the entry uses the *live* tuple's key but the TID of the HOT chain's *root*, so the new index points at the same line pointers
+as the table's other indexes. When the build finishes, `index_set_state_flags(INDEX_CREATE_SET_READY)` sets `indisready`, and
+transaction 2 commits.
+
+In the lab's **Busy table** scenario, press **Start** and step with **Next event** to t = 5. The catalog row has committed, and the progress view
+reads `waiting for writers before build`: T1 inserted a row at t = 2 and HOT-updated `r3` at t = 3, before the catalog row existed.
+The build cannot take S1 until T1 commits at t = 6. Once the build finishes at t = 13, the heap strip shows `(0,8)`, the heap-only version of `r3`, indexed with key 35 under its root `(0,3)`.
+
+## Wait 2, then validation with snapshot S2
+
+Anything committed after S1 is invisible to the build, and until `indisready` commits, its writers do not insert it either. Some of them
+are still running when the flag commits, possibly working from an index list in which the index is not ready. So transaction 3
+starts with the same wait again: every writer holding a lock at that moment must finish.
+
+Then it takes the **reference snapshot S2** and calls `validate_index()`. Its comment in `index.c` spells out the method:
+
+1. Scan the whole index with a bulk-delete callback that records every TID and never deletes anything.
+2. Sort those TIDs, encoded as 64-bit integers, in a tuplesort bounded by `maintenance_work_mem`.
+3. Scan the heap under S2 in physical order — synchronized scans are disabled because the scan must start at block 0 to line up with the
+   sorted list — and merge-join. Each visible tuple's TID is converted to its HOT root; if that root is absent from the index, insert an entry.
+
+Tuples committed after S2 are handled by their writers, which by now all see `indisready`. Tuples that were deleted and committed before S2
+get no entry at all; the next wait deals with them.
+
+Step the lab to t = 13. `indisready` has committed, and the build's seven entries appear. T3 wrote its first row at t = 12, one tick before
+the flag, so it is not maintaining the index. The build waits for it until t = 17. T4 first writes at t = 14 and inserts `(0,13)` into the index
+itself. At t = 22 validation has back-filled four tuples: `(0,10)` and `(0,11)` from T2, `(0,12)` and `(0,14)` from T3. `(0,9)` was inserted
+after S1 and deleted before S2, so it needs no entry.
+
+## Wait 3: old snapshots, then indisvalid
+
+The index now has an entry for every tuple visible in S2. It does not have entries for tuples deleted just before S2, and a transaction holding an
+older snapshot can still see those tuples. If it planned a query against the new index, those rows would silently disappear from its results.
+
+So transaction 3 commits, and a fourth transaction — which takes no snapshot of its own, so other concurrent builds cannot end up waiting on it — calls
+`WaitForOlderSnapshots(limitXmin)`. It waits for every transaction in the database whose advertised xmin is not newer than S2's xmin. That covers
+transactions on *any* table: a `REPEATABLE READ` report on another table holds up the build as effectively as a writer on this one. It
+skips processes that cannot be affected: backends with no snapshot (xmin 0, such as a `READ COMMITTED` session idle between statements), autovacuum
+and lazy `VACUUM`, and, since PostgreSQL 14, other `CREATE INDEX CONCURRENTLY` or `REINDEX CONCURRENTLY` runs whose indexes have no expressions or predicates.
+
+Then it sets `indisvalid` and sends a relcache invalidation for the table, so existing sessions replan and notice the index.
+
+In the lab, R1 took its snapshot at t = 10 and the progress view shows it as the current locker in `waiting for old snapshots` until it commits at t = 26.
+Drag **R1 commits at t =** down to 20. R1 is gone before validation ends, and the index becomes valid at t = 23. Now switch to **A writer left idle in
+transaction**. T1 wrote before the build started and then went idle, so wait 1 lasts until T1 commits at t = 18. Q1 sits idle in transaction from t = 2 to t = 40,
+yet no wait ever includes it: it holds no write lock and, in `READ COMMITTED`, no snapshot.
+
+While `pg_stat_progress_create_index` shows a waiting phase, its `lockers_total`, `lockers_done` and `current_locker_pid` columns tell you exactly whom to chase.
+
+## What each wait prevents
+
+The lab's hypothetical **Skip a wait** option — PostgreSQL never skips — shows what each wait protects against:
+
+| Skipped wait | Transactions it would have waited for | What goes wrong | In the lab (Busy table) |
+|---|---|---|---|
+| Wait 1 | Writers already running when the catalog row committed | A writer unaware of the index HOT-updates a row and commits after S1. The build indexed the old key under the chain root, and validation skips that root because its TID is already present. | `(0,8)` is marked **WRONG KEY**: the index holds 30 for a row whose value is 35. |
+| Wait 2 | Writers already running when `indisready` committed | Their rows commit after S2, so validation cannot see them, and they never inserted them. | `(0,12)` and `(0,14)` are **MISSING**. |
+| Wait 3 | Snapshots with xmin not newer than S2's | An old snapshot sees a row that was deleted before S2 and never indexed. | R1 cannot find `(0,9)` through the index. |
+
+A plain `CREATE INDEX` skips all three waits: its `ShareLock` stops writers, and it indexes recently dead tuples. It handles broken HOT chains more cheaply. If the table has
+HOT chains that may be broken, it sets `pg_index.indcheckxmin`, and the planner ignores the index for any transaction whose `TransactionXmin` does not yet follow the
+`pg_index` row's xmin — which is why a freshly built index can be missing from `EXPLAIN` in a session with an old snapshot. The concurrent path never sets
+`indcheckxmin`, because wait 3 has already outwaited everyone it would protect.
+
+## When the build fails
+
+A deadlock, a uniqueness violation, an error in an index expression, `statement_timeout` or `pg_cancel_backend()` aborts only the current transaction. Earlier commits
+stand, so what is left behind depends on where the build stopped. Use **Fail at t** to try each case:
+
+- **Before transaction 1 commits** (t = 4): nothing is left behind.
+- **After the catalog row, before `indisready`** (t = 5 to 12): an `INVALID` index with `indisready = false`. No writer maintains it, but it still counts in HOT-safety
+  decisions, so updates to its columns stop being HOT.
+- **After `indisready`** (t = 13 onward): an `INVALID` index that every insert and non-HOT update keeps maintaining — T4's entry still appears after a failure at t = 13 —
+  and that the planner never uses. If it is unique, the documentation warns that it keeps enforcing uniqueness.
+
+`\d` lists such an index as `INVALID`. Find them with `SELECT indexrelid::regclass FROM pg_index WHERE NOT indisvalid`, then either `DROP INDEX CONCURRENTLY` and try again,
+or `REINDEX INDEX CONCURRENTLY`, which builds a replacement with the same phases and swaps it in.
+
+## InnoDB: a log instead of a second scan
+
+MySQL's `ALTER TABLE t ADD INDEX … , ALGORITHM=INPLACE, LOCK=NONE` builds a secondary index in place without rebuilding the table. The sequence below is from
+`mysql_inplace_alter_table()` in `sql/sql_table.cc` and `handler0alter.cc` in MySQL 8.4:
+
+1. **Prepare, under an exclusive metadata lock.** The statement opens the table with a `SHARED_UPGRADABLE` metadata lock and briefly upgrades it to `EXCLUSIVE`.
+   Under that lock, InnoDB adds the index in state `ONLINE_INDEX_CREATION`, allocates a row log for it, and assigns the read view the build will scan. The lock is then
+   downgraded again.
+2. **Build.** The clustered index is scanned at `REPEATABLE READ`, sorted and bulk-loaded. Meanwhile every DML statement that changes the new index calls
+   `row_log_online_op()`, which appends the change to a temporary file in blocks of `innodb_sort_buffer_size` (1 MiB by default).
+3. **Apply.** `row_log_apply()` replays the log while writers keep appending to it. Once only the last block remains, it takes the index's exclusive latch so no one can
+   append, applies that block, and marks the index `ONLINE_INDEX_COMPLETE`. From then on DML writes into the index directly.
+4. **Commit, under an exclusive metadata lock again**, to install the new table definition.
+
+The exclusive lock at the start gives InnoDB a clean cut. Metadata locks are held until commit, so every transaction that touched the table before that point has finished,
+and every change after it goes to the log. There is no snapshot wait and no validation scan. The cost moves into the lock queue. Upgrading to `EXCLUSIVE` has to wait for every transaction holding a metadata lock
+on the table, and a transaction that merely ran a `SELECT` holds one until it commits. While the upgrade waits, it blocks every new statement on the table, and they show
+`Waiting for table metadata lock`.
+
+Switch the lab to **InnoDB online ADD INDEX**. With the defaults, a transaction opens halfway through the build and stays open for 450 seconds. The log peaks at
+93 MiB and is fully applied at 648.6 s, but the commit must wait for that transaction to end at 750 s, so DML on the table stalls for about 103 seconds. Set the open
+transaction to **None**, and only the brief latch and commit remain.
+
+The log is capped by `innodb_online_alter_log_max_size`, 128 MiB by default. Raise **Concurrent DML** to 2,500 changes per second. The log reaches 128 MiB at about 537 seconds,
+before the 600-second build ends. For an added secondary index, the overflow only marks the index corrupt and stops logging. The statement fails with
+`ER_INNODB_ONLINE_LOG_TOO_BIG` when it reaches the log-apply step, and rollback drops the half-built index. Select **256 MiB** and the same load succeeds with a 163 MiB peak.
+The lab assumes 100 bytes per logged record and a fixed apply rate, so read the shape, not the exact numbers. As the manual notes, a larger limit allows more DML but
+lengthens the apply at the end.
+
+When the operation rebuilds the table, InnoDB logs row changes with `row_log_table_*` and applies the last of that log again under the exclusive lock at commit.
+
+## Where it bites in production
+
+- **A build stuck behind one session.** A build sitting in `waiting for writers before build` or `waiting for old snapshots` is waiting for a person, not for I/O.
+  `current_locker_pid` names the session. The usual culprits are an `idle in transaction` session that wrote to the table, a long `REPEATABLE READ` job on some other table, and a
+  forgotten prepared transaction, which `WaitForLockers` also waits for.
+- **Two scans on a busy database.** Each scan holds a snapshot while it runs, holding back the vacuum horizon for the whole database, and `ShareUpdateExclusiveLock` keeps autovacuum off the
+  table for the entire build. Expect bloat to grow meanwhile.
+- **Leftover INVALID indexes.** Those left after `indisready` cost write amplification and may enforce uniqueness while never serving a query. Re-running the same statement with `IF NOT EXISTS` "succeeds" with a notice,
+  because the documentation guarantees only that *a relation* with that name exists. Check `indisvalid` after every migration.
+- **PostgreSQL 14.0 to 14.3.** An optimization added in 14 caused `CREATE INDEX CONCURRENTLY` and `REINDEX CONCURRENTLY` to sometimes miss rows updated during the build. It was reverted
+  in 14.4, and the release notes recommend rebuilding any index built concurrently on those versions.
+- **InnoDB's two failure modes.** One open transaction can stall the whole table at either end of an online `ALTER`, so set a low `lock_wait_timeout` for the DDL session
+  and retry. `ER_INNODB_ONLINE_LOG_TOO_BIG` arrives only after the build, so size `innodb_online_alter_log_max_size` above write rate × build time × record size. Part 5's
+  schema-evolution module covers running both engines' builds safely.
+
+:::note[What to take forward]
+`CREATE INDEX CONCURRENTLY` commits a catalog row first so every writer respects HOT safety, builds from snapshot S1, sets `indisready` so writers maintain the index, then
+back-fills from reference snapshot S2 by merging the index's sorted TIDs against a heap scan. Before each step it waits for writers who could not see the previous flag, and finally for
+every snapshot older than S2, anywhere in the database. A failure leaves an `INVALID` index that you must drop or rebuild. InnoDB instead takes a brief exclusive metadata lock, logs
+concurrent changes and replays them, so its failure modes are a lock queue and a log that can overflow.
+:::

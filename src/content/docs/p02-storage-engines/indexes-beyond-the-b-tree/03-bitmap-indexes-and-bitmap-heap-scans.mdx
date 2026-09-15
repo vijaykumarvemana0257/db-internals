@@ -1,0 +1,228 @@
+---
+title: Bitmap indexes and bitmap heap scans
+description: How stored bitmap indexes in Oracle and Druid keep one compressed bitmap per value (WAH, Roaring) and why a single update locks many rows, and how PostgreSQL instead builds TID bitmaps per query, combines them with BitmapAnd and BitmapOr, reads the heap in block order and degrades to lossy pages with a recheck when work_mem runs out.
+depth: intermediate
+sidebar:
+  order: 3
+---
+
+import StoredBitmapIndexLab from '../../../../components/viz/StoredBitmapIndexLab';
+import TidBitmapHeapScanLab from '../../../../components/viz/TidBitmapHeapScanLab';
+
+A B-tree answers one predicate at a time and hands back row pointers in key order. A report that asks for
+`region = 'west' AND channel = 'web' AND quarter IN ('Q1', 'Q2')` needs something else: the *set* of rows matching
+each condition, intersected and unioned, before any row is read. A bitmap turns a set of rows into a string of bits,
+and set algebra into AND, OR and NOT on machine words.
+
+Engines use that idea in two very different ways. **Stored bitmap indexes**, in Oracle, Apache Druid and many
+warehouses, keep one bitmap per distinct value on disk. **PostgreSQL has no bitmap index type at all.** It builds a
+bitmap of tuple IDs in memory for one query, from whatever indexes it has. The first design suits read-mostly data;
+the second has to fit in `work_mem`, and what happens when it does not is the second half of this page.
+
+## One bitmap per value
+
+In a bitmap index, bit *i* of a value's bitmap is set when row *i* holds that value. A column with 16 distinct
+values has 16 bitmaps, and each row sets exactly one bit across them.
+
+Oracle stores these bitmaps in an ordinary B-tree whose leaf entries are `(key, low rowid, high rowid, bitmap)`.
+Each bit is an offset into that rowid range. Because the number of rows a block can hold is predetermined, a bit
+position maps back to a block and a row slot; the **Hakan factor** caps the rows per block the database assumes, which
+keeps bitmaps shorter. A large bitmap is split into several **pieces** with their own rowid ranges. Unlike Oracle's
+B-tree indexes, bitmap indexes also store all-null keys, so counting nulls needs no table access.
+
+Druid builds the same structure inside every segment: a dictionary maps each string value to an integer, the column
+stores those integers, and each value gets a bitmap of the rows that contain it. Druid's documentation calls these
+bitmaps what they are, an inverted index.
+
+<StoredBitmapIndexLab client:visible />
+
+A query becomes a pipeline of bitmap operators, and Oracle's plans name each one. For
+`cust_gender = 'F' AND cust_year_of_birth < 1918`, the SQL Tuning Guide shows `BITMAP INDEX RANGE SCAN` fetching the
+bitmap of every birth year below 1918, `BITMAP MERGE` ORing them, `BITMAP INDEX SINGLE VALUE` fetching the `'F'`
+bitmap, `BITMAP AND` combining the two, and `BITMAP CONVERSION TO ROWIDS` turning surviving bits into rowids for
+`TABLE ACCESS BY INDEX ROWID BATCHED`. For a count, `BITMAP CONVERSION COUNT` skips the table entirely.
+
+This is why bitmap indexes anchor star-schema warehouses. Oracle's **star transformation** adds "bitmap semijoin
+predicates" to a star join: subqueries on the filtered dimensions supply key values, and indexes on the fact table's
+join columns turn them into bitmaps that are ANDed and ORed before any fact row is fetched. `STAR_TRANSFORMATION_ENABLED`
+defaults to `false`.
+
+## Compression: WAH and Roaring
+
+Uncompressed, the index costs *distinct values × rows* bits. The lab starts with 16 regions over 262,144 rows: 512 KB
+of raw bitmaps. Two things make real bitmaps far smaller than that: most bitmaps are sparse, and many are clustered.
+
+**Word-Aligned Hybrid (WAH)**, from Wu, Otoo and Shoshani at Lawrence Berkeley Lab, is a run-length code that
+never breaks a machine word. The bitmap is cut into 31-bit groups, and each 32-bit word is one of two kinds:
+
+- a **literal** (top bit 0) carrying one group's 31 bits verbatim;
+- a **fill** (top bit 1), whose second bit is the fill value and whose low 30 bits count how many consecutive groups
+  are all zeros or all ones.
+
+An AND matches the operands group by group: a 0-fill in either one yields zeros for its whole length, and a 1-fill
+passes the other operand's groups through. The operation reads words, never individual bits.
+
+In the lab, with rows loaded **sorted by region**, the bitmap for `r1` is seven words: `80000210`, a 0-fill of 528
+groups, a literal for the group where the run starts, `C0000210`, a 1-fill of 528 groups, a literal where it ends, and
+a 0-fill to the end, plus the active word and its bit count. All 16 region bitmaps take 432 bytes. Switch to
+**Arrival order** and the same bitmaps are scattered: most 31-bit groups now contain a set bit, so WAH needs 519 KB,
+slightly *more* than the raw 512 KB. For a bitmap with nothing to compress, the paper puts WAH's overhead at one bit
+per word, about three percent; the few runs of empty groups here win part of it back. Now raise **Distinct regions** to 1,024: each bitmap is sparse, and the whole index takes 2.0 MB
+against 32 MB raw — about two words per row, the size the WAH paper derives for such columns. Sparse
+bitmaps, not only low-cardinality ones, are where compression pays.
+
+The earlier byte-aligned **BBC** code came from Antoshenkov at Oracle; in the WAH authors' measurements, logical
+operations on BBC bitmaps took roughly ten times as long. Oracle's documentation says only that it compresses runs of
+zeros.
+
+Run-length codes share one weakness: no random access. To test one bit or intersect a small set with a large one, you
+decode from the start. **Roaring** fixes that. It cuts the row space into chunks of 2^16 rows and stores each non-empty
+chunk as one of three containers, chosen per chunk:
+
+| Container | Contents | Size |
+|---|---|---|
+| array | sorted 16-bit values, up to 4,096 of them | 2 bytes per value |
+| bitset | 2^16 bits | 8 KB |
+| run | (start, length) pairs | 2 bytes + 4 per run |
+
+CRoaring keeps a run container when it is no larger than both alternatives; otherwise it uses an array up to 4,096
+values and a bitset above that. Every container supports a binary search or a direct bit test, and intersections pick
+an algorithm for each pair of container types. In the lab's arrival-order index with 1,024 regions, every chunk becomes
+a small array and the index takes 512 KB, a quarter of WAH's size. Druid uses Roaring by default, with Concise, a WAH
+variant, as the alternative, and the choice is made per segment in the `indexSpec`.
+
+## One lock, many rows
+
+A bitmap entry covers many rows, and that is its operational weakness: Oracle cannot lock one bit. When a session
+changes one row's indexed value, it needs exclusive access to the index entries for the **old** value and the **new**
+value, and Oracle's documentation says the rows those two entries point to cannot be modified by anyone else until it
+commits. Because a key points to many rows, "DML on indexed data typically locks all of these rows."
+
+Tick **Session 1 updates one row's region** in the lab. With 16 regions in sorted order, the update moves a row from
+`r1` to `r2`, and the 32,768 rows in those two bitmaps are now blocked. (The lab stores each bitmap as one entry; Oracle
+may split a large one into pieces.) With a B-tree index, the same update locks one row.
+
+Oracle's guidance follows: bitmap indexes suit tables that are "read-only or not subject to significant modification
+by DML". Druid avoids the problem by construction: bitmaps are built when a segment is created, a published segment is
+immutable, and new data goes into new segments.
+
+## PostgreSQL: a bitmap per query
+
+PostgreSQL's built-in index types are B-tree, hash, GiST, SP-GiST, GIN and BRIN. None of them is a bitmap index. Instead, each
+access method can implement `amgetbitmap`, which feeds every matching tuple ID into an in-memory **TID bitmap**, and the
+executor's **Bitmap Index Scan** node calls it. B-tree, hash, GiST and SP-GiST support both this and ordinary index scans.
+GIN and BRIN support *only* bitmap scans: their `amgettuple` is `NULL`.
+
+The TID bitmap, in `src/backend/nodes/tidbitmap.c`, is a hash table keyed by heap block number. Each exact entry, a
+`PagetableEntry`, holds a bitmap of line-pointer offsets on that page, sized for `MaxHeapTuplesPerPage` (291 at the
+default 8 KB page). Several bitmap sources then combine:
+
+- **BitmapAnd** runs its first child, keeps that bitmap as the result, and intersects each later child's bitmap into it.
+  If the result is ever empty it stops without running the remaining children. The planner's `choose_bitmap_and` sorts
+  candidate indexes cheapest first and adds each further index only if it lowers the estimated total cost.
+- **BitmapOr** lets its Bitmap Index Scan children add their TIDs directly into one shared bitmap.
+
+Then the **Bitmap Heap Scan** iterates. `tbm_begin_private_iterate` copies the entries into arrays sorted by block
+number, so the heap is read in ascending physical order, each page once, however scattered the index order was. That
+makes the reads [prefetchable](../../../p02-storage-engines/buffer-pool/07-prefetching-and-asynchronous-reads/), at two
+costs: any `ORDER BY` needs a separate sort, and the whole bitmap is built before the first heap page is read.
+
+<TidBitmapHeapScanLab client:visible />
+
+The lab's table has 2,048 pages of 40 rows; `created_at` follows physical order and `amount` does not. At the
+defaults — the newest 40% of rows by `created_at`, 5% by `amount` — the `created_at` index returns 32,768 TIDs on 821
+pages and the `amount` index 4,096 TIDs spread over 1,793 pages: a 5% predicate touches 88% of the pages. The BitmapAnd
+leaves 722 pages, and the heap scan examines exactly the 1,667 tuples the bitmap names.
+
+On an exact page the scan visits only the listed offsets, following any HOT chain that starts there (see
+[HOT updates](../../../p02-storage-engines/pages-tuples-heap-files/04-hot-updates-redirect-line-pointers-and-opportunistic-page-pr/)).
+A B-tree adds its TIDs without the recheck flag, so the condition is not evaluated again.
+
+## When the bitmap outgrows work_mem
+
+The bitmap's size limit comes from `work_mem`. `tbm_calculate_entries` divides it by the size of a `PagetableEntry`
+plus two pointers — 64 bytes on a 64-bit build — so the default `work_mem` of 4 MB allows 65,536 entries. A bitmap whose
+matches fall on more than 65,536 heap pages, about 512 MB of heap, does not fit. Under a BitmapAnd each Bitmap Index Scan sizes its own
+bitmap from `work_mem`; the Bitmap Index Scan children of a BitmapOr share one.
+
+A bitmap never spills to disk. It becomes **lossy** instead. Pages are grouped into chunks of `PAGES_PER_CHUNK` =
+`BLCKSZ / 32` = 256, and a lossy chunk is a single entry, keyed by its first page, holding one bit per page: "this page
+has matches somewhere". The source comment's arithmetic is that lossy storage represents every page of 64 GB of heap in
+about 1 MB.
+
+`tbm_add_tuples` checks the entry count after every TID. The moment it exceeds the limit, `tbm_lossify` walks the hash
+table in hash order — "essentially random", says its own comment — turning exact pages into lossy page bits until the
+count is down to **half** the limit, skipping pages that would be their own chunk header. If it cannot get that low,
+because every chunk still costs an entry, it raises the limit to twice the current count: the bitmap exceeds
+`work_mem` rather than fail.
+
+Drag **work_mem** from 256 kB down to 112 kB. The limit is now 1,792 entries, and the `amount` bitmap needs 1,793: one
+lossify pass cuts it to half the limit, leaving 905 of its pages lossy. The heap scan still reads 723 pages, one more
+than before, but 380 of them are lossy, so it examines 15,983 tuples to return the same 1,667 rows and discards 14,316
+on recheck. Pages read stays flat; the work per page does not.
+
+Keep going and the numbers move unevenly. At 80 kB only 269 result pages are lossy and 11,719 tuples are examined —
+*fewer* than at 112 kB, because the bitmap overflowed earlier, was halved once, and the remaining TIDs fit. At 64 kB a
+second pass brings 420 lossy pages and 17,375 tuples. Each pass halves the table, so lossiness arrives in steps.
+
+### Combining exact and lossy pages
+
+`tbm_intersect` has to AND entries that may be at different precision:
+
+| First bitmap | Other bitmap | Result |
+|---|---|---|
+| exact page | exact page | tuple bits ANDed; empty pages dropped |
+| exact page | lossy page | first bitmap's tuple bits kept, flagged **recheck** |
+| lossy page | page present, exact or lossy | stays lossy |
+| either | page absent | dropped |
+
+A lossy page survives the AND whenever both inputs have *some* match on it, even if no single row matches both. That
+is where the extra page came from above.
+
+The recheck flag matters when the first bitmap is exact. Set `created_at` to 10% and `amount` to 20%, then drop
+`work_mem` to 64 kB: the smaller `created_at` bitmap is intersected into and stays exact, while the `amount` bitmap goes
+lossy. The result has no lossy pages, but 115 exact pages are flagged for recheck, and the scan examines 5,267 tuples
+to return 1,657.
+
+### Recheck Cond, and what it costs
+
+Every Bitmap Heap Scan in `EXPLAIN` prints a `Recheck Cond` line, lossy or not. `BitmapHeapNext` evaluates it only
+when the page's `recheck` flag is set, and counts failures as `Rows Removed by Index Recheck`; on a lossy page the heap
+code also checks every line pointer rather than a list of offsets. The line that shows whether any of this happened is
+`Heap Blocks: exact=… lossy=…` under `EXPLAIN ANALYZE`, which the lab's plan excerpt mirrors.
+
+Lossy memory is one source of rechecks; the index is the other. The hash AM adds every TID with the recheck flag,
+because it stores hash codes, not keys (see [hash indexes](../01-hash-indexes-extendible-and-linear-hashing/)). GIN flags
+TIDs its consistent function cannot confirm, and BRIN adds whole pages; the
+[BRIN](../04-brin-zone-maps-and-min-max-data-skipping/) and [GIN](../06-gin-inverted-indexes-and-posting-lists/) pages
+show those rechecks.
+
+The planner knows lossiness is coming, roughly. `compute_bitmap_pages` compares the estimated heap pages with the
+`work_mem` entry limit and, when they exceed it, estimates the lossy pages as `pages − limit / 2` — the same halving —
+and raises the tuples it expects to process accordingly.
+
+## Where it bites in production
+
+- **Lossy bitmap heap scans.** The symptom is a Bitmap Heap Scan with a large `lossy=` count and a `Rows Removed by
+  Index Recheck` far above the rows returned, burning CPU on tuples that were never candidates. Size `work_mem` at
+  64 bytes per heap page in the largest input bitmap — for a BitmapAnd, the index whose matches cover the most pages,
+  not the result — and raise it for the one query with `SET LOCAL work_mem` rather than for the whole server.
+- **A 5% predicate is not a 5% scan.** Selectivity is per row; a bitmap is per page. An uncorrelated predicate on a
+  table with many rows per page still touches most pages.
+- **ORDER BY ... LIMIT.** A bitmap scan builds its entire bitmap before returning a row and then needs a sort, so it
+  cannot stop after the first 20 matches the way an index scan already in `ORDER BY` order can.
+- **Parallel bitmap heap scans have a serial front half.** In a parallel plan, the leader builds the whole bitmap; only
+  the heap scan is shared with the workers.
+- **Stored bitmap indexes under concurrent writes.** Sessions updating different rows block each other because the rows
+  share a bitmap entry. Tables that take concurrent DML want B-tree indexes.
+- **Compression depends on load order.** In the lab, 16 region bitmaps take 432 bytes of WAH when rows are loaded
+  sorted by region and 519 KB in arrival order, and the cost of a bitmap operation grows with compressed size.
+
+:::note[What to take forward]
+A stored bitmap index keeps one compressed bitmap per value — WAH for word-level runs, Roaring for random access per
+2^16-row chunk — and answers multi-predicate queries with AND, OR and NOT before touching rows, at the price of locking
+many rows for every change. PostgreSQL builds a TID bitmap per query from any index, combines bitmaps with BitmapAnd and
+BitmapOr, and reads the heap in block order. When the bitmap exceeds `work_mem ÷ 64 bytes` entries, `tbm_lossify` halves
+its entry count by folding pages into 256-page lossy chunks: pages read barely move, but every tuple on a lossy page is rechecked, which is what
+`Heap Blocks: lossy=` and `Rows Removed by Index Recheck` tell you.
+:::

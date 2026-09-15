@@ -5,7 +5,7 @@ tableOfContents: false
 ---
 
 12 parts · 104 modules · 716 pages.
-**74** are written so far; the rest are specified and queued.
+**89** are written so far; the rest are specified and queued.
 
 ## Part 1 — Foundations: Machines, Data and the Shape of an Engine
 
@@ -148,26 +148,26 @@ The single-node storage substrate in depth: page layout, buffer management, B-tr
 
 *advanced* — Once many cores hit the same index, correctness and throughput come from latch protocols, the memory model beneath them and safe reclamation — and the same pressure produced the latch-free, write-optimized and copy-on-write descendants of the B+tree, which only make sense once you have seen both a B+tree and an LSM and can price one against the other; this module is the first 'enough for most engineers, stop here' boundary in Part 2, so a reader who stops after it still has the complete core storage spine, while everything here is what you need before reading engine source or designing an index yourself.
 
-- B-tree concurrency: latch crabbing and Lehman-Yao <span class="pending">soon</span>
-- Memory models, atomics and what makes optimistic latching correct <span class="pending">soon</span>
-- Bw-tree: delta chains and the mapping table <span class="pending">soon</span>
-- Memory reclamation for latch-free structures: epochs, hazard pointers, RCU <span class="pending">soon</span>
-- Bε-trees, fractal trees and copy-on-write B-trees <span class="pending">soon</span>
-- Persistence by path copying: fat nodes, versions and why snapshots are cheap <span class="pending">soon</span>
+- [B-tree concurrency: latch crabbing and Lehman-Yao](../p02-storage-engines/b-tree-concurrency-and-write-optimized-variants/01-b-tree-concurrency-latch-crabbing-and-lehman-yao/)
+- [Memory models, atomics and what makes optimistic latching correct](../p02-storage-engines/b-tree-concurrency-and-write-optimized-variants/02-memory-models-atomics-and-what-makes-optimistic-latching-cor/)
+- [Bw-tree: delta chains and the mapping table](../p02-storage-engines/b-tree-concurrency-and-write-optimized-variants/03-bw-tree-delta-chains-and-the-mapping-table/)
+- [Memory reclamation for latch-free structures: epochs, hazard pointers, RCU](../p02-storage-engines/b-tree-concurrency-and-write-optimized-variants/04-memory-reclamation-for-latch-free-structures-epochs-hazard-p/)
+- [Bε-trees, fractal trees and copy-on-write B-trees](../p02-storage-engines/b-tree-concurrency-and-write-optimized-variants/05-b-trees-fractal-trees-and-copy-on-write-b-trees/)
+- [Persistence by path copying: fat nodes, versions and why snapshots are cheap](../p02-storage-engines/b-tree-concurrency-and-write-optimized-variants/06-persistence-by-path-copying-fat-nodes-versions-and-why-snaps/)
 
 ### 2.8 Indexes Beyond the B-Tree
 
 *core* — Hash, bitmap, spatial, inverted and range-summary access methods each serve predicates a B-tree cannot, the hash function underneath them decides whether buckets stay short or collapse into skew, and building any of them online is its own mechanism.
 
-- Hash indexes: extendible and linear hashing <span class="pending">soon</span>
-- Hash functions inside the engine: universality, avalanche and adversarial keys <span class="pending">soon</span>
-- Bitmap indexes and bitmap heap scans <span class="pending">soon</span>
-- BRIN, zone maps and min/max data skipping <span class="pending">soon</span>
-- GiST and R-trees for spatial and range data <span class="pending">soon</span>
-- GIN inverted indexes and posting lists <span class="pending">soon</span>
-- Full-text indexes: term dictionaries, postings and skip lists <span class="pending">soon</span>
-- Top-k without scanning everything: the threshold algorithm, WAND and block-max <span class="pending">soon</span>
-- Building indexes online: CREATE INDEX CONCURRENTLY internals <span class="pending">soon</span>
+- [Hash indexes: extendible and linear hashing](../p02-storage-engines/indexes-beyond-the-b-tree/01-hash-indexes-extendible-and-linear-hashing/)
+- [Hash functions inside the engine: universality, avalanche and adversarial keys](../p02-storage-engines/indexes-beyond-the-b-tree/02-hash-functions-inside-the-engine-universality-avalanche-and-/)
+- [Bitmap indexes and bitmap heap scans](../p02-storage-engines/indexes-beyond-the-b-tree/03-bitmap-indexes-and-bitmap-heap-scans/)
+- [BRIN, zone maps and min/max data skipping](../p02-storage-engines/indexes-beyond-the-b-tree/04-brin-zone-maps-and-min-max-data-skipping/)
+- [GiST and R-trees for spatial and range data](../p02-storage-engines/indexes-beyond-the-b-tree/05-gist-and-r-trees-for-spatial-and-range-data/)
+- [GIN inverted indexes and posting lists](../p02-storage-engines/indexes-beyond-the-b-tree/06-gin-inverted-indexes-and-posting-lists/)
+- [Full-text indexes: term dictionaries, postings and skip lists](../p02-storage-engines/indexes-beyond-the-b-tree/07-full-text-indexes-term-dictionaries-postings-and-skip-lists/)
+- [Top-k without scanning everything: the threshold algorithm, WAND and block-max](../p02-storage-engines/indexes-beyond-the-b-tree/08-top-k-without-scanning-everything-the-threshold-algorithm-wa/)
+- [Building indexes online: CREATE INDEX CONCURRENTLY internals](../p02-storage-engines/indexes-beyond-the-b-tree/09-building-indexes-online-create-index-concurrently-internals/)
 
 ### 2.9 Tries, Learned and Vector Indexes
 

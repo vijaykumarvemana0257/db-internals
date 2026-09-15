@@ -1,0 +1,99 @@
+---
+title: 'Full-text indexes: term dictionaries, postings and skip lists'
+description: How a prebuilt inverted index answers a query — the term dictionary found by binary search over blocks or a trie walk, block-packed postings with skip data, leapfrog intersection led by the rarest term, prefixes expanded into unions, phrases checked against positions — and why PostgreSQL GIN and pg_trgm recheck the heap instead.
+depth: intermediate
+sidebar:
+  order: 7
+---
+
+import TermDictPostingsLeapfrogLab from '../../../../components/viz/TermDictPostingsLeapfrogLab';
+
+An inverted index answers "which documents contain these words?" with two kinds of work. The **term dictionary** maps each term to its statistics and to the location of its **posting list**, the sorted IDs of every document containing the term. A query looks up each term, then walks the lists together. The documents it returns are rarely the expensive part. The postings it had to decode to find them are.
+
+This page takes the index as already built and follows a query through it. Lucene, the library under Elasticsearch, OpenSearch and Solr, is the main example, with Tantivy and PostgreSQL for contrast. GIN's own structure (entry tree, posting trees, pending list) is on the [previous page](../06-gin-inverted-indexes-and-posting-lists/). Tokenizing text and BM25 ranking belong to the SQL module on full-text search.
+
+<TermDictPostingsLeapfrogLab client:visible />
+
+## Finding the term
+
+A dictionary of millions of variable-length terms cannot be binary-searched one term at a time on disk, because every probe would be a seek. So most designs cut the sorted terms into **blocks**, strip each block's shared prefixes, and keep a small index in memory that says which block to read.
+
+**Binary search over block-leading terms.** Lucene 3.x copied every 128th term (`termIndexInterval`) into a `.tii` file held in memory. A lookup binary-searched that array, seeked into the `.tis` file at the chosen entry, and scanned forward through at most 127 terms. It is the same shape as an SSTable block with [restart points](../../../p02-storage-engines/lsm-trees/05-sstable-format-blocks-restart-points-index-filters-footer/).
+
+The lab's dictionary holds 64 terms in blocks of 8. Look up `fsync` with **Binary search**: three probes of block-leading terms, numbered on the blocks, choose block 3, and two entries are compared inside it.
+
+**Walking a trie.** Lucene 4.0 introduced the BlockTree dictionary: blocks of terms sharing a prefix (25 to 48 per block by default today), indexed by an **FST** (finite-state transducer, a trie that also shares suffixes) mapping each block's prefix to the block's file offset. Lucene 10.3 replaced the FST with a specialized trie, but the lookup is unchanged: follow one arc per byte of the term as far as the index goes, then read one block and scan it. Tantivy's default dictionary is an FST that maps every term straight to its ordinal. Its optional SSTable dictionary, written for Quickwit, cuts terms into blocks instead, because searching an FST on object storage means downloading all of it; the SSTable's small block index, itself an FST over block keys, is fetched once and each lookup then reads one block.
+
+Switch the lab to **Trie walk**. `fsync` takes five arcs, one per letter, however many terms the dictionary holds. The root has 20 outgoing arcs, one per distinct first letter; nodes deeper down usually have one. A missing arc can prove a term absent without reading its block, which Lucene's documentation lists as the index's second job.
+
+The entry at the end of either path carries what the query needs: `docFreq` (documents containing the term), `totalTermFreq`, and file pointers into `.doc` (doc IDs and frequencies), `.pos` (positions) and `.pay` (payloads and offsets). A term that occurs in exactly one document keeps that doc ID in the dictionary entry itself, so nothing is read from `.doc` for it.
+
+## Postings: gaps, blocks and skip data
+
+Because a posting list is sorted, Lucene stores the **gaps** between consecutive doc IDs, which are small for frequent terms. It packs the gaps into fixed-size blocks, each encoded at one bit width chosen for its largest gap, and writes the trailing partial block as variable-length integers. Since Lucene 10.2 a block is stored as a bitset instead whenever that is smaller, as it is for dense terms. Blocks held 128 gaps until Lucene 10.4 raised the size to 256; Tantivy packs 128. A whole block decodes in one tight loop, so the unit of work is a block, not a posting.
+
+Blocks also make random access possible. Since Lucene 9.12, **skip data** is written inline: a level-0 entry before every packed block records the block's last doc ID and the file-pointer delta to jump past it, and a level-1 entry before every 32 blocks does the same for the group. `advance(target)`, "move to the first doc ≥ target", reads entries until it meets a block whose last doc is at least `target`, skips the bytes of every block before it, and decodes that one block. Older formats kept a multi-level skip list at the end of each posting list; Lucene moved it inline in 9.12 to speed up conjunctions.
+
+These skip pointers are written once, alongside an immutable list. They share an idea with the [skip list inside an LSM memtable](../../../p02-storage-engines/lsm-trees/03-skip-lists-probabilistic-balance-without-rebalancing/), a sparse express lane over sorted data, and nothing else: no towers, no randomness, no concurrent inserts.
+
+In the lab, `fsync` occurs in 52 of 100,000 documents and `postgres` in 40,069. With **Skip data** on, `fsync AND postgres` decodes 6,068 postings, 48 of the 315 blocks. The thin line along the `postgres` lane marks blocks that were jumped over after reading only their skip entries. Turn skip data off and the same query decodes 39,988.
+
+Now raise **docFreq of fsync**. Skipping pays only while the gaps between the rare term's documents are wider than a block of the common term. At a docFreq of 491, 252 of 318 blocks get decoded; at 1,976, the count is exactly what it is with no skip data, because nearly every block of `postgres` holds a doc the cursor must land on. Switching to 256-posting blocks halves the skip entries read (139 against 258) but decodes more postings (10,292 against 6,068). Lucene 10.4 adopted the larger blocks because they made many queries noticeably faster; the lab's counters measure work, not time.
+
+**Elias-Fano** is the main alternative to gaps. For n doc IDs below u, each ID's low ⌊log₂(u/n)⌋ bits are stored verbatim and its remaining high bits are written as unary-coded gaps in a bit array. That costs at most 2 + ⌈log₂(u/n)⌉ bits per posting, and with skip pointers over the high-bits array, finding the first ID ≥ target takes expected constant time without decoding what comes before. Vigna's quasi-succinct indices made it the default in MG4J, and the partitioned variant came from ds2i, the codebase the PISA research engine grew out of. Lucene and Tantivy stay with fixed-size blocks.
+
+## AND: cursors that leapfrog
+
+A conjunction keeps one cursor per list. Lucene's `ConjunctionDISI` sorts the lists by `cost()`, which for a term is its docFreq, so the sparsest list leads. Then:
+
+1. The lead moves to its next doc, `d`.
+2. The second list is sent to `advance(d)`. If it lands past `d`, the lead is sent to `advance` to that doc, and the two repeat until they agree.
+3. Each remaining list is advanced to the agreed doc. Any list that overshoots sends the lead forward to where it landed, and the check starts over.
+4. When every cursor sits on the same doc, that doc matches.
+
+Every `advance` is where skip data does its work. Press **Step from the start**, then **Next operation**: `fsync.nextDoc()` lands on doc 3,003, and `postgres.advance(3,003)` reads 11 skip entries, jumps 9 blocks and decodes block 9.
+
+Now choose **Most common first**. Under leapfrog the query decodes 6,196 postings instead of 6,068. It barely matters who leads when any list that overshoots pulls the lead forward: the sparse list still dictates every jump. Order matters more with three lists, because lists after the first two are consulted only once those two agree. Choose `fsync AND checkpoint AND postgres`: 8,104 postings with the rarest term first, 12,072 with the most common first.
+
+Order matters enormously when nothing can pull the lead forward. PostgreSQL's GIN scan, covered on the [previous page](../06-gin-inverted-indexes-and-posting-lists/), sorts a scan key's entries by estimated frequency and marks the rarest ones **required** until the rest cannot match on their own; for `a & b` that is only the rarer term. Candidates come only from required entries, and each **additional** entry is advanced to every candidate but never moves the required entries forward. The source comment says the split "speeds up queries like 'frequent & rare' considerably". (A GIN posting tree skips by descending again from its root rather than through inline skip entries.)
+
+Select **Lead drives (GIN)**. With the rarest term first the query still decodes 6,068 postings. With the most common term first it steps through every posting of `postgres` and decodes every block of both lists, 40,121 postings in 315 blocks, to find the same 19 documents. The frequency estimate is what keeps GIN on the right side of that 6.6× gap.
+
+## OR, prefixes and wildcards
+
+A disjunction cannot skip. Lucene's `DisjunctionDISIApproximation` keeps the cursors in a heap ordered by current doc ID; each step emits the smallest ID and advances every cursor sitting on it. Every posting of every list is visited, so `fsync OR postgres` decodes all 40,121. Pruning a union takes score bounds, "nothing in this block can reach the top 10", which is the subject of the [next page](../08-top-k-without-scanning-everything-the-threshold-algorithm-wa/).
+
+A prefix query is a dictionary range scan followed by that union. `compact*` seeks to the first term ≥ `compact` and reads forward while terms still start with it. In the lab's dictionary that is three probes and 13 entry comparisons across two blocks, yielding five terms; switch to **Trie walk** and it is seven arcs plus a walk of the nine-node subtree below them. Each term then contributes a list, and the query decodes all 10,261 postings to return 9,941 documents. Lucene compiles `PrefixQuery` and `WildcardQuery` into automata and intersects them with the dictionary, so only matching terms are enumerated. Its documentation still warns that a wildcard term should not start with `*`: such a pattern has no leading bytes to narrow the walk, so it visits the whole dictionary.
+
+How the expansion runs depends on its size. `PrefixQuery` defaults to `CONSTANT_SCORE_BLENDED_REWRITE`: up to 16 matching terms become a boolean OR of term queries; beyond that, terms matching at most 512 documents are folded into one doc-ID set, and at most 16 of the costliest remain separate lists in the union. The scoring rewrite keeps one clause per term and throws `TooManyClauses` past `IndexSearcher`'s default limit of 1,024. Elasticsearch refuses prefix queries when `search.allow_expensive_queries` is false, unless the field maps `index_prefixes`, which indexes prefixes of 2 to 5 characters in a separate field so such a prefix becomes a single term lookup.
+
+## Phrases need positions
+
+A conjunction finds documents containing both `write` and `ahead`. The phrase `"write ahead"` needs them adjacent. Lucene stores the **position** of every occurrence in `.pos`, block-packed like doc IDs. `PhraseQuery` runs in two phases: the doc-ID conjunction is the cheap approximation, and `ExactPhraseMatcher` confirms each candidate by walking the terms' position lists, subtracting each term's offset within the phrase and leapfrogging positions as the conjunction leapfrogged doc IDs. The first phrase term leads that walk, whatever its docFreq. A field indexed without positions cannot run a phrase at all: Lucene throws `IllegalStateException`, saying the field "was indexed without position data; cannot run PhraseQuery".
+
+Choose `"write ahead"` in the lab. Of 2,557 documents containing both words, 820 fail the position check and 1,737 match, for 7,525 positions read. Press **Step from the start**, then **Next match**: each press draws one candidate's two position lists and boxes the adjacent pair, if there is one.
+
+**PostgreSQL GIN stores no positions.** Its entries are lexemes with lists of row pointers, and the documentation notes that weight labels are dropped too. The tsquery consistent function turns a match into "maybe" whenever the query uses a phrase operator (`<->`, `<N>`) or a weight, and GIN reports that as a recheck. Set **Positions** to **Heap recheck (GIN)**: the index work is identical, but all 2,557 candidates become heap fetches that read the row's `tsvector`. With an expression index on `to_tsvector(body)`, each recheck recomputes it; the documentation lists avoiding that as an advantage of a stored `tsvector` column. Ranking has the same dependency, since `ts_rank` takes the row's `tsvector` as input, and GIN cannot return rows in rank order at all (`amcanorderbyop` is false). The RUM extension exists to keep positions in the index for exactly these cases. Elasticsearch's `match_only_text` field makes the GIN trade on purpose: it indexes doc IDs only, and phrase queries verify matches against `_source`.
+
+## One dictionary per segment
+
+Lucene never updates an index file in place. Each flush writes a new **segment** with its own dictionary, postings and positions, and a search repeats the lookups and the intersection in every segment before combining results. docFreq is per segment, so the lead of a conjunction can differ from one segment to the next. A deleted document stays in the postings, masked by the segment's live-docs bitset, until a merge (planned by `TieredMergePolicy` by default) rewrites several segments into one without it. The shape is [LSM compaction](../../../p02-storage-engines/lsm-compaction-and-maintenance/02-compaction-strategies-leveled-tiered-twcs-and-lazy-leveling/) with dictionaries instead of SSTables.
+
+Postings answer "which documents contain this term?". Sorting and aggregations ask the reverse, "what value does this document have?", and Lucene answers that with **doc values**, a separate columnar structure built at index time. A query that filters with postings and sorts with doc values reads both.
+
+## Substring search with pg_trgm
+
+`LIKE '%sync%'` cannot use a word dictionary, because the pattern is not a word. `pg_trgm` turns it into terms anyway. Its `gin_trgm_ops` class indexes every three-character sequence of each word, padding the word with two spaces in front and one behind, so `cat` yields `"  c"`, `" ca"`, `"cat"` and `"at "`. From a `LIKE` pattern it extracts only the trigrams any match must contain, with no padding next to a wildcard: `'%fsync%'` becomes `fsy`, `syn` and `ync`, all required, which is an intersection of three posting lists. The consistent function marks every result inexact, so each candidate row is rechecked against the real pattern, the `Recheck Cond` of a [bitmap heap scan](../03-bitmap-indexes-and-bitmap-heap-scans/). A pattern with no extractable trigrams, such as `'%ab%'`, degenerates into a scan of the entire index.
+
+## Where it bites in production
+
+- **Short prefixes and leading wildcards.** `a*` expands to a large slice of the dictionary and `*sync` enumerates all of it, so the blended rewrite reads every matching term's postings into one doc-ID set, keeping at most 16 as separate lists, and a scoring rewrite throws `TooManyClauses`. Index for it instead (`index_prefixes`), and set `search.allow_expensive_queries` to false so the rest are refused rather than slow.
+- **Hand-written intersections that never skip.** Merging sorted ID lists in application code by stepping through the longer one costs that list's full length whatever the result size. Drive from the shortest list and jump by binary search or skip entries, or leapfrog.
+- **Phrase and weighted queries on GIN.** Every candidate is a heap fetch, and with an expression index each fetch recomputes `to_tsvector`. `EXPLAIN (ANALYZE, BUFFERS)` shows the heap blocks read and `Rows Removed by Index Recheck`. Store the `tsvector` in a column, and consider RUM when phrases or ranking dominate.
+- **Phrases on a field without positions.** Lucene rejects the query with `IllegalStateException`; `match_only_text` answers it slowly from `_source`. Dropping positions to save space also drops fast phrases.
+- **Deleted documents still get decoded.** Until a merge reclaims them they are decoded and then masked, so heavily updated indexes do more work per query. `TieredMergePolicy`'s `deletesPctAllowed`, 20% by default, caps the share of doc IDs that deleted documents may occupy.
+- **Two-character `LIKE` patterns.** Nothing can be extracted from `'%ab%'`, so the "indexed" query reads the whole trigram index and rechecks every row it finds.
+
+:::note[What to take forward]
+A full-text query is one dictionary lookup per term, by binary search over block-leading terms or one trie arc per byte, followed by a merge of block-packed postings. Skip entries let `advance` decode only the block holding its target, which saves work only while the driving list is sparser than the other list's blocks. Leapfrog lets any overshooting list pull the lead forward, so order matters little for two lists, while a scan that only probes from its lead, like GIN's required entries, depends on starting from the rarest term. Unions and prefix expansions cannot skip, phrases need positions, and GIN and pg_trgm have none, so they recheck the heap.
+:::

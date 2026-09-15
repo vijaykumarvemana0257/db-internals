@@ -1,0 +1,205 @@
+---
+title: 'Top-k without scanning everything: the threshold algorithm, WAND and block-max'
+description: How engines return the exact top k while scoring a fraction of the matches — Fagin's TA and NRA and their instance optimality, WAND, MaxScore and block-max WAND in Lucene and PISA, why scores must be monotone, and the production features that turn pruning back into a full scan.
+depth: deep
+sidebar:
+  order: 8
+---
+
+import TopKPruningLab from '../../../../components/viz/TopKPruningLab';
+
+An OR query for `raft leader election` matches every document that contains any of the three words, and the user wants ten.
+Scoring every match and keeping the best ten in a heap is correct, but the work grows with the number of matching
+postings, not with ten. The algorithms on this page return exactly the ten documents a full evaluation would.
+They keep an upper bound on what anything not yet scored could still achieve, and skip or stop once that bound
+cannot beat the k-th best score found so far.
+
+<TopKPruningLab client:visible />
+
+## One invariant behind all of them
+
+Every algorithm here maintains a min-heap of the best k scores seen so far. Call the smallest of them **θ**, the
+threshold. For any group of documents not yet scored, suppose the engine can compute an **upper bound** U on
+their scores. If U cannot beat θ, none of those documents can enter the result, so the engine need not look at them.
+
+Ding and Suel call this **safe** early termination: the result is identical to an exhaustive evaluation, same
+documents, same order, same scores. It depends on two things, and production breaks each of them:
+
+- **The bound must really be a bound.** That requires the score to be a monotone function of what the index stores.
+- **θ must rise quickly.** Pruning starts only when the heap is full, and it skips more as the threshold climbs.
+
+## Fagin's threshold algorithm
+
+The formal version comes from Fagin, Lotem and Naor, *Optimal Aggregation Algorithms for Middleware* (PODS 2001).
+Each object has m grades, one per attribute. For each attribute there is a list of all objects sorted by that grade,
+highest first. An object's overall grade is t(x₁, …, xₘ) for a **monotone** aggregation function t: if no grade
+goes down, the overall grade does not go down. Sum and min are monotone. An engine can read a list in two ways:
+**sorted access**, the next entry from the top, and **random access**, one object's grade in one list.
+
+The **threshold algorithm** (TA) is three steps:
+
+1. Do sorted access to all m lists in parallel. For each object seen, do random access to the other lists to get all its
+   grades, compute t, and keep it if it is among the k best so far.
+2. Let xᵢ be the grade last read from list i, and set the threshold τ = t(x₁, …, xₘ).
+3. Halt as soon as k objects have grades of at least τ.
+
+Why is that correct? Any object not yet seen sits below the read position in every list, so each of its grades is at most
+the matching xᵢ, and monotonicity gives t(object) ≤ τ.
+
+Switch the lab to **Score order (Fagin)**. Each list now holds one term's BM25 contributions, sorted highest first.
+With k = 10, TA halts at depth 20, after 60 sorted and 76 random accesses. By then it has seen 38 of the 877 documents
+that contain any of the three terms.
+
+The paper then proves something stronger than "fast". An algorithm is **instance optimal** over a class of algorithms
+if, on *every* database, its cost is within a constant factor of every algorithm in the class. TA is instance optimal
+among all correct algorithms that make no **wild guesses**, that is, no random access to an object before sorted access
+has returned it. The optimality ratio is m + m(m−1)·c_R/c_S, where c_R and c_S are the costs of one random and one sorted
+access, and no deterministic algorithm does better for a strict aggregation function. Allow wild guesses and, for min over lists
+whose grades can tie, no algorithm is instance optimal. With distinct grades and a strictly monotone t, TA is instance optimal again. Nepal and Ramakrishna (first to publish) and Güntzer, Balke
+and Kießling found TA independently of Fagin's group.
+
+When random access is impossible, **NRA** (No Random Access) keeps two bounds for each object it has seen. **W** is t
+with the unknown grades set to 0. **B** is t with each unknown grade set to that list's last-read value. An unseen object
+has B = τ. NRA halts when no object outside its current top k, seen or unseen, has a B above the k-th best W. It returns
+the top k objects without necessarily knowing their grades. It is instance optimal among algorithms with no random access,
+with ratio m, but it must update bounds for every object seen at each step. Select **NRA**: it runs to depth 145 and sees
+251 documents before the bounds separate. Choose **min** as the aggregation and the gap widens: W stays 0 until every grade
+of an object is known, so NRA needs depth 190 where TA needs 17.
+
+Lucene and PISA do not run TA literally. Sorting a posting list by score destroys the small doc ID gaps that make it
+compress, as Ding and Suel point out, and a random access into a compressed list means decoding a block. So these engines
+keep postings in doc ID order and borrow only the bound.
+
+## WAND: the bound over doc-ID-ordered postings
+
+The [previous page](../07-full-text-indexes-term-dictionaries-postings-and-skip-lists/) covered doc-ID-ordered posting
+lists and the skip pointers that let a cursor jump forward. WAND ("Weak AND", Broder, Carmel, Herscovici, Soffer
+and Zien, CIKM 2003) adds one number per term: the **maximum contribution** that term makes to any document. That number can
+live in the term dictionary.
+
+The scorer keeps one cursor per query term and repeats:
+
+1. Sort the cursors by their current doc ID.
+2. Walk them in that order, adding up their max scores, until the sum would beat θ. The cursor where that happens is the
+   **pivot**, and its doc ID is the pivot doc.
+3. Any document before the pivot doc could appear only in the lists already walked, whose maxima together cannot beat θ,
+   so none of them can enter the heap.
+4. If the first cursor is already on the pivot doc, score that document fully. Otherwise advance one of the earlier
+   cursors to the pivot doc with `nextGEQ`, using skip data instead of reading each posting.
+
+Switch the lab back to **Doc-ID order** and set the scorer to **WAND**. Exhaustive OR decodes all 1,040 postings and scores all 877
+documents. WAND scores 107 of them and decodes 672 postings. Press **Restart** and **Step** through the start: while the
+heap is filling, θ is 0 and every document gets scored. Once it holds ten, θ climbs, and from event 44 the log reads
+"Pivot is doc …". Once θ passes 2.81, the combined maximum of `leader` and `election`, no document without `raft` can win,
+and most pivots land on `raft` documents.
+
+WAND's weakness is that one bound covers a whole list. That maximum is usually far above a typical posting. Choose the
+query **the index**: `the` appears in 1,900 documents but contributes at most 0.05. The pivot usually lands on an `index`
+posting, and every advance moves `the` up to it. WAND decodes 2,440 of 2,500 postings, and 230 of `the`'s 238 blocks.
+
+## MaxScore: essential and non-essential lists
+
+Turtle and Flood's **MaxScore** (1995) uses the same bounds differently. Sort the terms by max score. The terms with the
+smallest maxima whose *combined* maxima cannot beat θ are **non-essential**: a document that appears only in them cannot
+make the top k. The scorer iterates only the essential lists to find candidates. For each candidate it probes the
+non-essential lists with `nextGEQ`, and gives up as soon as the score so far plus the remaining bounds cannot win.
+
+On **the index**, MaxScore makes `the` non-essential as soon as θ passes its 0.05 maximum, at event 32 ("only 'index'
+drives the iteration"). It decodes 888 postings and touches 36 of `the`'s blocks. PISA implements it as `maxscore_query`.
+Lucene 9.8 added `MaxScoreBulkScorer` for top-level disjunctions sorted by score. It splits the clauses into essential and
+non-essential sets per window of doc IDs, using bounds from the index's impacts.
+
+## Block-max: a bound per block
+
+Ding and Suel (SIGIR 2011) observed that posting lists are already cut into blocks with a skip table, so they stored each
+block's **maximum score** in that table, uncompressed. On GOV2, with 64 doc IDs per block, 32-bit maxima added about 400 MB
+to an 8,759 MB compressed index.
+
+Substituting block maxima for list maxima during pivot selection is **not safe**. A later block in an earlier list, before
+the pivot doc, might hold a much larger score. **Block-max WAND** (BMW) therefore selects the pivot with the global maxima,
+exactly as WAND does, and then checks it against the blocks:
+
+1. For each cursor up to the pivot, make a **shallow** move to the block containing the pivot doc. This reads skip data only
+   and decodes nothing.
+2. Sum those blocks' maxima. If the sum can beat θ, proceed as WAND does: score the document, abandoning it early if its partial
+   score cannot win, or advance a cursor.
+3. If not, no document from the pivot doc up to the nearest block end can win. Jump one cursor to the smallest block end plus one,
+   or to the next cursor's doc if that comes sooner, without decoding the blocks in between.
+
+Select **Block-max WAND**. On **the index** it decodes 1,280 postings where WAND decoded 2,440. Back on **raft leader election**
+it decodes 576, skips 59 of 131 blocks and scores 77 documents. **Postings per block** is the precision knob. Smaller blocks give tighter bounds, at the
+cost of more skip entries: 4 postings per block decodes 416, and 32 decodes 944. Back at 8, **k** controls how high θ can climb: at k = 1
+BMW decodes 96 postings, and at k = 50 it decodes 1,028, barely better than a full scan. Set k back to 10 for the rest of the page.
+
+Lucene stores **impacts** in its skip data rather than scores: the (freq, norm) pairs that could produce the highest score in each
+range, on two levels, every block and every 32 blocks. A block holds 128 documents in the Lucene 10.3 postings format and 256 in
+the 10.4 format. The scorer turns impacts into a maximum score at query time, so one index serves any similarity that obeys the monotonicity
+contract. Boolean queries have used block-max WAND since Lucene 8.0 (LUCENE-8135). `WANDScorer` rounds maximum scores up and the
+minimum competitive score down, so that floating-point error does not skip a real hit. PISA instead precomputes per-list and per-block
+maxima for one scorer at index-build time (`create_wand_data`), with fixed-size or variable-size blocks.
+
+The threshold reaches the scorer through a feedback loop. Lucene's `TopScoreDocCollector` calls `setMinCompetitiveScore` with
+`Math.nextUp` of the heap's smallest score, but only after it has counted more hits than its total-hits threshold. `IndexSearcher.search`
+sets that threshold to 1,000.
+
+## Monotonicity decides eligibility
+
+Pruning is valid only if the score cannot exceed the bound computed from stored data. Lucene writes this into `Similarity.SimScorer`:
+the score must not decrease when term frequency rises, and must not increase when the encoded length norm rises. BM25 qualifies. It is
+a sum of non-negative per-term contributions, each rising with tf and falling with document length. Lucene's `BM25Similarity` even
+rewrites its arithmetic so float rounding cannot break that contract.
+
+A scoring UDF or script offers no such guarantee, so the engine must assume the bound is infinite. Elasticsearch's `script_score`
+scorer returns `Float.MAX_VALUE` from `getMaxScore`, and asks its inner query for complete scoring whenever the script reads `_score`.
+
+In the lab, choose the twist **Per-user boost the index never saw**. Each document's score is multiplied by 0.5 to 3.0, a value that
+comes from a user profile at query time. An honest engine sets every bound to +∞, and all four scorers decode all 1,040 postings. Tick
+**Keep pruning with the stored bounds**: BMW now decodes 264 postings and returns only 3 of the true top 10, with no error. Back in
+**Score order**, TA with **sum × per-user boost** halts at depth 8 and misses 6 of the 10. The lists know nothing about the boost, so τ
+stopped bounding unseen documents.
+
+Not every multiplier breaks the bound. A freshness decay that only multiplies by factors of at most 1 keeps every bound valid, only looser.
+A multiplier above 1 is safe only if the engine scales every bound by the largest factor it could apply.
+
+## The same pattern outside search
+
+- **ORDER BY … LIMIT over an index** is TA with a single list, where the index order *is* the score order. A Limit node over an index scan
+  stops after k rows. Without a usable index, PostgreSQL sorts every input row. Its `tuplesort` switches to a bounded heap (EXPLAIN shows
+  `top-N heapsort`) once the input exceeds twice the bound, or exceeds it with `work_mem` full, which caps memory but still reads everything. No partition
+  can feed more than k rows into a `MergeAppend`, so `ExecSetTupleBound` pushes the limit through it and a Sort under each partition becomes a top-N sort.
+- **An LSM range scan with a limit** runs the same k-way merge: the
+  [merging iterator](../../../p02-storage-engines/lsm-trees/06-read-path-bloom-filters-and-the-block-cache/) pops the smallest key across sorted
+  sources and can stop after k.
+- **Ranking without pruning.** [GIN cannot return rows in any order](../07-full-text-indexes-term-dictionaries-postings-and-skip-lists/#phrases-need-positions) (`amcanorderbyop` is false). A query ending in
+  `ORDER BY ts_rank(...) LIMIT 10` must rank every match before the top-N sort.
+- **Scatter-gather.** Each shard prunes against its own k-th best score, which is never higher than the global one. Elasticsearch has every
+  shard collect `from + size` hits (more if a rescore window is larger), and the coordinator merges them. `index.max_result_window`, default
+  10,000, rejects anything deeper with "Result window is too large, from + size must be less than or equal to: [10000]".
+
+## Where it bites in production
+
+- **Exact hit counts.** Counting every match requires visiting every match. Elasticsearch counts accurately up to `track_total_hits`, which
+  defaults to 10,000. `track_total_hits: true` means the collector never passes a minimum score to the scorer. The lab's **Exact total hit count**
+  twist decodes all 1,040 postings.
+- **Aggregations in the same request.** Aggregations need every hit, so Elasticsearch's query-phase collector ignores
+  `setMinCompetitiveScore` whenever both aggregations and top hits are collected.
+- **Post-filters.** Filtered-out documents never reach the heap, so θ is set only by survivors. In **Doc-ID order** with **Selective filter** at 3%, the heap does fill,
+  but θ settles at 0.84. That is below `leader`'s maximum of 1.00, so no list can ever be ruled out and all 1,040 postings are decoded. Tick **Push
+  the filter into the query**: cursors leap to the next passing document, 612 postings are decoded, and only 22 documents get scored. In Elasticsearch that is the
+  difference between `post_filter`, which the query-phase collector applies to hits as they arrive, and a filter inside the query, which
+  becomes part of the iteration.
+- **Deletes and updates.** A deleted document stays in its segment's postings and block maxima until a merge rewrites the segment. The bounds remain
+  valid but loose, and deleted high scorers never raise θ. The lab stays correct but decodes 664 postings at 30% deleted and 920 at 60%. By
+  default `TieredMergePolicy` lets deleted documents take up to 20% of the doc ID space ([previous page](../07-full-text-indexes-term-dictionaries-postings-and-skip-lists/#where-it-bites-in-production)).
+- **Deep pages.** Page 50 at ten results a page is k = 500 on every shard, and a large k keeps θ low. In the lab, k = 50 already decodes 1,028
+  of 1,040 postings.
+
+The failure signature is the same for all of them: latency that tracks the number of matching documents instead of k, while results stay correct.
+The opposite failure, a hand-rolled bound that went stale, looks like fast queries that are quietly wrong.
+
+:::note[What to take forward]
+Safe top-k pruning keeps the k-th best score as a threshold and skips anything whose upper bound cannot beat it. Fagin's TA shows the idea is instance
+optimal for monotone aggregation over sorted lists. WAND, MaxScore and block-max WAND apply the same bound to doc-ID-ordered postings, block maxima
+make the bound tight enough to skip whole blocks, and Lucene and PISA ship them. The guarantees last only while scores stay monotone in what the index
+stores and while θ can rise. Exact counts, aggregations, post-filters, script scores and deep pagination each quietly turn pruning back into a full scan.
+:::

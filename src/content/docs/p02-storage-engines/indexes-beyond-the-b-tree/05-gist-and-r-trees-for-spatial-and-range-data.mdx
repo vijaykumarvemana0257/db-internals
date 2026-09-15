@@ -1,0 +1,222 @@
+---
+title: GiST and R-trees for spatial and range data
+description: How R-trees index overlapping bounding boxes, why split heuristics decide query cost, how PostgreSQL's GiST generalizes them with KNN and NSN concurrency, and when cell-id keys win instead.
+depth: intermediate
+sidebar:
+  order: 5
+---
+
+import RTreeGistSpatialLab from '../../../../components/viz/RTreeGistSpatialLab';
+
+A B-tree needs a total order in which nearby keys sit next to each other. Rectangles, polygons and time ranges have
+no such order. Sort boxes by their left edge, and two boxes with the same left edge at opposite ends of the map
+become neighbours. Sort bookings by start time, and a week-long booking lands far away from the short ones it
+overlaps. The questions people ask — does this polygon intersect that one, which bookings overlap this
+interval, what are the ten nearest shops — are not a range in any single ordering.
+
+The **R-tree** (Guttman, SIGMOD 1984) keeps the B-tree's shape: balanced, page-sized nodes, growth at the root. It
+replaces separator keys with **minimum bounding rectangles** (MBRs). Nearly everything else on this page follows from
+one concession: sibling boxes are allowed to overlap.
+
+<RTreeGistSpatialLab client:visible />
+
+## The invariant, and what overlap costs
+
+A leaf entry is `(MBR, tuple id)`, where the box encloses the indexed object. An internal entry is `(MBR, child
+pointer)`, where the box encloses every entry in the child page. Every page except the root holds between *m* and *M*
+entries, with *m* ≤ *M*/2. The root has at least two children unless it is itself a leaf, and all leaves sit at the same
+depth.
+
+A window search starts at the root and follows **every** entry whose box intersects the window. A B-tree follows exactly
+one child per level. An R-tree may follow zero, one or several, and nothing bounds the worst case below "every page".
+That holds even for exact-match lookups.
+
+The lab opens on 200 small boxes, pages of up to *M* = 10 entries and the R*-tree algorithm. The dashed query window
+intersects 15 rectangles. The search reads **9 of the tree's 34 pages**: at 3 of the 4 internal pages it reads, more
+than one child box intersects the window, so the search forks. One page, drawn dashed, is
+read and matches nothing. Its box meets the window only in empty space.
+
+Pages are read for nothing when the window hits **dead space** inside a box, and **overlap** multiplies the cost: a
+window in a region two siblings share must enter both. Drag the window and watch the page count and the forks change.
+Insertion decides how much dead space and overlap the index has, and a plain R-tree never revisits the decision.
+
+## Insertion: choose a subtree, split when full
+
+Guttman's insertion descends from the root. At each level it picks the entry whose box needs the **least area
+enlargement** to cover the new rectangle, breaking ties by the smaller box. It places the entry in a leaf, then enlarges
+the boxes along the path. A page that reaches *M* + 1 entries must **split** into two groups of at least *m* entries
+each. Trying every partition is exponential in *M*, so Guttman proposed two approximations:
+
+- **Quadratic split.** *PickSeeds* takes the pair that would waste the most area if boxed together:
+  area(J) − area(E1) − area(E2), where J covers both. *PickNext* then repeatedly takes the remaining entry with the
+  largest difference between the enlargement each group would need, and adds it to the group that grows less. Once a group needs every
+  remaining entry to reach *m*, it gets them all.
+- **Linear split.** For each axis, the seeds are the entry with the highest low side and the entry with the lowest high
+  side. Their separation is divided by the width of the whole set, and the axis with the greatest normalized separation
+  wins. The remaining entries are assigned in any order.
+
+Set **Pointer** to **Draw** and move **Rectangles inserted** from 10 to 11. The eleventh rectangle overflows the only
+page, the page splits, and a new root appears above the two halves. Under the default
+R*-tree algorithm the halves hold 5 and 6 entries. Switch to **Quadratic** and the same insertion splits 7 + 4.
+
+With all 200 rectangles in, open **Show the numbers**, which rebuilds the same data under each algorithm. Sibling-box overlap
+comes to **62.6%** of the plane with the linear split, **16.5%** with quadratic and **7.8%** with the R*-tree. Across
+100 windows of the current size, that averages 7.86, 7.23 and 6.58 pages per query.
+
+## The R*-tree: optimize overlap and margin, then reinsert
+
+Beckmann, Kriegel, Schneider and Seeger (SIGMOD 1990) tested combinations of area, **margin** (the sum of a box's edge
+lengths) and overlap, and kept what performed best:
+
+1. **ChooseSubtree.** At the level just above the leaves, pick the entry whose box gains the **least overlap** with its
+   siblings; break ties by area enlargement, then by area. Higher up, keep Guttman's rule.
+2. **Split.** For each axis, sort the entries by lower edge and, separately, by upper edge. Consider every cut that
+   leaves at least *m* entries on each side (*M* − 2*m* + 2 per sort). Choose the axis whose cuts have the **smallest
+   total margin**, which favours squarish boxes. On that axis, take the cut with the **least overlap**, with ties broken
+   by area.
+3. **Forced reinsert.** The first time a level overflows during one insertion (the root excepted), do not split. Remove
+   the 30% of entries whose centres lie farthest from the page's centre and insert them again, nearest first. Split only
+   if a page overflows again.
+
+The paper found *m* = 40% of *M* best; the lab uses that minimum for all three algorithms.
+
+Switch back to **R\*-tree** and untick **Forced reinsert**. Overlap drops from 7.8% to 6.7%: on random-order data at this size, reinsertion buys
+nothing. Now choose the data set **inserted left to right**. Quadratic reaches 30.2% overlap and the R*-tree 9.3%; tick
+**Forced reinsert** again and it falls to 6.7%. Reinsertion earns its cost when early boxes were placed before the rest of
+the data existed. Finally, choose **Long thin strips**. Every algorithm leaves more than 160% overlap and reads about 9 to
+14 pages per window, against 6 to 8 for small boxes. There the overlap comes from the data, and no split can remove it.
+
+SQLite's R\*Tree module uses Guttman's ChooseLeaf with the R\*-tree split and *m* = *M*/3.
+InnoDB's `SPATIAL` indexes split pages with Guttman's quadratic `pick_seeds`/`pick_next` (`gis0geo.cc`). PostgreSQL's
+built-in box and point opclasses use area enlargement as the penalty and Korotkov's **double sorting split**, which, like
+the R*-tree, looks for the cut along each axis that minimizes overlap.
+
+## GiST: the R-tree with the geometry taken out
+
+Hellerstein, Naughton and Pfeffer (VLDB 1995) noticed that B-trees and R-trees share a skeleton: balanced trees of pages
+whose internal entries hold a **predicate** true of everything beneath them. The **Generalized Search Tree** keeps that
+skeleton — page layout, splits, WAL logging, concurrency, the search loop — and asks an **operator class** for the
+data-type logic:
+
+| Method | Question it answers | R-tree version |
+|---|---|---|
+| `consistent` | Could anything under this entry satisfy the query? Sets `recheck` if the answer may be approximate | box intersects or contains the query |
+| `union` | What key covers all these entries? | the MBR |
+| `penalty` | How bad is adding this key to this subtree? | area enlargement |
+| `picksplit` | How do the entries of a full page divide into two? | quadratic, R*-tree, double sorting |
+| `same` | Are two keys equal? | box equality |
+| `compress` / `decompress` | What is stored in the page instead of the value? | geometry → bounding box |
+| `distance` | What is a lower bound on the distance to this entry? | distance to the box |
+
+`fetch`, `options`, `sortsupport` and, in PostgreSQL 18, `translate_cmptype` complete the optional list. `consistent`, `union` and `same` decide correctness;
+`penalty` and `picksplit` decide only speed.
+
+The same skeleton runs very different indexes:
+
+- **PostGIS geometry.** The leaf key is a `BOX2DF`: four `float4` values, rounded **outward** so the stored box never
+  shrinks. `&&` compares boxes. `ST_Intersects` uses the index to find candidates and then tests the exact geometry. The
+  penalty is area enlargement, or perimeter enlargement when the area does not change, and `picksplit` is the double
+  sorting split.
+- **Range types and exclusion constraints.** `range_ops` indexes intervals as one-dimensional boxes.
+  `EXCLUDE USING gist (during WITH &&)` enforces "no two bookings overlap": each insert searches the index for a
+  conflicting row and fails with *conflicting key value violates exclusion constraint*. Adding a scalar column such as
+  `room WITH =` needs the `btree_gist` extension. PostgreSQL 18's `PRIMARY KEY (id, valid_at WITHOUT OVERLAPS)` builds
+  on the same machinery.
+- **Text search.** `tsvector_ops` hashes each word to one bit of a fixed signature — 124 bytes by default, configurable up
+  to 2,024 with `siglen` — and ORs the bits together; `union` ORs signatures too. Two words can share a bit, so the index is **lossy** and every
+  match is rechecked against the row. The documentation prefers [GIN](../06-gin-inverted-indexes-and-posting-lists/) for text search.
+
+## Nearest neighbour: best-first over the same tree
+
+`ORDER BY geom <-> $1 LIMIT 10` does not search a window. Since PostgreSQL 9.1, GiST answers it with a priority
+queue — a pairing heap in current `gistget.c` — holding both pages and index tuples, keyed by distance. For a leaf tuple, `distance`
+returns the distance to the query point. For an internal entry, it returns a lower bound: the smallest distance anything
+beneath could have, usually the distance to the box. The scan pops the smallest item. A tuple is returned at once,
+because nothing left in the queue can be closer. A page has its entries pushed. `LIMIT` stops the scan. This is Hjaltason and
+Samet's best-first **distance browsing** (TODS 1999).
+
+Choose **200 small boxes, random order** again, switch the lab to **KNN point** and press **Restart search**, then **Step**. The first three pops are pages at distance 0,
+because the point lies inside their boxes. The fourth pop returns rectangle #88 at distance 3.0 as result 1 of 5. After three results, a page at distance 4.9 comes off the queue *before* the
+fourth result at 5.2, since a box that close might still hold something nearer. The search finishes at 8.2 after expanding **9 of 34 pages**, with the queue
+peaking at 46 entries. Set **k nearest** to 1 and only 3 pages are expanded. At 10, 11 are.
+
+PostGIS's `<->` computes only the box distance and sets `recheck` on leaf
+entries, so the executor computes exact distances from the heap rows and reorders them.
+
+## Concurrency, crash safety and builds
+
+A B-tree reader detects a concurrent split by comparing its search key with the page's **high key** and moving right, as
+the [B-tree structure-modification page](../../../p02-storage-engines/b-trees-and-variants/03-crash-safety-of-structure-modifications-atomic-splits-and-in/)
+showed. GiST keys have no order, so there is no high key to compare with. Kornacker, Mohan and Hellerstein (SIGMOD 1997)
+use a **node sequence number** instead, and PostgreSQL implements it as a special-purpose LSN in each page header:
+
+- A split links the left half to the new right page with a **right link** and marks the left half `F_FOLLOW_RIGHT` until
+  the parent receives the new downlink. The downlink insertion then clears the flag and sets the child's **NSN** to the LSN
+  of the parent update.
+- A scan remembers the parent's LSN when it queues a child. If the child's NSN is greater, or the flag is still set, the
+  child split after the parent was read, so the scan queues the right sibling too.
+- Insertion widens downlink keys with `union` on the way **down**. The tree is therefore consistent the moment the leaf
+  insert lands. A split interrupted by a crash leaves a flagged page, and the next insertion that meets it finishes the
+  split.
+
+One-at-a-time inserts turn into random I/O once the index outgrows the cache, so PostgreSQL has two other
+build methods:
+
+- The **buffered build** follows Arge, Hinrichs, Vahrenhold and Vitter. Internal pages carry buffers, and tuples flow
+  down in batches. With the default `buffering = auto`, the build switches to this method once the index reaches
+  `effective_cache_size`, and the buffers need temporary disk space up to the size of the index.
+- The **sorted build** (PostgreSQL 14) is the default when every opclass supplies `sortsupport`. It sorts the tuples and packs
+  leaves bottom-up, like a B-tree build. `point_ops` sorts by **Z-order** (Morton code) and PostGIS by **Hilbert** value
+  of each box's centre. PostgreSQL 18 extended sorted builds to range types and `btree_gist`. Index quality then depends
+  on how well the curve keeps neighbours together.
+
+## The other way: turn space into a key
+
+An R-tree **divides the objects**: page boxes follow wherever the data happens to be. The alternative **divides the
+space**. Quarter the plane recursively and give each cell an id whose bits interleave x and y: that is a Z-order code, and
+**geohash** writes it in base 32. A Hilbert ordering numbers the cells so that consecutive ids are always neighbouring cells.
+
+A location becomes an ordinary key, and a window becomes a **covering**: a few cells, hence a few key-range scans on a
+plain B-tree or LSM, whose candidates are then tested exactly. There are false positives, never false negatives.
+
+- **MongoDB.** The `2d` index stores geohash values. `2dsphere` indexes S2 cell ids, with coverings bounded by a maximum
+  cell count and finest and coarsest levels.
+- **CockroachDB.** Spatial indexes use **S2**: a quadtree on each face of a cube around the sphere, numbered along a
+  Hilbert curve. `s2_max_cells` defaults to 4 and `s2_max_level` to 30. Its documentation's reasons: it scales
+  horizontally, needs no rebalancing, and inserts take no locks.
+- **DynamoDB and Cassandra.** Neither has a spatial index, and Cassandra has no geometry type. AWS's Geo Library for DynamoDB keeps geohash keys computed with S2, runs several
+  `Query` calls per search and filters the candidates itself, so every false positive costs read capacity.
+- **H3.** Uber's grid uses hexagons instead of squares: 122 base cells, each finer resolution about seven times smaller in
+  area, down to resolution 15.
+
+| | R-tree / GiST | Cell ids on a B-tree or LSM |
+|---|---|---|
+| Structure follows | the data | a fixed grid |
+| Large or long object | one entry with a big, overlapping box | many cells, or one coarse cell full of false positives |
+| Window query | descends every intersecting subtree | a few range scans plus a filter |
+| Insert | box enlargement up the path, page splits | one ordinary key insert per covering cell |
+
+## Where it bites in production
+
+- **Big, long or diagonal geometries.** Country outlines, rivers and road networks have boxes that are mostly empty space.
+  `&&` then returns a flood of candidates, and the exact test on large polygons dominates the query. `ST_Subdivide` cuts
+  them into pieces of at most 256 vertices by default, with far tighter boxes.
+- **Recheck hides in the plan.** Lossy keys such as text signatures show up as `Rows Removed by Index Recheck` in
+  `EXPLAIN ANALYZE`, for index scans and bitmap heap scans alike. PostGIS's exact test after `&&` counts instead as
+  `Rows Removed by Filter`. Either way the rejected rows were read from the heap first, as with the lossy bitmaps on the
+  [bitmap scan page](../03-bitmap-indexes-and-bitmap-heap-scans/).
+- **The tree remembers its history.** Early boxes were placed before later data existed, so a long-lived index can be
+  worse than a fresh build. Compare size and scan cost after [`REINDEX CONCURRENTLY`](../09-building-indexes-online-create-index-concurrently-internals/).
+- **KNN needs the operator in `ORDER BY`.** Sorting by `ST_Distance(...)` or another function computes the distance for
+  every row. Only an ordering operator such as `<->` lets the index return rows in distance order, and a `LIMIT` lets it stop early.
+- **Signatures saturate.** Over long documents, a `tsvector` GiST index sets most of its 992 default signature bits, and
+  internal pages, which OR many documents together, look consistent with nearly any query.
+
+:::note[What to take forward]
+An R-tree is a B-tree whose keys are bounding boxes that may overlap, so a search follows every intersecting subtree. The
+split heuristic sets how much overlap and dead space every later query pays for: linear worst, quadratic better, the
+R*-tree's overlap- and margin-aware split usually best. GiST keeps the balanced, logged, concurrent tree, with NSNs in place
+of high keys, and lets an operator class supply `consistent`, `union`, `penalty` and `picksplit`; that one access method
+serves PostGIS, range exclusion constraints, text signatures and KNN. Cell ids trade the adaptive tree for ordinary keys
+that shard and bulk-load like any other, and pay in false positives.
+:::

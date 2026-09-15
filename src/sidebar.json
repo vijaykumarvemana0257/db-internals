@@ -129,6 +129,28 @@
             }
           }
         ]
+      },
+      {
+        "label": "2.7 B-Tree Concurrency and Write-Optimized Variants",
+        "collapsed": true,
+        "items": [
+          {
+            "autogenerate": {
+              "directory": "p02-storage-engines/b-tree-concurrency-and-write-optimized-variants"
+            }
+          }
+        ]
+      },
+      {
+        "label": "2.8 Indexes Beyond the B-Tree",
+        "collapsed": true,
+        "items": [
+          {
+            "autogenerate": {
+              "directory": "p02-storage-engines/indexes-beyond-the-b-tree"
+            }
+          }
+        ]
       }
     ]
   }

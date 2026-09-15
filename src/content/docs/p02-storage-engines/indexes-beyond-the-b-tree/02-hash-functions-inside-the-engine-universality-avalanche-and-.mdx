@@ -1,0 +1,189 @@
+---
+title: 'Hash functions inside the engine: universality, avalanche and adversarial keys'
+description: What hash indexes, hash joins, partitioners, caches and checksums need from a hash function, where MurmurHash3, lookup3, xxHash, CRC32C and SipHash are used, why universal families keep chains short, how seed-independent collisions and reused hash bits collapse a table into one bucket, and how the birthday bound sizes fingerprints.
+depth: intermediate
+sidebar:
+  order: 2
+---
+
+import HashAvalancheSkewLab from '../../../../components/viz/HashAvalancheSkewLab';
+
+Every engine structure that promises O(1) — a hash index, a hash join, a hash aggregate, a partitioner, a
+Bloom filter, a sharded block cache — assumes its hash function scatters keys the way a random function would. Nothing
+checks that assumption at run time, and nothing reports an error when it fails. One bucket, batch or partition simply
+ends up holding far more than its share, and a constant-time operation becomes a linear scan.
+
+This page covers what an engine needs from that function, which functions real engines ship, the theory that keeps chains
+short, and the three ways the guarantee is lost: hostile keys, hash bits read twice, and outputs too short to serve as identities.
+
+<HashAvalancheSkewLab client:visible />
+
+## What an engine needs from a hash
+
+**Every output bit must be as random as every other.** Engine tables are sized to powers of two and pick a bucket by masking
+the low bits: `hash & (nbuckets - 1)` in PostgreSQL's hash join, `hash & sizemask` in its `simplehash` tables, `x & mask()` in
+ClickHouse's `HashTable`. The comment at the top of PostgreSQL's `hashfn.c` states the contract: every bit of the 32-bit result
+should be as random as every other, or hash tables perform poorly.
+
+**Avalanche.** Flipping any one input bit should flip each output bit with probability ½ — the *strict avalanche criterion* that
+SMHasher's avalanche tests measure. Real keys are nearly identical to each other (`ORD-00000017`, `ORD-00000018`, consecutive
+`bigint` ids), so this is what spreads them apart.
+
+Open the lab's **Avalanche** view. Each cell flips one bit in the first eight bytes of 256 keys and records how often one output
+bit flips. Choose *Sequential integers* and *×31 polynomial*, the shape of Java's `String.hashCode`. The mean bias is 0.718, and 676
+of the 2,048 cells never or always flip. Multiply-and-add only carries upward, so an input bit can never change an output bit below
+it, and the low bits a masked table reads depend only on low input bits. FNV-1a leaves 411 cells stuck for the same reason;
+PostgreSQL's page checksum, which is built on FNV-1a, repairs it by XORing the pre-multiply value, shifted right 17 bits, back in. Switch
+to `hash_bytes`, MurmurHash3, xxHash32 or SipHash: each measures a mean bias of about 0.05, the sampling noise a truly random function
+shows at 256 samples.
+
+**Speed on short keys.** Speed is quoted in cycles per byte on long inputs, but most keys are 8-byte integers or 16-byte UUIDs,
+where setup and finalization dominate. The 29C3 SipHash talk measured SipHash-2-4 at 1.44 cycles per byte on long messages but 123
+cycles for an 8-byte one. RocksDB's `hash.cc` found its XXH3-based `Hash64` almost universally faster than its older 32-bit hash; the old one
+won only when keys of the same small size were hashed thousands of times in a row. ClickHouse's `Hash.h` offers a hash built on the
+CPU's CRC32C instruction and concedes that CRC32C scores poorly on SMHasher's avalanche tests but can still win in hash tables on speed.
+
+**Independent seeds.** Engines need several functions from one family: *k* probes for a [Bloom filter](../../../p02-storage-engines/lsm-trees/06-read-path-bloom-filters-and-the-block-cache/), one function per parallel
+worker, one for partitioning and another for the table. A seed provides them only if the function mixes it into every bit. RocksDB's
+`hash.h` warns that incrementing its seed by one "might not give sufficiently independent results" and recommends a large odd increment.
+
+What an engine does not need is collision resistance against a determined attacker, and it cannot afford a cryptographic hash on every
+probe. That trade is safe until someone chooses the keys.
+
+## Where each function lives
+
+| Engine | Function | Used for |
+|---|---|---|
+| Cassandra | MurmurHash3 x64_128, seed 0, first 64 bits | The token of every partition key under the default `Murmur3Partitioner` |
+| PostgreSQL | `hash_bytes` (Bob Jenkins' lookup3, 32-bit) behind `hash_any`; seeded 64-bit `hash_bytes_extended` | Hash indexes, hash joins, hash aggregation; hash partitioning uses the seeded 64-bit form |
+| PostgreSQL | An FNV-1a-derived fold | [Page checksums](../../../p02-storage-engines/pages-tuples-heap-files/06-checksums-corruption-detection-and-on-disk-format-evolution/) |
+| RocksDB | `Hash64`, a preview release of XXH3 | General 64-bit hashing, including block cache keys and shard selection |
+| RocksDB | CRC32C, xxHash, xxHash64 or XXH3 | Block checksums; `kXXH3` has been the default since 7.8.0 |
+| ClickHouse | Murmur's 64-bit finalizer (`intHash64`); a CRC32C-instruction variant | Integer keys in its hash tables |
+| Redis | SipHash-1-2, keyed with 16 random bytes at startup | Its dictionaries, through `dictGenHashFunction` |
+
+Two hashes in these engines are not quite what their names say, and both are frozen for the same reason. Cassandra's `hash3_x64_128` is, in its own
+words, "*almost* MurmurHash 3.0": a sign bug slipped through, and fixing it would break `Murmur3Partitioner`, because tokens decide
+which node owns data on disk. RocksDB's legacy 32-bit `Hash` is MurmurHash1 — "fast but mediocre quality" — with a sign-extension quirk
+kept because the hash is "part of the format definition". Once a hash decides where persisted data lives, it is part of the file format.
+
+## Universal hashing: the guarantee behind O(1)
+
+Any fixed hash function has a bad key set: by pigeonhole, some keys all land in one bucket. Carter and Wegman's answer was to stop fixing
+the function. A family *H* is **universal** if, for any two distinct keys, a function drawn at random from *H* makes them collide with
+probability at most 1/*m*. Draw the function when the table is created, and the expected chain length for any lookup is at most 1 + *n*/*m*
+for **every** key set: the adversary picks keys without knowing the function.
+
+**Pairwise independent** families go further, making any two keys' hash values independent and uniform, and *k*-independent families extend
+that to *k* keys. Chaining needs only universality. Linear probing, where collisions spill into neighbouring slots and runs merge, needs more:
+
+- Pagh, Pagh and Ružić showed that a pairwise independent family can give linear probing logarithmic expected cost, and that
+  **5-independence** is enough for constant expected time.
+- Pătraşcu and Thorup built a 4-independent family with logarithmic expected search time, so 5 is the threshold. They also showed that
+  the fast 2-independent multiply-shift scheme fails badly for linear probing.
+- Simple tabulation hashing is only 3-independent, yet it has since been proven to give constant expected time too.
+
+For a random function, Knuth's analysis gives the expected probes for linear probing at load factor α as ½(1 + 1/(1−α)) for a successful
+search and ½(1 + 1/(1−α)²) for an unsuccessful one. At α = 0.9 that is 5.5 probes to find a key and 50.5 to learn it is absent. PostgreSQL's
+`simplehash` normally grows at 90% full, and grows early when a key sits more than 25 slots from home (`SH_GROW_MAX_DIB`) or an insert must
+move more than 150 entries (`SH_GROW_MAX_MOVE`). ClickHouse's `HashTable` grows at half full.
+
+Switch to **Buckets and probes**. The left chart counts buckets by chain length against the Poisson curve of a random function; the right
+counts keys by the probes needed to find them in a linear-probing table, against a random hash simulated over eight runs. At the default 1,024
+buckets and α = 0.75, Knuth predicts 2.50 probes, and UUIDs through lookup3, xxHash32 or SipHash average 2.42 to 2.45. Single runs swing noticeably, because a few long runs dominate the mean.
+
+Now pick *Order ids* with the *×31 polynomial*. No bucket holds more than 5 keys and a chained lookup scans 3.32 keys against 1.75 for a random hash, yet linear probing averages 78.98
+probes and the worst key needs 640. `ORD-00000001`, `ORD-00000002` and `ORD-00000003` hash to consecutive values and fill consecutive buckets, so the
+occupied runs merge into a few huge clusters. Chaining does not care whether full buckets are adjacent; linear probing does, which is why it needs the
+stronger independence. FNV-1a, lookup3, MurmurHash3, xxHash32 and SipHash bring the same keys back to between 2.2 and 2.4 probes.
+
+The catch is that engines do not draw from a universal family. They ship one fixed, well-mixed function and rely on real keys not being hostile.
+
+## Adversarial keys: hash flooding
+
+In December 2011, Alexander Klink and Julian Wälde showed that web frameworks in Java, PHP, Python, Ruby and others put attacker-chosen POST
+parameter names into hash tables with predictable collisions (oCERT-2011-003); one request could hold a CPU at 100% for up to several hours. For
+multiply-and-add hashes the collisions are trivial: under ×31, `"Aa"` and `"BB"` hash identically, so *k* such blocks give 2^*k* equal-hash strings.
+
+The usual first fix was a per-process random seed. In 2012, "Hash-flooding DoS reloaded" by Jean-Philippe Aumasson, Daniel J. Bernstein and Martin Boßlet
+(oCERT-2012-001) showed that MurmurHash2, MurmurHash3 and CityHash64 have **seed-independent** multicollisions. A difference injected into one block
+propagates through the state in a fixed way whatever the seed, and the next block injects the matching difference to cancel it. Each block pair offers
+two interchangeable variants, so *k* pairs give 2^*k* keys with one hash under every seed.
+
+The lab builds such a set against MurmurHash3 x86_32. Pick *Attack: Murmur3 multicollisions* and *MurmurHash3* in **Buckets and probes**: all 768 keys
+share one 32-bit hash, one bucket holds them all, and linear probing averages 384.5 probes because every insert walks the whole run. Move the **Seed**
+slider and nothing changes. Switch to SipHash-2-4 and the same keys behave like random ones. xxHash32 and lookup3 look fine too, but only because this
+attack is not aimed at them.
+
+The durable fix was **SipHash**, a pseudorandom function Aumasson and Bernstein designed in 2012 with a 128-bit secret key: without the key, nobody can
+predict which inputs collide. SipHash-2-4 became Python's string hash in 3.4 (PEP 456), replacing a randomized FNV whose secret a remote attacker could
+compute. Redis uses the reduced-round SipHash-1-2; its source says 2-4 cost about 4% throughput, while 1-2 matched the MurmurHash2 it replaced.
+
+Databases mostly cannot follow Redis. Hash indexes store hash codes on disk, hash partitions are defined over hash values, and Cassandra's tokens place data
+on nodes. A secret key chosen per process would make yesterday's data unreachable today, so persisted structures fed attacker-controlled keys have to rely
+on limits and skew detection instead.
+
+## Reusing one hash for partitioning and the table
+
+The most common collapse needs no attacker. A hash join or aggregation that does not fit in memory first routes rows to partitions by hash, then builds
+an in-memory table per partition. If both steps read the **same bits of the same hash**, the second has nothing left to work with. Rows in partition
+`h & (P − 1)` all share their low log₂*P* bits, so a table that buckets with `h & (B − 1)` puts the whole partition in one bucket when *B* ≤ *P*, and
+can use only 1 in *P* buckets otherwise.
+
+Switch to **Partition, then join**. With hostnames, MurmurHash3, seed 0, 64 partitions and 64 buckets under *Same hash, same bits*, the bit strip shows both steps
+reading bits 0–5. The biggest partition's 83 rows sit in one bucket, and each probe scans 83 rows where a random hash would scan about 2.3. Raise **Buckets
+per join table** to 256: only 4 buckets are used and the longest chain holds 26 rows. A better-mixed hash cannot help; the problem is which bits are read.
+
+Engines fix it in one of two ways.
+
+**Read different bits.** PostgreSQL's `ExecHashGetBucketAndBatch` computes `bucketno = hashvalue & (nbuckets - 1)` and `batchno = ROR(hashvalue,
+log2_nbuckets) & (nbatch - 1)`, taking the batch from the bits above the bucket bits. Once `nbuckets × nbatch` exceeds 2³², the batch steals bucket bits,
+because "it's better to have longer bucket chains than to lose the ability to divide batches". Hash aggregation takes spill partitions from the top of the
+hash and records `used_bits`, so a recursive re-spill uses fresh bits. RocksDB's LRU cache picks a shard from the low bits and indexes the shard's table
+from the top bits, capped at `32 − num_shard_bits`. ClickHouse's `TwoLevelHashTable` picks one of 256 sub-tables from bits 24–31 while each sub-table masks
+the low bits. Set the buckets back to 64 and choose *Different bits (PG)*: 43 of the 64 buckets are used, and the longest chain is 5.
+
+**Use a second seed.** *Second seed* rehashes each row with an independent seed: 44 buckets used, longest chain 4. PostgreSQL's hash partitioning computes a
+64-bit hash with a fixed `HASH_PARTITION_SEED`, while its hash join works on 32-bit hash values. Its tuple hash tables mix in a per-worker initial value,
+`murmurhash32(ParallelWorkerNumber)`, because tables iterated in hash order and fed into identically built ones come out unbalanced when their size was underestimated. The seed must be mixed
+in, though. Switch the function to the ×31 polynomial: its seed just adds a constant for each key length, so rows that agreed on their low bits still agree, and 54 rows share one bucket.
+
+The correlation can span machines. RocksDB's `ShardedCacheOptions::hash_seed` defaults to a hash of the host name: with one seed everywhere, the same SST files
+could cluster their large filter blocks into one cache shard on every host at once, turning one unlucky hash into a fleet-wide thrashing problem.
+
+## The birthday bound: when a hash becomes an identity
+
+A bucket index can collide freely, because the engine compares the real keys afterwards; PostgreSQL's [hash index](../01-hash-indexes-extendible-and-linear-hashing/) stores only a 4-byte hash code, so every hash
+index scan is lossy and rechecks the heap. A hash used as an **identity** — a deduplication fingerprint, a content hash, a cache key — has no recheck, so its
+width comes from the birthday bound. For *n* random *b*-bit values, the chance that two are equal is about 1 − e^(−*n*²/2^(*b*+1)), reaching 50% near
+1.18 · 2^(*b*/2).
+
+| Items | 32-bit | 64-bit | 128-bit |
+|---|---|---|---|
+| 77,163 | 50% | 1.6 × 10⁻¹⁰ | 8.7 × 10⁻³⁰ |
+| 1 million | ≈ 100% | 2.7 × 10⁻⁸ | 1.5 × 10⁻²⁷ |
+| 1 billion | ≈ 100% | 2.7% | 1.5 × 10⁻²¹ |
+| 10 billion | ≈ 100% | 93% | 1.5 × 10⁻¹⁹ |
+| 1 trillion | ≈ 100% | ≈ 100% | 1.5 × 10⁻¹⁵ |
+
+A 64-bit fingerprint is a coin flip at about five billion items, and a billion items already carry a 2.7% chance of a silent collision. RocksDB's SST unique IDs
+are 128 bits, and its `cache_key.cc` estimates random 128-bit keys for 2⁴⁵ blocks at "roughly 1 in 2^(128 − 2·45)", about one in 275 billion. For a backup
+namespace shared across a fleet it offers a 192-bit extended ID. An identity hash needs well over 2·log₂(*n*) bits.
+
+## Where it bites in production
+
+- **A hash join that cannot split a batch.** When PostgreSQL doubles `nbatch` and the split moves all of a batch's tuples or none, it sets `growEnabled = false`:
+  identical hash values cannot be subdivided, so it must "gut it out and hope the server has enough RAM". In `EXPLAIN ANALYZE`, look for `Batches: N (originally M)`
+  with memory far above `work_mem` × `hash_mem_multiplier`. Duplicate join keys cause it as surely as a bad hash.
+- **Trivial hashes on structured integers.** ClickHouse's `Hash.h` explains why it avoids the standard library's integer hash: visitor IDs carried a timestamp in
+  their low bits, the trivial hash used exactly those bits, and linear probing made it disastrous. A mixing hash sped aggregation up more than five times.
+- **One partition holding everything.** Hostile keys and reused bits leave the same signature: wildly uneven partition or bucket counts while totals look normal.
+  Monitor per-partition row counts and the longest chain, not just totals.
+- **Hashes you cannot change.** Anything that places persisted data — tokens, hash partitions, on-disk hash codes — freezes its hash into the format, bugs included.
+
+:::note[What to take forward]
+Engines need uniform low bits, avalanche, speed on short keys and independent seeds, not cryptographic strength. Universal and 5-independent families make expected
+O(1) a theorem, but engines ship fixed functions, so structured keys, seed-independent multicollisions and reused hash bits can each collapse a table into one bucket.
+When you partition before building a table, read disjoint bits or rehash with a well-mixed second seed; key the hash when attackers choose keys and nothing is persisted;
+and size any hash used as an identity by the birthday bound.
+:::
